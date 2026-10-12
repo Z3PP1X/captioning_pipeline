@@ -1,0 +1,988 @@
+"""Background extraction job worker and Server-Sent Events (SSE) dispatcher."""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import queue
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any, AsyncGenerator
+
+import cv2
+import numpy as np
+
+from pipeline.classifier import ClipClassifier
+from pipeline.config import Settings, get_settings, merged_user_settings
+from pipeline.db import DB
+from pipeline.decode import decode_exact_frame, decode_exact_frames, sample_chunk_frames
+from pipeline.export import snap_to_multiple_of_16
+from pipeline.metrics import compute_tier1_metrics, filter_and_rank_tier1
+from pipeline.openrouter import ModelRefusalError, OpenRouterCaptioner
+from pipeline.scoring import ScoringEngine
+from pipeline.select import select_diverse_top_k
+from pipeline.tagger import LocalTagger
+
+
+class JobManager:
+    def __init__(self, db: DB, settings: Settings | None = None):
+        self.db = db
+        self.settings = settings or get_settings()
+        self.classifier = ClipClassifier(self.settings)
+        self.tagger = LocalTagger(self.classifier, self.settings)
+        self.scoring_engine = ScoringEngine(self.classifier)
+        self.captioner = OpenRouterCaptioner(self.settings)
+        # Support 3-4 concurrent extraction jobs in parallel
+        self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pipeline_worker")
+        self._listeners: list[asyncio.Queue] = []
+        self._lock = threading.Lock()
+        self._cancel_flags: set[int] = set()
+
+    def broadcast_event(self, event_type: str, data: dict[str, Any]) -> None:
+        """Broadcast event to all SSE listeners."""
+        payload = json.dumps({"type": event_type, "data": data})
+        with self._lock:
+            for q in list(self._listeners):
+                try:
+                    q.put_nowait(payload)
+                except Exception:
+                    pass
+
+    async def sse_stream(self) -> AsyncGenerator[str, None]:
+        """Async generator yielding SSE formatted strings."""
+        q = asyncio.Queue()
+        with self._lock:
+            self._listeners.append(q)
+        try:
+            # Send initial keepalive
+            yield f"data: {json.dumps({'type': 'connected'})}\n\n"
+            while True:
+                msg = await q.get()
+                yield f"data: {msg}\n\n"
+        finally:
+            with self._lock:
+                if q in self._listeners:
+                    self._listeners.remove(q)
+
+    def cancel_job(self, job_id: int) -> bool:
+        self._cancel_flags.add(job_id)
+        with self.db.write() as conn:
+            conn.execute("UPDATE jobs SET status='cancelled' WHERE id=?", (job_id,))
+        self.broadcast_event("job_cancelled", {"job_id": job_id})
+        return True
+
+    def submit_extract_job(self, video_id: str, chunk_id: int | None = None) -> int:
+        now = time.time()
+        vid = self.db.one("SELECT name FROM videos WHERE id=?", (video_id,))
+        video_name = vid["name"] if vid else "Video"
+
+        with self.db.write() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO jobs (type, video_id, chunk_id, status, progress, created_at)
+                VALUES (?, ?, ?, 'queued', 0.0, ?)
+                """,
+                ("extract_chunk" if chunk_id else "extract_video", video_id, chunk_id, now),
+            )
+            job_id = cursor.lastrowid
+            conn.execute("UPDATE videos SET status='extracting' WHERE id=?", (video_id,))
+
+        self.broadcast_event("job_queued", {
+            "job_id": job_id,
+            "video_id": video_id,
+            "video_name": video_name,
+            "chunk_id": chunk_id,
+        })
+        self.executor.submit(self._run_job, job_id, video_id, chunk_id, video_name)
+        return job_id
+
+    def submit_auto_process_job(self, video_id: str, target_frames: int = 150) -> int:
+        now = time.time()
+        vid = self.db.one("SELECT name FROM videos WHERE id=?", (video_id,))
+        video_name = vid["name"] if vid else "Video"
+
+        with self.db.write() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO jobs (type, video_id, chunk_id, status, progress, created_at)
+                VALUES ('auto_process', ?, NULL, 'queued', 0.0, ?)
+                """,
+                (video_id, now),
+            )
+            job_id = cursor.lastrowid
+            conn.execute("UPDATE videos SET status='extracting' WHERE id=?", (video_id,))
+
+        self.broadcast_event("job_queued", {
+            "job_id": job_id,
+            "video_id": video_id,
+            "video_name": video_name,
+            "chunk_id": None,
+        })
+        self.executor.submit(self._run_auto_process_job, job_id, video_id, video_name, target_frames)
+        return job_id
+
+    def submit_extract_750_job(self, video_id: str) -> int:
+        now = time.time()
+        vid = self.db.one("SELECT name FROM videos WHERE id=?", (video_id,))
+        video_name = vid["name"] if vid else "Video"
+
+        with self.db.write() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO jobs (type, video_id, chunk_id, status, progress, created_at)
+                VALUES ('extract_750', ?, NULL, 'queued', 0.0, ?)
+                """,
+                (video_id, now),
+            )
+            job_id = cursor.lastrowid
+            conn.execute("UPDATE videos SET status='extracting_750' WHERE id=?", (video_id,))
+
+        self.broadcast_event("job_queued", {
+            "job_id": job_id,
+            "video_id": video_id,
+            "video_name": video_name,
+            "chunk_id": None,
+        })
+        self.executor.submit(self._run_extract_750_job, job_id, video_id, video_name)
+        return job_id
+
+    def _run_extract_750_job(self, job_id: int, video_id: str, video_name: str) -> None:
+        now = time.time()
+        with self.db.write() as conn:
+            conn.execute("UPDATE jobs SET status='running', started_at=? WHERE id=?", (now, job_id))
+        self.broadcast_event("job_started", {
+            "job_id": job_id,
+            "video_id": video_id,
+            "video_name": video_name,
+            "chunk_id": None,
+        })
+
+        try:
+            video = self.db.one("SELECT * FROM videos WHERE id=?", (video_id,))
+            if not video:
+                raise ValueError(f"Video {video_id} not found")
+
+            vpath = Path(video["path"])
+            chunks = self.db.all("SELECT * FROM chunks WHERE video_id=? ORDER BY position ASC", (video_id,))
+            if not chunks:
+                from pipeline.autochunk import AutoChunker
+                chunker = AutoChunker(self.db, self.settings)
+                chunks = chunker.generate_balanced_chunks(video_id, target_frames=300)
+
+            total_chunks = len(chunks)
+            target_total = 750
+
+            def update_job_progress(p: float, step: str):
+                with self.db.write() as conn:
+                    conn.execute("UPDATE jobs SET progress=? WHERE id=?", (p, job_id))
+                self.broadcast_event("job_progress", {
+                    "job_id": job_id,
+                    "video_id": video_id,
+                    "video_name": video_name,
+                    "chunk_id": None,
+                    "progress": p,
+                    "step": step,
+                })
+
+            update_job_progress(0.05, "Sampling 750 candidate frames across chunks...")
+
+            # 1. Sample candidate frames per chunk according to budget_pct
+            all_candidates: list[dict[str, Any]] = []
+            seen_cand_ts: set[float] = set()
+
+            for idx, ch in enumerate(chunks):
+                if job_id in self._cancel_flags:
+                    break
+
+                bpct = float(ch.get("budget_pct", 100.0 / max(1, total_chunks)))
+                chunk_n = max(15, round(target_total * (bpct / 100.0)))
+                dur = max(1.0, float(ch["end_s"]) - float(ch["start_s"]))
+                needed_fps = max(1.0, (chunk_n * 1.5) / dur)
+
+                raw_samples = sample_chunk_frames(
+                    vpath,
+                    float(ch["start_s"]),
+                    float(ch["end_s"]),
+                    sample_fps=needed_fps,
+                    max_samples=chunk_n * 2,
+                    max_dim=720,
+                )
+
+                for t, img_bgr in raw_samples:
+                    t_val = round(float(t), 3)
+                    if t_val in seen_cand_ts:
+                        continue
+                    seen_cand_ts.add(t_val)
+                    all_candidates.append({
+                        "chunk_id": ch["id"],
+                        "t": t_val,
+                        "img_bgr": img_bgr,
+                    })
+
+                p = 0.05 + 0.35 * ((idx + 1) / total_chunks)
+                update_job_progress(round(p, 2), f"Sampled Chunk {idx + 1}/{total_chunks} ({len(raw_samples)} frames)")
+
+            if not all_candidates:
+                raise RuntimeError("No candidate frames could be sampled from video")
+
+            # 2. Quality Metrics
+            update_job_progress(0.45, f"Computing Tier-1 metrics on {len(all_candidates)} frames...")
+            for c in all_candidates:
+                c["metrics"] = compute_tier1_metrics(c["img_bgr"])
+
+            # 3. Batch Embeddings & 7-Dimension Scoring
+            update_job_progress(0.55, "Computing CLIP embeddings...")
+            images_to_embed = [c["img_bgr"] for c in all_candidates]
+            embeddings = self.classifier.embed_images(images_to_embed, batch_size=32)
+
+            update_job_progress(0.68, "Evaluating 7-dimension scoring criteria...")
+            self.scoring_engine.score_candidates_batch(all_candidates, embeddings)
+
+            # 4. Multi-objective 750 -> 300 reduction
+            update_job_progress(0.78, "Optimizing 300 best frame subset...")
+            picks_300, runners_450, stats = self.scoring_engine.reduce_750_to_300(
+                all_candidates, chunks, target_total=300
+            )
+
+            # 5. Save previews and decode exact full-resolution frames for 300 picks
+            update_job_progress(0.82, "Saving thumbnails and native frames...")
+            preview_dir = self.settings.cache_dir / "previews" / video_id
+            preview_dir.mkdir(parents=True, exist_ok=True)
+            cand_dir = self.settings.cache_dir / "candidates" / video_id
+            cand_dir.mkdir(parents=True, exist_ok=True)
+
+            all_to_store = picks_300 + runners_450
+
+            picks_by_chunk: dict[int, list[dict[str, Any]]] = {}
+            for p in picks_300:
+                cid = p["chunk_id"]
+                picks_by_chunk.setdefault(cid, []).append(p)
+
+            exact_frames_map: dict[float, np.ndarray] = {}
+            for cid, ch_picks in picks_by_chunk.items():
+                ts = [p["t"] for p in ch_picks]
+                decoded = decode_exact_frames(vpath, ts)
+                exact_frames_map.update(decoded)
+
+            saved_records = []
+            seen_store_ts: set[float] = set()
+            for item in all_to_store:
+                t = round(float(item["t"]), 3)
+                if t in seen_store_ts:
+                    continue
+                seen_store_ts.add(t)
+                cid = item["chunk_id"]
+                is_pick = item.get("role") == "pick"
+
+                prev_path = preview_dir / f"prev_c{cid}_{int(t * 1000)}.webp"
+                h, w = item["img_bgr"].shape[:2]
+                pw = 384
+                ph = max(16, int(h * (pw / w)))
+                small = cv2.resize(item["img_bgr"], (pw, ph), interpolation=cv2.INTER_AREA)
+                cv2.imwrite(str(prev_path), small, [cv2.IMWRITE_WEBP_QUALITY, 85])
+
+                full_path = cand_dir / f"full_c{cid}_{int(t * 1000)}.png"
+                if is_pick and t in exact_frames_map:
+                    cv2.imwrite(str(full_path), exact_frames_map[t])
+                else:
+                    cv2.imwrite(str(full_path), item["img_bgr"])
+
+                saved_records.append({
+                    "item": item,
+                    "t": t,
+                    "prev_path": str(prev_path),
+                    "full_path": str(full_path),
+                })
+
+            # 6. Database Commit
+            update_job_progress(0.95, "Committing records to database...")
+            with self.db.write() as conn:
+                conn.execute("DELETE FROM frames WHERE video_id=?", (video_id,))
+                for rec in saved_records:
+                    item = rec["item"]
+                    cursor = conn.execute(
+                        """
+                        INSERT OR REPLACE INTO frames (
+                            video_id, chunk_id, t, metrics, phash, embedding,
+                            zs_scores, preview_path, full_path
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            video_id,
+                            item["chunk_id"],
+                            rec["t"],
+                            json.dumps(item["metrics"]),
+                            item["metrics"]["phash"],
+                            item["embedding"].tobytes(),
+                            json.dumps(item["scores"]),
+                            rec["prev_path"],
+                            rec["full_path"],
+                        ),
+                    )
+                    frame_id = cursor.lastrowid
+                    conn.execute(
+                        """
+                        INSERT INTO picks (frame_id, chunk_id, role, rank, state)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (frame_id, item["chunk_id"], item.get("role", "pick"), item.get("rank", 0), item.get("state", "keep")),
+                    )
+
+                conn.execute("UPDATE videos SET status='curating_300' WHERE id=?", (video_id,))
+                conn.execute(
+                    "UPDATE jobs SET status='finished', error=NULL, progress=1.0, finished_at=? WHERE id=?",
+                    (time.time(), job_id),
+                )
+
+
+            self.broadcast_event("job_finished", {
+                "job_id": job_id,
+                "video_id": video_id,
+                "video_name": video_name,
+                "chunk_id": None,
+                "picks_count": len(picks_300),
+                "runners_count": len(runners_450),
+                "stats": stats,
+            })
+
+            del all_candidates, images_to_embed, embeddings, picks_300, runners_450, exact_frames_map, saved_records
+            import gc
+            gc.collect()
+
+        except Exception as ex:
+            with self.db.write() as conn:
+                conn.execute("UPDATE jobs SET status='error', error=?, finished_at=? WHERE id=?", (str(ex), time.time(), job_id))
+            self.broadcast_event("job_error", {
+                "job_id": job_id,
+                "video_id": video_id,
+                "video_name": video_name,
+                "error": str(ex),
+            })
+
+    def submit_openrouter_caption_job(self, video_id: str, options: dict[str, Any]) -> int:
+        now = time.time()
+        vid = self.db.one("SELECT name FROM videos WHERE id=?", (video_id,))
+        video_name = vid["name"] if vid else "Video"
+
+        with self.db.write() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO jobs (type, video_id, chunk_id, status, progress, created_at)
+                VALUES ('openrouter_caption', ?, NULL, 'queued', 0.0, ?)
+                """,
+                (video_id, now),
+            )
+            job_id = cursor.lastrowid
+            conn.execute("UPDATE videos SET status='captioning' WHERE id=?", (video_id,))
+
+        self.broadcast_event("job_queued", {
+            "job_id": job_id,
+            "video_id": video_id,
+            "video_name": video_name,
+            "chunk_id": None,
+        })
+        self.executor.submit(self._run_openrouter_caption_job, job_id, video_id, options, video_name)
+        return job_id
+
+    def _run_openrouter_caption_job(self, job_id: int, video_id: str, options: dict[str, Any], video_name: str) -> None:
+        now = time.time()
+        with self.db.write() as conn:
+            conn.execute("UPDATE jobs SET status='running', started_at=? WHERE id=?", (now, job_id))
+        self.broadcast_event("job_started", {
+            "job_id": job_id,
+            "video_id": video_id,
+            "video_name": video_name,
+            "chunk_id": None,
+        })
+
+        try:
+            import httpx
+
+            video = self.db.one("SELECT * FROM videos WHERE id=?", (video_id,))
+            if not video:
+                raise ValueError(f"Video {video_id} not found")
+
+            api_key = options.get("api_key") or getattr(self.settings, "openrouter_api_key", "")
+            if not api_key:
+                api_key = os.getenv("OPENROUTER_API_KEY", "")
+            if not api_key:
+                env_file = Path(__file__).resolve().parent.parent.parent / ".env"
+                if env_file.exists():
+                    for line in env_file.read_text(encoding="utf-8").splitlines():
+                        if line.strip().startswith("OPENROUTER_API_KEY="):
+                            api_key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                            break
+            if not api_key:
+                raise ValueError("OpenRouter API Key not provided. Please set OPENROUTER_API_KEY.")
+
+            primary_model = options.get("model", "google/gemma-4-31b-it")
+            layer2_model = options.get("fallback_layer2", "deepseek/deepseek-v4.1-flash")
+            layer3_model = options.get("fallback_layer3", "x-ai/grok-4.7")
+            reasoning_effort = options.get("reasoning_effort", "high")
+            mode = options.get("mode", "concept")
+            trigger = options.get("trigger", "restrained_elegance")
+            class_noun = options.get("class_noun", "woman")
+            max_tokens = min(int(options.get("max_tokens", 300)), 300)
+            temperature = float(options.get("temperature", 0.80))
+            top_p = float(options.get("top_p", 0.90))
+            gemma_temp = float(options.get("gemma_temperature", options.get("primary_temperature", temperature)))
+            deepseek_temp = float(options.get("deepseek_temperature", options.get("fallback_temperature", temperature)))
+            grok_temp = float(options.get("grok_temperature", options.get("fallback_layer3_temperature", temperature)))
+
+            l1_success_count = 0
+            l2_success_count = 0
+            l3_success_count = 0
+            l1_refusals = 0
+            l2_refusals = 0
+            completed_count = 0
+
+            query = """
+                SELECT f.id, f.chunk_id, f.t, f.full_path, f.metrics, f.zs_scores,
+                       c.position as chunk_pos
+                FROM frames f
+                JOIN picks p ON f.id = p.frame_id
+                JOIN chunks c ON f.chunk_id = c.id
+                WHERE f.video_id = ? AND p.state IN ('keep', 'star')
+                ORDER BY c.position ASC, f.t ASC
+            """
+            kept_frames = self.db.all(query, (video_id,))
+            if not kept_frames:
+                raise RuntimeError("No approved frames found to caption.")
+
+            total_frames = len(kept_frames)
+            vslug = video["slug"]
+            per_video_dir = self.settings.finished_dir / "per_video" / vslug
+            merged_dir = self.settings.finished_dir / "merged"
+            per_video_dir.mkdir(parents=True, exist_ok=True)
+            merged_dir.mkdir(parents=True, exist_ok=True)
+            manifest_path = merged_dir / "manifest.jsonl"
+
+            def update_prog(done: int, step: str):
+                p = round((done / total_frames), 2)
+                with self.db.write() as conn:
+                    conn.execute("UPDATE jobs SET progress=? WHERE id=?", (p, job_id))
+                self.broadcast_event("job_progress", {
+                    "job_id": job_id,
+                    "video_id": video_id,
+                    "video_name": video_name,
+                    "chunk_id": None,
+                    "progress": p,
+                    "step": step,
+                })
+
+            update_prog(0, f"Starting 3-Layer Cascade ({primary_model} ➜ {layer2_model} ➜ {layer3_model}) for {total_frames} frames...")
+
+            async def process_all_async():
+                nonlocal l1_success_count, l2_success_count, l3_success_count, l1_refusals, l2_refusals, completed_count
+                sem = asyncio.Semaphore(4)
+                file_lock = asyncio.Lock()
+
+                async with httpx.AsyncClient() as client:
+                    async def process_single_item(item: dict[str, Any]) -> dict[str, Any] | None:
+                        nonlocal l1_success_count, l2_success_count, l3_success_count, l1_refusals, l2_refusals, completed_count
+                        if job_id in self._cancel_flags:
+                            return None
+
+                        fname_stem = f"{vslug}_c{item['chunk_pos'] + 1:02d}_{int(item['t'] * 1000):07d}"
+                        out_png = per_video_dir / f"{fname_stem}.png"
+                        out_txt = per_video_dir / f"{fname_stem}.txt"
+
+                        # Resume support: if already captioned, keep existing caption without re-billing
+                        if out_txt.is_file() and out_txt.stat().st_size > 10 and out_png.is_file():
+                            caption_text = out_txt.read_text(encoding="utf-8").strip()
+                            l1_success_count += 1
+                            completed_count += 1
+                            update_prog(
+                                completed_count,
+                                f"Captioned {completed_count}/{total_frames} [L1 Gemma: {l1_success_count} | L2 DeepSeek: {l2_success_count} | L3 Grok: {l3_success_count}]"
+                            )
+                            return {
+                                "source_video": video["name"],
+                                "video_id": video_id,
+                                "chunk_id": item["chunk_id"],
+                                "timestamp_s": item["t"],
+                                "caption": caption_text,
+                                "model": primary_model,
+                                "layer": "layer1_cached",
+                            }
+
+                        full_path = Path(item["full_path"])
+                        if not full_path.is_file():
+                            return None
+
+                        async with sem:
+                            if job_id in self._cancel_flags:
+                                return None
+
+                            img = cv2.imread(str(full_path))
+                            if img is None:
+                                return None
+
+                            # Snap to multiple of 16 for highest native quality
+                            img_snapped = snap_to_multiple_of_16(img)
+                            h, w = img_snapped.shape[:2]
+                            cv2.imwrite(str(out_png), img_snapped)
+
+                            caption_model_used = primary_model
+                            layer_used = "layer1"
+                            warnings: list[str] = []
+
+                            # -------------------------------------------------------------
+                            # 3-Layer Cascade: Only send refused images to the next layer!
+                            # -------------------------------------------------------------
+                            try:
+                                # Layer 1: Google Gemma 4 31B (High reasoning budget, max 300 tokens)
+                                caption_text, warnings = await self.captioner.caption_single_frame(
+                                    client=client,
+                                    img_bgr=img_snapped,
+                                    api_key=api_key,
+                                    model=primary_model,
+                                    mode=mode,
+                                    trigger=trigger,
+                                    class_noun=class_noun,
+                                    max_tokens=max_tokens,
+                                    temperature=gemma_temp,
+                                    top_p=top_p,
+                                    reasoning_effort=reasoning_effort,
+                                )
+                                l1_success_count += 1
+                            except ModelRefusalError:
+                                l1_refusals += 1
+                                # Layer 1 Refused -> Send ONLY this refused image to Layer 2 (DeepSeek V4.1 Flash)
+                                try:
+                                    caption_text, warnings = await self.captioner.caption_single_frame(
+                                        client=client,
+                                        img_bgr=img_snapped,
+                                        api_key=api_key,
+                                        model=layer2_model,
+                                        mode=mode,
+                                        trigger=trigger,
+                                        class_noun=class_noun,
+                                        max_tokens=max_tokens,
+                                        temperature=deepseek_temp,
+                                        top_p=top_p,
+                                        reasoning_effort=None,
+                                    )
+                                    l2_success_count += 1
+                                    caption_model_used = f"{layer2_model} (fallback from {primary_model})"
+                                    layer_used = "layer2"
+                                    warnings.append(f"Recovered from {primary_model} refusal via Layer 2 ({layer2_model})")
+                                except ModelRefusalError:
+                                    l2_refusals += 1
+                                    # Layer 2 also Refused -> Send this refused image to Layer 3 (Grok 4.7)
+                                    caption_text, warnings = await self.captioner.caption_single_frame(
+                                        client=client,
+                                        img_bgr=img_snapped,
+                                        api_key=api_key,
+                                        model=layer3_model,
+                                        mode=mode,
+                                        trigger=trigger,
+                                        class_noun=class_noun,
+                                        max_tokens=max_tokens,
+                                        temperature=grok_temp,
+                                        top_p=top_p,
+                                        reasoning_effort=None,
+                                    )
+                                    l3_success_count += 1
+                                    caption_model_used = f"{layer3_model} (fallback from {layer2_model} & {primary_model})"
+                                    layer_used = "layer3"
+                                    warnings.append(f"Recovered from {primary_model} & {layer2_model} refusals via Layer 3 ({layer3_model})")
+
+                            out_txt.write_text(caption_text, encoding="utf-8")
+
+                            merged_png = merged_dir / f"{fname_stem}.png"
+                            merged_txt = merged_dir / f"{fname_stem}.txt"
+                            for src, dst in [(out_png, merged_png), (out_txt, merged_txt)]:
+                                if dst.exists():
+                                    dst.unlink()
+                                try:
+                                    os.link(str(src), str(dst))
+                                except Exception:
+                                    import shutil
+                                    shutil.copy2(str(src), str(dst))
+
+                            manifest_entry = {
+                                "source_video": video["name"],
+                                "video_id": video_id,
+                                "chunk_id": item["chunk_id"],
+                                "timestamp_s": item["t"],
+                                "width": w,
+                                "height": h,
+                                "caption": caption_text,
+                                "model": caption_model_used,
+                                "layer": layer_used,
+                                "cascade_stats": {
+                                    "layer1_gemma_success": l1_success_count,
+                                    "layer2_deepseek_success": l2_success_count,
+                                    "layer3_grok_success": l3_success_count,
+                                    "layer1_refusals": l1_refusals,
+                                    "layer2_refusals": l2_refusals,
+                                },
+                                "metrics": item.get("metrics"),
+                                "scores": item.get("zs_scores"),
+                                "warnings": warnings,
+                                "exported_at": time.time(),
+                            }
+                            async with file_lock:
+                                with open(manifest_path, "a", encoding="utf-8") as mf:
+                                    mf.write(json.dumps(manifest_entry) + "\n")
+                                completed_count += 1
+                                update_prog(
+                                    completed_count,
+                                    f"Captioned {completed_count}/{total_frames} [L1 Gemma: {l1_success_count} | L2 DeepSeek: {l2_success_count} | L3 Grok: {l3_success_count}]"
+                                )
+                            return manifest_entry
+
+                    raw_results = await asyncio.gather(*(process_single_item(item) for item in kept_frames))
+                    return [r for r in raw_results if r is not None]
+
+
+            captioned_results = asyncio.run(process_all_async())
+
+            with self.db.write() as conn:
+                conn.execute(
+                    "UPDATE jobs SET status='finished', error=NULL, progress=1.0, finished_at=? WHERE id=?",
+                    (time.time(), job_id),
+                )
+
+                conn.execute("UPDATE videos SET status='exported' WHERE id=?", (video_id,))
+
+            self.broadcast_event("job_finished", {
+                "job_id": job_id,
+                "video_id": video_id,
+                "video_name": video_name,
+                "chunk_id": None,
+                "exported": len(captioned_results),
+            })
+
+        except Exception as ex:
+            with self.db.write() as conn:
+                conn.execute("UPDATE jobs SET status='error', error=?, finished_at=? WHERE id=?", (str(ex), time.time(), job_id))
+            self.broadcast_event("job_error", {
+                "job_id": job_id,
+                "video_id": video_id,
+                "video_name": video_name,
+                "error": str(ex),
+            })
+
+    def _run_auto_process_job(self, job_id: int, video_id: str, video_name: str, target_frames: int) -> None:
+        from pipeline.autoprocess import AutoProcessor
+
+        processor = AutoProcessor(self.db, self.settings, job_manager=self)
+        now = time.time()
+        with self.db.write() as conn:
+            conn.execute("UPDATE jobs SET status='running', started_at=? WHERE id=?", (now, job_id))
+        self.broadcast_event("job_started", {
+            "job_id": job_id,
+            "video_id": video_id,
+            "video_name": video_name,
+            "chunk_id": None,
+        })
+
+        def on_prog(pct: float, step: str):
+            with self.db.write() as conn:
+                conn.execute("UPDATE jobs SET progress=? WHERE id=?", (pct, job_id))
+            self.broadcast_event("job_progress", {
+                "job_id": job_id,
+                "video_id": video_id,
+                "video_name": video_name,
+                "chunk_id": None,
+                "progress": pct,
+                "step": step,
+            })
+
+        try:
+            res = processor.process_video(video_id, target_frames=target_frames, on_progress=on_prog)
+            with self.db.write() as conn:
+                conn.execute(
+                    "UPDATE jobs SET status='finished', progress=1.0, finished_at=? WHERE id=?",
+                    (time.time(), job_id),
+                )
+                conn.execute("UPDATE videos SET status='exported' WHERE id=?", (video_id,))
+            self.broadcast_event("job_finished", {
+                "job_id": job_id,
+                "video_id": video_id,
+                "video_name": video_name,
+                "chunk_id": None,
+                "exported": res["exported_frames"],
+            })
+        except Exception as ex:
+            with self.db.write() as conn:
+                conn.execute("UPDATE jobs SET status='error', error=?, finished_at=? WHERE id=?", (str(ex), time.time(), job_id))
+            self.broadcast_event("job_error", {
+                "job_id": job_id,
+                "video_id": video_id,
+                "video_name": video_name,
+                "error": str(ex),
+            })
+
+    def _run_job(self, job_id: int, video_id: str, chunk_id: int | None, video_name: str) -> None:
+        now = time.time()
+        with self.db.write() as conn:
+            conn.execute("UPDATE jobs SET status='running', started_at=? WHERE id=?", (now, job_id))
+        self.broadcast_event("job_started", {
+            "job_id": job_id,
+            "video_id": video_id,
+            "video_name": video_name,
+            "chunk_id": chunk_id,
+        })
+
+        try:
+            if chunk_id:
+                chunks = self.db.all("SELECT * FROM chunks WHERE id=?", (chunk_id,))
+            else:
+                chunks = self.db.all("SELECT * FROM chunks WHERE video_id=? ORDER BY position ASC", (video_id,))
+
+            total_chunks = len(chunks)
+            if total_chunks == 0:
+                with self.db.write() as conn:
+                    conn.execute("UPDATE jobs SET status='finished', progress=1.0, finished_at=? WHERE id=?", (time.time(), job_id))
+                self.broadcast_event("job_finished", {
+                    "job_id": job_id,
+                    "video_id": video_id,
+                    "video_name": video_name,
+                    "chunk_id": chunk_id,
+                })
+                return
+
+            user_settings = merged_user_settings(self.db.get_setting("user_settings", {}))
+
+            for idx, chunk in enumerate(chunks):
+                if job_id in self._cancel_flags:
+                    break
+
+                def on_progress(stage: str, frac: float):
+                    p = round((idx + frac) / total_chunks, 2)
+                    with self.db.write() as conn:
+                        conn.execute("UPDATE jobs SET progress=? WHERE id=?", (p, job_id))
+                    self.broadcast_event("job_progress", {
+                        "job_id": job_id,
+                        "video_id": video_id,
+                        "video_name": video_name,
+                        "chunk_id": chunk["id"],
+                        "progress": p,
+                        "step": f"Chunk {idx + 1}/{total_chunks}: {stage}",
+                    })
+
+                # Extract single chunk with live stage callbacks
+                self._process_chunk(video_id, chunk, user_settings, on_progress)
+
+                progress = round((idx + 1) / total_chunks, 2)
+                with self.db.write() as conn:
+                    conn.execute("UPDATE jobs SET progress=? WHERE id=?", (progress, job_id))
+                self.broadcast_event("job_progress", {
+                    "job_id": job_id,
+                    "video_id": video_id,
+                    "video_name": video_name,
+                    "chunk_id": chunk["id"],
+                    "progress": progress,
+                    "step": f"Chunk {idx + 1}/{total_chunks} Complete",
+                })
+
+            final_status = "cancelled" if job_id in self._cancel_flags else "finished"
+            with self.db.write() as conn:
+                conn.execute(
+                    "UPDATE jobs SET status=?, finished_at=? WHERE id=?",
+                    (final_status, time.time(), job_id),
+                )
+                conn.execute("UPDATE videos SET status='curating' WHERE id=? AND status='extracting'", (video_id,))
+
+            self.broadcast_event(f"job_{final_status}", {
+                "job_id": job_id,
+                "video_id": video_id,
+                "video_name": video_name,
+                "chunk_id": chunk_id,
+            })
+
+        except Exception as ex:
+            with self.db.write() as conn:
+                conn.execute("UPDATE jobs SET status='error', error=?, finished_at=? WHERE id=?", (str(ex), time.time(), job_id))
+            self.broadcast_event("job_error", {
+                "job_id": job_id,
+                "video_id": video_id,
+                "video_name": video_name,
+                "error": str(ex),
+            })
+
+    def _process_chunk(
+        self,
+        video_id: str,
+        chunk: dict[str, Any],
+        user_settings: dict[str, Any],
+        on_progress: Any = None,
+    ) -> None:
+        video = self.db.one("SELECT * FROM videos WHERE id=?", (video_id,))
+        if not video:
+            return
+
+        vpath = Path(video["path"])
+        sample_fps = float(user_settings.get("sample_fps", 4.0))
+        survivor_frac = float(user_settings.get("survivor_frac", 0.5))
+        weights = user_settings.get("weights", {})
+        prompts = user_settings.get("prompts", {})
+
+        # Step 1: Decode sampled frames
+        if on_progress:
+            on_progress("Decoding frames", 0.05)
+        raw_samples = sample_chunk_frames(vpath, chunk["start_s"], chunk["end_s"], sample_fps)
+        if not raw_samples:
+            return
+
+        # Step 2: Compute Tier-1 metrics
+        if on_progress:
+            on_progress("Quality metrics", 0.25)
+        candidates: list[dict[str, Any]] = []
+        for t, img_bgr in raw_samples:
+            metrics = compute_tier1_metrics(img_bgr)
+            candidates.append({
+                "t": t,
+                "metrics": metrics,
+                "img_bgr": img_bgr,
+            })
+
+        # Step 3: Tier-1 filtering & ranking
+        target_k = chunk.get("k", 5)
+        survivors, rejected = filter_and_rank_tier1(
+            candidates,
+            weights=weights,
+            survivor_frac=survivor_frac,
+            min_survivors=max(target_k * 2, 16),
+        )
+        if not survivors:
+            return
+
+        # Step 4: Tier-2 Multimodal CLIP embedding & classification
+        if on_progress:
+            on_progress("CLIP scoring", 0.50)
+        survivor_images = [s["img_bgr"] for s in survivors]
+        embeddings = self.classifier.embed_images(survivor_images)
+        zs_scores = self.classifier.classify_and_score(embeddings, prompts)
+
+        for i, s in enumerate(survivors):
+            s["embedding"] = embeddings[i]
+            s["zs_scores"] = zs_scores[i]
+
+        # Step 5: MMR Diverse Top-K Selection
+        if on_progress:
+            on_progress("Diverse selection", 0.75)
+        picks, runner_ups, unselected = select_diverse_top_k(
+            survivors,
+            k=target_k,
+            runner_ups=max(target_k, int(user_settings.get("runner_ups", 20))),
+            rule=chunk.get("rule", "person"),
+            weights=weights,
+            lam=user_settings.get("mmr_lambda", 0.7),
+            alpha=user_settings.get("mmr_alpha", 0.8),
+        )
+
+        # Step 6: Save preview thumbnails and full-res frames
+        preview_dir = self.settings.cache_dir / "previews" / video_id
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        cand_dir = self.settings.cache_dir / "candidates" / video_id
+        cand_dir.mkdir(parents=True, exist_ok=True)
+
+        all_to_save = picks + runner_ups
+
+        # Step 5b: Zero-shot Tagging for chunk and frames
+        if on_progress:
+            on_progress("Tagging frames", 0.82)
+        chunk_summary_tags, per_frame_tags = self.tagger.tag_chunk_frames(all_to_save)
+        for i, item in enumerate(all_to_save):
+            if "zs_scores" not in item:
+                item["zs_scores"] = {}
+            item["zs_scores"]["tags"] = per_frame_tags[i]
+
+        # Step 6: Save preview thumbnails and full-res frames to disk
+        if on_progress:
+            on_progress(f"Saving {len(all_to_save)} frames", 0.88)
+
+        # Batch decode exact full-resolution native frames for all picks in one single pass
+        pick_timestamps = [item["t"] for item in picks]
+        exact_frames = decode_exact_frames(vpath, pick_timestamps)
+
+        saved_records = []
+        for item in all_to_save:
+            t = item["t"]
+            is_pick = item.get("role") == "pick"
+
+            # Save 384px WebP preview
+            prev_path = preview_dir / f"prev_c{chunk['id']}_{int(t * 1000)}.webp"
+            h, w = item["img_bgr"].shape[:2]
+            pw = 384
+            ph = max(16, int(h * (pw / w)))
+            small = cv2.resize(item["img_bgr"], (pw, ph), interpolation=cv2.INTER_AREA)
+            cv2.imwrite(str(prev_path), small, [cv2.IMWRITE_WEBP_QUALITY, 85])
+
+            # Save full-resolution frame (picks get exact full native res from single-pass decode)
+            full_path = cand_dir / f"full_c{chunk['id']}_{int(t * 1000)}.png"
+            if is_pick:
+                exact_bgr = exact_frames.get(t)
+                if exact_bgr is not None:
+                    cv2.imwrite(str(full_path), exact_bgr)
+                else:
+                    cv2.imwrite(str(full_path), item["img_bgr"])
+            else:
+                cv2.imwrite(str(full_path), item["img_bgr"])
+
+            saved_records.append({
+                "item": item,
+                "t": t,
+                "prev_path": str(prev_path),
+                "full_path": str(full_path),
+            })
+
+        # Step 7: Fast single-transaction database commit
+        with self.db.write() as conn:
+            cur = conn.execute("SELECT tags FROM chunks WHERE id=?", (chunk["id"],))
+            r = cur.fetchone()
+            existing_tags = []
+            if r and r["tags"]:
+                try:
+                    existing_tags = json.loads(r["tags"]) if isinstance(r["tags"], str) else r["tags"]
+                except Exception:
+                    existing_tags = []
+            merged_tags = list(dict.fromkeys(existing_tags + chunk_summary_tags))
+            conn.execute("UPDATE chunks SET tags=? WHERE id=?", (json.dumps(merged_tags), chunk["id"]))
+
+            # Delete previous frames for this chunk
+            conn.execute("DELETE FROM frames WHERE chunk_id=?", (chunk["id"],))
+
+            for rec in saved_records:
+                item = rec["item"]
+                cursor = conn.execute(
+                    """
+                    INSERT INTO frames (
+                        video_id, chunk_id, t, metrics, phash, embedding,
+                        zs_scores, preview_path, full_path
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        video_id,
+                        chunk["id"],
+                        rec["t"],
+                        json.dumps(item["metrics"]),
+                        item["metrics"]["phash"],
+                        item["embedding"].tobytes(),
+                        json.dumps(item["zs_scores"]),
+                        rec["prev_path"],
+                        rec["full_path"],
+                    ),
+                )
+                frame_id = cursor.lastrowid
+                conn.execute(
+                    """
+                    INSERT INTO picks (frame_id, chunk_id, role, rank, state)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (frame_id, chunk["id"], item.get("role", "pick"), item.get("rank", 0), item.get("state", "keep")),
+                )
+
+            # Mark chunk as clean
+            conn.execute("UPDATE chunks SET dirty=0 WHERE id=?", (chunk["id"],))
+
+        # Free memory and trigger garbage collection immediately
+        del raw_samples, candidates, survivors, survivor_images, all_to_save, saved_records, exact_frames
+        import gc
+        gc.collect()

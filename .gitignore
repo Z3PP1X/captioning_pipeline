@@ -1,0 +1,50 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Secrets and local config
+.env
+.env.local
+.env.*.local
+*.key
+
+# SQLite / Database & Locks
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Data and dataset output (keep target_videos.txt, ignore bulky binary frames & finished dataset)
+data/finished/
+data/cache/
+data/previews/
+data/proxies/
+data/*.mp4
+data/*.png
+data/*.jpg
+data/*.jpeg
+
+# Logs
+*.log
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

@@ -1,0 +1,219 @@
+"""Finished dataset export: crop, multiples-of-16 alignment, sRGB PNG, caption stubs, and manifest."""
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+from typing import Any
+
+import cv2
+import numpy as np
+
+from pipeline.config import Settings, get_settings, merged_user_settings
+from pipeline.db import DB
+
+
+def snap_to_multiple_of_16(img: np.ndarray) -> np.ndarray:
+    """Crop up to 15 pixels from edges to make width and height multiples of 16 (0 aspect distortion)."""
+    h, w = img.shape[:2]
+    new_w = (w // 16) * 16
+    new_h = (h // 16) * 16
+    if new_w == w and new_h == h:
+        return img
+
+    dw = w - new_w
+    dh = h - new_h
+    x0 = dw // 2
+    y0 = dh // 2
+    return img[y0:y0 + new_h, x0:x0 + new_w]
+
+
+def clamp_max_edge(img: np.ndarray, max_edge: int = 2048) -> np.ndarray:
+    """Downscale with Lanczos if max dimension > max_edge. Never upscales."""
+    h, w = img.shape[:2]
+    long_edge = max(h, w)
+    if long_edge <= max_edge:
+        return img
+    scale = max_edge / long_edge
+    new_w = max(16, int(round(w * scale)))
+    new_h = max(16, int(round(h * scale)))
+    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+
+
+class Exporter:
+    def __init__(self, db: DB, settings: Settings | None = None):
+        self.db = db
+        self.settings = settings or get_settings()
+
+    def export_video(
+        self,
+        video_id: str,
+        custom_trigger: str | None = None,
+    ) -> dict[str, Any]:
+        """Export all approved ('keep' or 'star') frames for a video to per_video and merged folders."""
+        video = self.db.one("SELECT * FROM videos WHERE id=?", (video_id,))
+        if not video:
+            return {"exported": 0, "error": "Video not found"}
+
+        user_settings = merged_user_settings(self.db.get_setting("user_settings", {}))
+        trigger_word = custom_trigger or user_settings.get("trigger_word", "")
+        max_edge = int(user_settings.get("max_edge", 2048))
+        min_edge = int(user_settings.get("min_export_edge", 0))
+
+        vslug = video["slug"]
+        per_video_dir = self.settings.finished_dir / "per_video" / vslug
+        merged_dir = self.settings.finished_dir / "merged"
+        per_video_dir.mkdir(parents=True, exist_ok=True)
+        merged_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = merged_dir / "manifest.jsonl"
+
+        # Fetch kept frames
+        query = """
+            SELECT f.id, f.chunk_id, f.t, f.metrics, f.zs_scores, f.full_path,
+                   c.position as chunk_pos, c.tags as chunk_tags,
+                   p.crop, p.state
+            FROM frames f
+            JOIN picks p ON f.id = p.frame_id
+            JOIN chunks c ON f.chunk_id = c.id
+            WHERE f.video_id = ? AND p.state IN ('keep', 'star')
+            ORDER BY c.position ASC, f.t ASC
+        """
+        kept_frames = self.db.all(query, (video_id,))
+        if not kept_frames:
+            return {"exported": 0, "msg": "No frames marked for keep"}
+
+        exported_count = 0
+        now = time.time()
+
+        for item in kept_frames:
+            full_path = Path(item["full_path"])
+            if not full_path.is_file():
+                continue
+
+            img = cv2.imread(str(full_path))
+            if img is None:
+                continue
+
+            # 1. Apply manual crop if present
+            crop_meta = item.get("crop")
+            if crop_meta and isinstance(crop_meta, dict):
+                h, w = img.shape[:2]
+                cx0 = max(0, int(crop_meta.get("x", 0) * w))
+                cy0 = max(0, int(crop_meta.get("y", 0) * h))
+                cw = min(w - cx0, int(crop_meta.get("width", 1) * w))
+                ch = min(h - cy0, int(crop_meta.get("height", 1) * h))
+                if cw > 32 and ch > 32:
+                    img = img[cy0:cy0 + ch, cx0:cx0 + cw]
+
+            # 2. Check minimum resolution
+            h, w = img.shape[:2]
+            if min_edge > 0 and min(h, w) < min_edge:
+                continue
+
+            # 3. Downscale with Lanczos if > max_edge
+            img = clamp_max_edge(img, max_edge=max_edge)
+
+            # 4. Snap to multiples of 16 (for MMDiT/DiT latents)
+            img = snap_to_multiple_of_16(img)
+
+            # File names
+            pts_ms = int(item["t"] * 1000)
+            chunk_num = item["chunk_pos"] + 1
+            base_name = f"{vslug}_c{chunk_num:02d}_{pts_ms:07d}"
+            img_filename = f"{base_name}.png"
+            txt_filename = f"{base_name}.txt"
+            json_filename = f"{base_name}.json"
+
+            per_img_path = per_video_dir / img_filename
+            per_txt_path = per_video_dir / txt_filename
+            per_json_path = per_video_dir / json_filename
+
+            # Save PNG (sRGB, EXIF-free)
+            cv2.imwrite(str(per_img_path), img)
+
+            # Generate caption stub
+            raw_tags = item.get("chunk_tags")
+            if isinstance(raw_tags, str):
+                try:
+                    chunk_tags = json.loads(raw_tags)
+                except Exception:
+                    chunk_tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
+            elif isinstance(raw_tags, list):
+                chunk_tags = raw_tags
+            else:
+                chunk_tags = []
+            zs = item.get("zs_scores") or {}
+            frame_tags = zs.get("tags") or []
+            caption_parts = []
+            if trigger_word:
+                caption_parts.append(trigger_word)
+            seen_tags = set(t.lower() for t in caption_parts)
+            for t in (chunk_tags + frame_tags):
+                t_clean = t.strip()
+                if t_clean and t_clean.lower() not in seen_tags:
+                    seen_tags.add(t_clean.lower())
+                    caption_parts.append(t_clean)
+            if zs.get("best_label") and zs["best_label"].lower() not in seen_tags:
+                caption_parts.append(zs["best_label"])
+
+            caption_text = ", ".join(caption_parts)
+            per_txt_path.write_text(caption_text, encoding="utf-8")
+
+            # JSON metadata sidecar
+            meta_payload = {
+                "source_video": video["name"],
+                "video_id": video_id,
+                "chunk_id": item["chunk_id"],
+                "timestamp_s": item["t"],
+                "width": img.shape[1],
+                "height": img.shape[0],
+                "caption": caption_text,
+                "metrics": item.get("metrics"),
+                "zero_shot_scores": zs,
+                "exported_at": now,
+            }
+            per_json_path.write_text(json.dumps(meta_payload, indent=2), encoding="utf-8")
+
+            # Link or copy to merged directory
+            merged_img_path = merged_dir / img_filename
+            merged_txt_path = merged_dir / txt_filename
+            merged_json_path = merged_dir / json_filename
+
+            for src_p, dst_p in [(per_img_path, merged_img_path), (per_txt_path, merged_txt_path), (per_json_path, merged_json_path)]:
+                if dst_p.exists():
+                    dst_p.unlink()
+                try:
+                    os.link(src_p, dst_p)
+                except OSError:
+                    dst_p.write_bytes(src_p.read_bytes())
+
+            # Append to JSONL manifest
+            with open(manifest_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(meta_payload) + "\n")
+
+            # Record in DB exports table
+            with self.db.write() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO exports (frame_id, per_video_path, merged_path, exported_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(frame_id) DO UPDATE SET
+                        per_video_path=excluded.per_video_path,
+                        merged_path=excluded.merged_path,
+                        exported_at=excluded.exported_at
+                    """,
+                    (item["id"], str(per_img_path), str(merged_img_path), now),
+                )
+
+            exported_count += 1
+
+        # Update video status to exported
+        with self.db.write() as conn:
+            conn.execute("UPDATE videos SET status='exported' WHERE id=?", (video_id,))
+
+        return {
+            "exported": exported_count,
+            "per_video_dir": str(per_video_dir),
+            "merged_dir": str(merged_dir),
+        }
