@@ -113,10 +113,12 @@ export class ChunkService {
     });
   }
 
-  async autoSuggest(videoId: string | number): Promise<void> {
+  /** `confirmDestructive` allows replacing chunks that hold picks (the backend answers 409 otherwise). */
+  async autoSuggest(videoId: string | number, confirmDestructive = false): Promise<void> {
     try {
       const data = await this.api.post<{ chunks?: ChunkItem[]; suggested?: ChunkItem[] }>(
-        `/api/videos/${videoId}/chunks/suggest`
+        `/api/videos/${videoId}/chunks/suggest`,
+        { confirm_destructive: confirmDestructive }
       );
       this.chunks.set(data.suggested || data.chunks || []);
     } catch (err) {
@@ -125,9 +127,10 @@ export class ChunkService {
     }
   }
 
-  async saveChunks(videoId: string | number): Promise<void> {
+  /** `confirmDestructive` allows deleting chunks that hold picks (the backend answers 409 otherwise). */
+  async saveChunks(videoId: string | number, confirmDestructive = false): Promise<void> {
     try {
-      const payload = { chunks: this.chunks() };
+      const payload = { chunks: this.chunks(), confirm_destructive: confirmDestructive };
       await this.api.put(`/api/videos/${videoId}/chunks`, payload);
       await this.loadChunks(videoId);
     } catch (err) {

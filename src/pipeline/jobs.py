@@ -18,12 +18,43 @@ from pipeline.classifier import ClipClassifier
 from pipeline.config import Settings, get_settings, merged_user_settings
 from pipeline.db import DB
 from pipeline.decode import decode_exact_frame, decode_exact_frames, sample_chunk_frames
-from pipeline.export import snap_to_multiple_of_16
+from pipeline.export import existing_caption_kind, link_or_copy, snap_to_multiple_of_16
 from pipeline.metrics import compute_tier1_metrics, filter_and_rank_tier1
-from pipeline.openrouter import ModelRefusalError, OpenRouterCaptioner
+from pipeline.openrouter import (
+    DEFAULT_CAPTION_MAX_TOKENS,
+    ModelRefusalError,
+    OpenRouterCaptioner,
+    looks_truncated,
+    normalize_reasoning_effort,
+)
 from pipeline.scoring import ScoringEngine
 from pipeline.select import select_diverse_top_k
 from pipeline.tagger import LocalTagger
+
+
+SSE_QUEUE_MAX = 500
+SSE_HEARTBEAT_S = 15.0
+
+# Settles a video after a job ends without completing (error or cancel); `?` = video id, then statuses.
+# Nothing changed on cancel, so a fully captioned video goes back to 'exported'.
+SETTLE_VIDEO_STATUS_SQL = """
+    UPDATE videos SET status = CASE
+        WHEN (SELECT COUNT(*) FROM picks p JOIN frames f ON p.frame_id=f.id
+              WHERE f.video_id=videos.id AND p.state IN ('keep', 'star')) > 0
+         AND (SELECT COUNT(*) FROM picks p JOIN frames f ON p.frame_id=f.id
+              WHERE f.video_id=videos.id AND p.state IN ('keep', 'star')
+                AND NOT EXISTS (SELECT 1 FROM exports e WHERE e.frame_id=f.id)) = 0 THEN 'exported'
+        WHEN (SELECT COUNT(*) FROM picks p JOIN frames f ON p.frame_id=f.id
+              WHERE f.video_id=videos.id AND p.role='pick') > 0 THEN 'curating_300'
+        WHEN EXISTS (SELECT 1 FROM chunks c WHERE c.video_id=videos.id) THEN 'chunked'
+        ELSE 'new'
+    END
+    WHERE id=? AND status IN ({placeholders})
+"""
+
+
+class JobCancelled(Exception):
+    """Raised at a job checkpoint after the user cancelled it; the job must not mutate the DB further."""
 
 
 class JobManager:
@@ -36,42 +67,124 @@ class JobManager:
         self.captioner = OpenRouterCaptioner(self.settings)
         # Support 3-4 concurrent extraction jobs in parallel
         self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pipeline_worker")
-        self._listeners: list[asyncio.Queue] = []
+        self._listeners: list[tuple[asyncio.AbstractEventLoop, asyncio.Queue]] = []
         self._lock = threading.Lock()
         self._cancel_flags: set[int] = set()
 
+    @staticmethod
+    def _enqueue(q: asyncio.Queue, payload: str) -> None:
+        """Runs on the listener's event loop. A slow client loses its oldest events, not the newest."""
+        if q.full():
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        q.put_nowait(payload)
+
     def broadcast_event(self, event_type: str, data: dict[str, Any]) -> None:
-        """Broadcast event to all SSE listeners."""
+        """Broadcast event to all SSE listeners. Safe to call from worker threads."""
         payload = json.dumps({"type": event_type, "data": data})
         with self._lock:
-            for q in list(self._listeners):
-                try:
-                    q.put_nowait(payload)
-                except Exception:
-                    pass
+            listeners = list(self._listeners)
+        for loop, q in listeners:
+            try:
+                # asyncio.Queue is not thread-safe; hand the put to the queue's own loop
+                loop.call_soon_threadsafe(self._enqueue, q, payload)
+            except RuntimeError:
+                pass  # loop closed: the stream's finally removes it
 
     async def sse_stream(self) -> AsyncGenerator[str, None]:
-        """Async generator yielding SSE formatted strings."""
-        q = asyncio.Queue()
+        """Async generator yielding SSE formatted strings, with a heartbeat comment when idle."""
+        entry = (asyncio.get_running_loop(), asyncio.Queue(maxsize=SSE_QUEUE_MAX))
+        q = entry[1]
         with self._lock:
-            self._listeners.append(q)
+            self._listeners.append(entry)
         try:
             # Send initial keepalive
             yield f"data: {json.dumps({'type': 'connected'})}\n\n"
             while True:
-                msg = await q.get()
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=SSE_HEARTBEAT_S)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
                 yield f"data: {msg}\n\n"
         finally:
             with self._lock:
-                if q in self._listeners:
-                    self._listeners.remove(q)
+                if entry in self._listeners:
+                    self._listeners.remove(entry)
 
     def cancel_job(self, job_id: int) -> bool:
+        """Request cancellation. Queued jobs end immediately; running jobs stop at their next checkpoint
+        and report `job_cancelled` themselves. Finished jobs cannot be cancelled."""
+        job = self.db.one("SELECT * FROM jobs WHERE id=?", (job_id,))
+        if not job or job["status"] not in ("queued", "running"):
+            return False
         self._cancel_flags.add(job_id)
-        with self.db.write() as conn:
-            conn.execute("UPDATE jobs SET status='cancelled' WHERE id=?", (job_id,))
-        self.broadcast_event("job_cancelled", {"job_id": job_id})
+        if job["status"] == "queued":
+            with self.db.write() as conn:
+                cur = conn.execute(
+                    "UPDATE jobs SET status='cancelled', finished_at=? WHERE id=? AND status='queued'",
+                    (time.time(), job_id),
+                )
+                if cur.rowcount and job["video_id"]:
+                    self._settle_video_status(conn, job["video_id"])
+            if cur.rowcount:
+                self.broadcast_event("job_cancelled", {"job_id": job_id, "video_id": job["video_id"]})
+                return True
+        self.broadcast_event("job_progress", {
+            "job_id": job_id,
+            "video_id": job["video_id"],
+            "chunk_id": job["chunk_id"],
+            "progress": job["progress"],
+            "step": "Cancelling...",
+        })
         return True
+
+    def _check_cancel(self, job_id: int) -> None:
+        if job_id in self._cancel_flags:
+            raise JobCancelled()
+
+    @staticmethod
+    def _settle_video_status(conn: Any, video_id: str) -> None:
+        """Move a video out of a transitional job status after a job ended without completing."""
+        transitional = ("extracting", "extracting_750", "captioning")
+        conn.execute(
+            SETTLE_VIDEO_STATUS_SQL.format(placeholders=", ".join("?" * len(transitional))),
+            (video_id, *transitional),
+        )
+
+    def _start_job(self, job_id: int, video_id: str, video_name: str, chunk_id: int | None = None) -> bool:
+        """Mark a queued job running. False if it was cancelled while still queued."""
+        with self.db.write() as conn:
+            cur = conn.execute(
+                "UPDATE jobs SET status='running', started_at=? WHERE id=? AND status='queued'",
+                (time.time(), job_id),
+            )
+        if cur.rowcount == 0:
+            self._cancel_flags.discard(job_id)
+            return False
+        self.broadcast_event("job_started", {
+            "job_id": job_id,
+            "video_id": video_id,
+            "video_name": video_name,
+            "chunk_id": chunk_id,
+        })
+        return True
+
+    def _finish_cancelled(self, job_id: int, video_id: str, video_name: str) -> None:
+        with self.db.write() as conn:
+            conn.execute(
+                "UPDATE jobs SET status='cancelled', finished_at=? WHERE id=?",
+                (time.time(), job_id),
+            )
+            self._settle_video_status(conn, video_id)
+        self.broadcast_event("job_cancelled", {
+            "job_id": job_id,
+            "video_id": video_id,
+            "video_name": video_name,
+            "chunk_id": None,
+        })
 
     def submit_extract_job(self, video_id: str, chunk_id: int | None = None) -> int:
         now = time.time()
@@ -149,15 +262,8 @@ class JobManager:
         return job_id
 
     def _run_extract_750_job(self, job_id: int, video_id: str, video_name: str) -> None:
-        now = time.time()
-        with self.db.write() as conn:
-            conn.execute("UPDATE jobs SET status='running', started_at=? WHERE id=?", (now, job_id))
-        self.broadcast_event("job_started", {
-            "job_id": job_id,
-            "video_id": video_id,
-            "video_name": video_name,
-            "chunk_id": None,
-        })
+        if not self._start_job(job_id, video_id, video_name):
+            return
 
         try:
             video = self.db.one("SELECT * FROM videos WHERE id=?", (video_id,))
@@ -193,8 +299,7 @@ class JobManager:
             seen_cand_ts: set[float] = set()
 
             for idx, ch in enumerate(chunks):
-                if job_id in self._cancel_flags:
-                    break
+                self._check_cancel(job_id)
 
                 bpct = float(ch.get("budget_pct", 100.0 / max(1, total_chunks)))
                 chunk_n = max(15, round(target_total * (bpct / 100.0)))
@@ -228,15 +333,18 @@ class JobManager:
                 raise RuntimeError("No candidate frames could be sampled from video")
 
             # 2. Quality Metrics
+            self._check_cancel(job_id)
             update_job_progress(0.45, f"Computing Tier-1 metrics on {len(all_candidates)} frames...")
             for c in all_candidates:
                 c["metrics"] = compute_tier1_metrics(c["img_bgr"])
 
             # 3. Batch Embeddings & 7-Dimension Scoring
+            self._check_cancel(job_id)
             update_job_progress(0.55, "Computing CLIP embeddings...")
             images_to_embed = [c["img_bgr"] for c in all_candidates]
             embeddings = self.classifier.embed_images(images_to_embed, batch_size=32)
 
+            self._check_cancel(job_id)
             update_job_progress(0.68, "Evaluating 7-dimension scoring criteria...")
             self.scoring_engine.score_candidates_batch(all_candidates, embeddings)
 
@@ -262,10 +370,14 @@ class JobManager:
 
             exact_frames_map: dict[float, np.ndarray] = {}
             for cid, ch_picks in picks_by_chunk.items():
+                self._check_cancel(job_id)
                 ts = [p["t"] for p in ch_picks]
                 decoded = decode_exact_frames(vpath, ts)
                 exact_frames_map.update(decoded)
 
+            # Last cancel point: the files below can overwrite the current frames' images on disk,
+            # and the commit replaces the current frames, picks and exports.
+            self._check_cancel(job_id)
             saved_records = []
             seen_store_ts: set[float] = set()
             for item in all_to_store:
@@ -351,26 +463,21 @@ class JobManager:
             import gc
             gc.collect()
 
+        except JobCancelled:
+            self._finish_cancelled(job_id, video_id, video_name)
         except Exception as ex:
             with self.db.write() as conn:
                 conn.execute("UPDATE jobs SET status='error', error=?, finished_at=? WHERE id=?", (str(ex), time.time(), job_id))
                 # Never leave video stuck in 'extracting_750'
-                conn.execute(
-                    """
-                    UPDATE videos SET status = CASE
-                        WHEN (SELECT COUNT(*) FROM picks p JOIN frames f ON p.frame_id=f.id WHERE f.video_id=videos.id AND p.role='pick') > 0 THEN 'curating_300'
-                        ELSE 'chunked'
-                    END
-                    WHERE id=? AND status='extracting_750'
-                    """,
-                    (video_id,),
-                )
+                self._settle_video_status(conn, video_id)
             self.broadcast_event("job_error", {
                 "job_id": job_id,
                 "video_id": video_id,
                 "video_name": video_name,
                 "error": str(ex),
             })
+        finally:
+            self._cancel_flags.discard(job_id)
 
     def submit_openrouter_caption_job(self, video_id: str, options: dict[str, Any]) -> int:
         now = time.time()
@@ -398,15 +505,8 @@ class JobManager:
         return job_id
 
     def _run_openrouter_caption_job(self, job_id: int, video_id: str, options: dict[str, Any], video_name: str) -> None:
-        now = time.time()
-        with self.db.write() as conn:
-            conn.execute("UPDATE jobs SET status='running', started_at=? WHERE id=?", (now, job_id))
-        self.broadcast_event("job_started", {
-            "job_id": job_id,
-            "video_id": video_id,
-            "video_name": video_name,
-            "chunk_id": None,
-        })
+        if not self._start_job(job_id, video_id, video_name):
+            return
 
         try:
             import httpx
@@ -415,7 +515,11 @@ class JobManager:
             if not video:
                 raise ValueError(f"Video {video_id} not found")
 
-            api_key = options.get("api_key") or getattr(self.settings, "openrouter_api_key", "")
+            api_key = (
+                options.get("api_key")
+                or (self.db.get_setting("user_settings", {}) or {}).get("openrouter_api_key")
+                or getattr(self.settings, "openrouter_api_key", "")
+            )
             if not api_key:
                 api_key = os.getenv("OPENROUTER_API_KEY", "")
             if not api_key:
@@ -431,11 +535,13 @@ class JobManager:
             primary_model = options.get("model", "google/gemma-4-31b-it")
             layer2_model = options.get("fallback_layer2", "deepseek/deepseek-v4.1-flash")
             layer3_model = options.get("fallback_layer3", "x-ai/grok-4.7")
-            reasoning_effort = options.get("reasoning_effort", "high")
+            # Reasoning is off by default: with effort "high" OpenRouter spends most of max_tokens on reasoning
+            # and the visible caption gets cut off. When enabled, build_request_payload raises the budget.
+            reasoning_effort = normalize_reasoning_effort(options.get("reasoning_effort"))
             mode = options.get("mode", "concept")
             trigger = options.get("trigger", "restrained_elegance")
             class_noun = options.get("class_noun", "woman")
-            max_tokens = min(int(options.get("max_tokens", 300)), 300)
+            max_tokens = int(options.get("max_tokens") or DEFAULT_CAPTION_MAX_TOKENS)
             temperature = float(options.get("temperature", 0.80))
             top_p = float(options.get("top_p", 0.90))
             gemma_temp = float(options.get("gemma_temperature", options.get("primary_temperature", temperature)))
@@ -448,6 +554,7 @@ class JobManager:
             l1_refusals = 0
             l2_refusals = 0
             completed_count = 0
+            failures: list[str] = []
 
             query = """
                 SELECT f.id, f.chunk_id, f.t, f.full_path, f.metrics, f.zs_scores,
@@ -492,6 +599,14 @@ class JobManager:
 
                 async with httpx.AsyncClient() as client:
                     async def process_single_item(item: dict[str, Any]) -> dict[str, Any] | None:
+                        # One frame's timeout, upstream error or triple refusal must not fail the whole batch
+                        try:
+                            return await caption_item(item)
+                        except Exception as ex:
+                            failures.append(f"t={item['t']:.3f}s: {type(ex).__name__}: {ex}")
+                            return None
+
+                    async def caption_item(item: dict[str, Any]) -> dict[str, Any] | None:
                         nonlocal l1_success_count, l2_success_count, l3_success_count, l1_refusals, l2_refusals, completed_count
                         if job_id in self._cancel_flags:
                             return None
@@ -505,9 +620,13 @@ class JobManager:
                         item_cap_model = (item.get("caption_model") or "").strip()
                         l1_model = item_cap_model if (use_chunk_models and item_cap_model) else primary_model
 
-                        # Resume support: if already captioned, keep existing caption without re-billing
-                        if out_txt.is_file() and out_txt.stat().st_size > 10 and out_png.is_file():
-                            caption_text = out_txt.read_text(encoding="utf-8").strip()
+                        # Resume support: if already captioned, keep existing caption without re-billing.
+                        # Exporter stubs and captions cut off by the old 300-token cap get replaced.
+                        caption_text = (
+                            out_txt.read_text(encoding="utf-8").strip()
+                            if existing_caption_kind(out_txt) == "caption" else ""
+                        )
+                        if caption_text and not looks_truncated(caption_text) and out_png.is_file():
                             l1_success_count += 1
                             completed_count += 1
                             # Ensure recorded in DB exports table
@@ -621,17 +740,14 @@ class JobManager:
                                     warnings.append(f"Recovered from {primary_model} & {layer2_model} refusals via Layer 3 ({layer3_model})")
 
                             out_txt.write_text(caption_text, encoding="utf-8")
+                            # A stub sidecar would mark this real caption as a stub again
+                            for stale in (per_video_dir / f"{fname_stem}.json", merged_dir / f"{fname_stem}.json"):
+                                stale.unlink(missing_ok=True)
 
                             merged_png = merged_dir / f"{fname_stem}.png"
                             merged_txt = merged_dir / f"{fname_stem}.txt"
                             for src, dst in [(out_png, merged_png), (out_txt, merged_txt)]:
-                                if dst.exists():
-                                    dst.unlink()
-                                try:
-                                    os.link(str(src), str(dst))
-                                except Exception:
-                                    import shutil
-                                    shutil.copy2(str(src), str(dst))
+                                link_or_copy(src, dst)
 
                             manifest_entry = {
                                 "source_video": video["name"],
@@ -683,12 +799,23 @@ class JobManager:
 
             captioned_results = asyncio.run(process_all_async())
 
+            # Frames captioned before the cancel keep their files and export rows (each one is complete)
+            self._check_cancel(job_id)
+            if failures and not captioned_results:
+                raise RuntimeError(f"All {len(failures)} frames failed. First error: {failures[0]}")
+
+            failure_note = (
+                f"{len(failures)} of {total_frames} frames failed and stay uncaptioned (re-run to retry). "
+                f"First error: {failures[0]}"
+                if failures else None
+            )
             with self.db.write() as conn:
                 conn.execute(
-                    "UPDATE jobs SET status='finished', error=NULL, progress=1.0, finished_at=? WHERE id=?",
-                    (time.time(), job_id),
+                    "UPDATE jobs SET status='finished', error=?, progress=1.0, finished_at=? WHERE id=?",
+                    (failure_note, time.time(), job_id),
                 )
-                conn.execute("UPDATE videos SET status='exported' WHERE id=?", (video_id,))
+                # 'exported' only when every approved frame has a caption; otherwise back to curating
+                self._settle_video_status(conn, video_id)
 
             self.broadcast_event("job_finished", {
                 "job_id": job_id,
@@ -696,43 +823,32 @@ class JobManager:
                 "video_name": video_name,
                 "chunk_id": None,
                 "exported": len(captioned_results),
+                "failed": len(failures),
             })
 
+        except JobCancelled:
+            self._finish_cancelled(job_id, video_id, video_name)
         except Exception as ex:
             err_msg = f"{type(ex).__name__}: {str(ex)}".strip(": ")
             with self.db.write() as conn:
                 conn.execute("UPDATE jobs SET status='error', error=?, finished_at=? WHERE id=?", (err_msg, time.time(), job_id))
                 # Never leave video stuck in 'captioning'
-                conn.execute(
-                    """
-                    UPDATE videos SET status = CASE
-                        WHEN (SELECT COUNT(*) FROM picks p JOIN frames f ON p.frame_id=f.id WHERE f.video_id=videos.id AND p.role='pick') > 0 THEN 'curating_300'
-                        ELSE 'chunked'
-                    END
-                    WHERE id=? AND status='captioning'
-                    """,
-                    (video_id,),
-                )
+                self._settle_video_status(conn, video_id)
             self.broadcast_event("job_error", {
                 "job_id": job_id,
                 "video_id": video_id,
                 "video_name": video_name,
                 "error": str(ex),
             })
+        finally:
+            self._cancel_flags.discard(job_id)
 
     def _run_auto_process_job(self, job_id: int, video_id: str, video_name: str, target_frames: int) -> None:
         from pipeline.autoprocess import AutoProcessor
 
         processor = AutoProcessor(self.db, self.settings, job_manager=self)
-        now = time.time()
-        with self.db.write() as conn:
-            conn.execute("UPDATE jobs SET status='running', started_at=? WHERE id=?", (now, job_id))
-        self.broadcast_event("job_started", {
-            "job_id": job_id,
-            "video_id": video_id,
-            "video_name": video_name,
-            "chunk_id": None,
-        })
+        if not self._start_job(job_id, video_id, video_name):
+            return
 
         def on_prog(pct: float, step: str):
             with self.db.write() as conn:
@@ -764,23 +880,19 @@ class JobManager:
         except Exception as ex:
             with self.db.write() as conn:
                 conn.execute("UPDATE jobs SET status='error', error=?, finished_at=? WHERE id=?", (str(ex), time.time(), job_id))
+                self._settle_video_status(conn, video_id)
             self.broadcast_event("job_error", {
                 "job_id": job_id,
                 "video_id": video_id,
                 "video_name": video_name,
                 "error": str(ex),
             })
+        finally:
+            self._cancel_flags.discard(job_id)
 
     def _run_job(self, job_id: int, video_id: str, chunk_id: int | None, video_name: str) -> None:
-        now = time.time()
-        with self.db.write() as conn:
-            conn.execute("UPDATE jobs SET status='running', started_at=? WHERE id=?", (now, job_id))
-        self.broadcast_event("job_started", {
-            "job_id": job_id,
-            "video_id": video_id,
-            "video_name": video_name,
-            "chunk_id": chunk_id,
-        })
+        if not self._start_job(job_id, video_id, video_name, chunk_id):
+            return
 
         try:
             if chunk_id:
@@ -852,12 +964,15 @@ class JobManager:
         except Exception as ex:
             with self.db.write() as conn:
                 conn.execute("UPDATE jobs SET status='error', error=?, finished_at=? WHERE id=?", (str(ex), time.time(), job_id))
+                self._settle_video_status(conn, video_id)
             self.broadcast_event("job_error", {
                 "job_id": job_id,
                 "video_id": video_id,
                 "video_name": video_name,
                 "error": str(ex),
             })
+        finally:
+            self._cancel_flags.discard(job_id)
 
     def _process_chunk(
         self,

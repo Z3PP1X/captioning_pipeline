@@ -1,5 +1,17 @@
 import { Injectable } from '@angular/core';
 
+/** Non-2xx response. `detail` is FastAPI's `detail` (a string, or an object such as the 409 re-chunk guard). */
+export class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    readonly detail: unknown,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
 @Injectable({
   providedIn: 'root',
 })
@@ -16,7 +28,7 @@ export class ApiService {
     });
 
     if (!res.ok) {
-      let detail = res.statusText;
+      let detail: unknown = res.statusText;
       try {
         const errJson = await res.json();
         if (errJson && errJson.detail) {
@@ -25,7 +37,11 @@ export class ApiService {
       } catch {
         // Fallback to statusText
       }
-      throw new Error(detail || `API request failed with status ${res.status}`);
+      const message =
+        typeof detail === 'string'
+          ? detail
+          : String((detail as { message?: string } | null)?.message ?? '');
+      throw new ApiError(res.status, detail, message || `API request failed with status ${res.status}`);
     }
 
     return res.json() as Promise<T>;

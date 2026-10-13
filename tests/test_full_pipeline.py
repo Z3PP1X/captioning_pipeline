@@ -197,6 +197,10 @@ def test_concurrent_job_manager():
         jm = JobManager(db, settings)
         try:
             assert jm.executor._max_workers == 4
+            # Hold submitted jobs in 'queued' so cancellation is deterministic (no worker race)
+            held: list[tuple] = []
+            real_submit = jm.executor.submit
+            jm.executor.submit = lambda fn, *args: held.append((fn, args))
 
             # Submit jobs for two separate videos
             j1 = jm.submit_extract_job("v1")
@@ -211,7 +215,7 @@ def test_concurrent_job_manager():
             assert row1["video_id"] == "v1"
             assert row2["video_id"] == "v2"
 
-            # Cancel job 1 only
+            # Cancel job 1 only: a queued job ends immediately and its video leaves 'extracting'
             ok = jm.cancel_job(j1)
             assert ok
             assert j1 in jm._cancel_flags
@@ -219,5 +223,18 @@ def test_concurrent_job_manager():
 
             row1_after = db.one("SELECT status FROM jobs WHERE id=?", (j1,))
             assert row1_after["status"] == "cancelled"
+            assert db.one("SELECT status FROM videos WHERE id='v1'")["status"] == "new"
+
+            # The worker must not resurrect a job cancelled while queued (review C4c)
+            for fn, args in held:
+                fn(*args)
+            assert db.one("SELECT status FROM jobs WHERE id=?", (j1,))["status"] == "cancelled"
+            assert db.one("SELECT status FROM jobs WHERE id=?", (j2,))["status"] == "finished"
+            assert not jm._cancel_flags
+
+            # Finished jobs cannot be cancelled (review C4d)
+            assert jm.cancel_job(j2) is False
+            assert db.one("SELECT status FROM jobs WHERE id=?", (j2,))["status"] == "finished"
+            jm.executor.submit = real_submit
         finally:
             jm.executor.shutdown(wait=False)

@@ -18,6 +18,7 @@ import {
 } from '@ng-icons/lucide';
 import { HlmButtonImports } from '@spartan-ng/helm/button';
 import { HlmBadgeImports } from '@spartan-ng/helm/badge';
+import { ApiError } from '../../core/services/api.service';
 import { ChunkService } from '../../core/services/chunk.service';
 import { VideoService } from '../../core/services/video.service';
 import { JobEventService } from '../../core/services/job-event.service';
@@ -381,11 +382,29 @@ export class ChunksPanelComponent {
     }
   }
 
+  /**
+   * Runs a chunk write; when the backend refuses to delete chunks that hold picks (409), asks once and
+   * retries with confirmation. Returns false when the user declines.
+   * TODO(B4): replace window.confirm with an hlm alert-dialog.
+   */
+  private async withRechunkConfirm(write: (confirm: boolean) => Promise<void>): Promise<boolean> {
+    try {
+      await write(false);
+      return true;
+    } catch (err) {
+      if (!(err instanceof ApiError) || err.status !== 409) throw err;
+      if (!window.confirm(`${err.message}\n\nThis cannot be undone. Continue?`)) return false;
+      await write(true);
+      return true;
+    }
+  }
+
   async onAutoSuggest(): Promise<void> {
     const video = this.videoService.currentVideo();
     if (video) {
       try {
-        await this.chunkService.autoSuggest(video.id);
+        const done = await this.withRechunkConfirm((confirm) => this.chunkService.autoSuggest(video.id, confirm));
+        if (!done) return;
         this.jobEvents.showToast(
           'Auto-Suggest Complete',
           `Generated ${this.chunkService.chunks().length} scene chunks using visual cuts!`,
@@ -409,7 +428,8 @@ export class ChunksPanelComponent {
     const video = this.videoService.currentVideo();
     if (video) {
       try {
-        await this.chunkService.saveChunks(video.id);
+        const done = await this.withRechunkConfirm((confirm) => this.chunkService.saveChunks(video.id, confirm));
+        if (!done) return;
         this.jobEvents.showToast(
           'Chunks Saved',
           `Saved ${this.chunkService.chunks().length} scene chunks!`,

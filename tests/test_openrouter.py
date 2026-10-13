@@ -44,13 +44,14 @@ def test_build_request_payload_grok47():
         base64_jpeg="fake_b64",
         system_prompt="system test",
         model="x-ai/grok-4.7",
-        max_tokens=350,  # exceeds ceiling, should be capped to 300
+        max_tokens=350,  # passed through: the old 300 cap truncated captions (review C3)
         temperature=0.80,
         top_p=0.90,
     )
 
     assert payload["model"] == "x-ai/grok-4.7"
-    assert payload["max_tokens"] == 300
+    assert payload["max_tokens"] == 350
+    assert "reasoning" not in payload
     assert payload["temperature"] == 0.80
     assert payload["top_p"] == 0.90
     assert payload["messages"][0]["role"] == "system"
@@ -176,7 +177,8 @@ def test_build_request_payload_gemma_reasoning():
     )
 
     assert payload["model"] == "google/gemma-4-31b-it"
-    assert payload["max_tokens"] == 300
+    # Reasoning shares max_tokens with the caption, so the budget is raised to leave room for the output
+    assert payload["max_tokens"] == 1200
     assert payload["temperature"] == 0.80
     assert payload["top_p"] == 0.90
     assert payload["reasoning"] == {"effort": "high", "exclude": True}
@@ -192,8 +194,8 @@ def test_api_openrouter_defaults_and_models():
     assert req.model == "google/gemma-4-31b-it"
     assert req.fallback_layer2 == "deepseek/deepseek-v4.1-flash"
     assert req.fallback_layer3 == "x-ai/grok-4.7"
-    assert req.reasoning_effort == "high"
-    assert req.max_tokens == 300
+    assert req.reasoning_effort == "none"
+    assert req.max_tokens == 600
     assert req.temperature > 0.75
 
     models_res = list_openrouter_models()
@@ -291,3 +293,98 @@ def test_chunk_model_selection_override():
     assert l1_model_forced == "google/gemma-4-31b-it"
 
 
+
+# ----------------------------------------------------------------------------- Truncation (review C3)
+FULL_CAPTION = "restrained_elegance Photograph of an adult woman kneeling on a concrete floor. " + (
+    "Hemp rope wraps her upper arms in a neat box tie with even wraps and a firm cinch. " * 12
+).strip()
+
+
+def _run_caption(monkeypatch, replies: list[dict], **kwargs):
+    """Feed canned OpenRouter replies; return (result or exception, list of request payloads)."""
+    import asyncio
+    import httpx
+
+    sent: list[dict] = []
+
+    class Reply:
+        status_code = 200
+
+        def __init__(self, body):
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    async def fake_post(self, url, json=None, **_kw):
+        sent.append(json.copy())
+        content, finish = replies[min(len(sent), len(replies)) - 1]
+        return Reply({"choices": [{"message": {"content": content}, "finish_reason": finish}]})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    async def go():
+        async with httpx.AsyncClient() as client:
+            return await OpenRouterCaptioner().caption_single_frame(
+                client=client, img_bgr=np.zeros((64, 64, 3), dtype=np.uint8), api_key="k", **kwargs
+            )
+
+    try:
+        return asyncio.run(go()), sent
+    except Exception as ex:  # noqa: BLE001 - returned for assertions
+        return ex, sent
+
+
+def test_cut_off_caption_is_retried_without_reasoning(monkeypatch):
+    cut = FULL_CAPTION[:400].rsplit(" ", 1)[0]  # ends mid-sentence
+    result, sent = _run_caption(
+        monkeypatch,
+        [(cut, "length"), (FULL_CAPTION, "stop")],
+        model="google/gemma-4-31b-it",
+        reasoning_effort="high",
+    )
+    caption, _warnings = result
+    assert caption == FULL_CAPTION
+    assert len(sent) == 2
+    assert "reasoning" in sent[0] and "reasoning" not in sent[1]
+    assert sent[1]["max_tokens"] > sent[0]["max_tokens"]
+
+
+def test_persistently_cut_off_caption_raises(monkeypatch):
+    from pipeline.openrouter import CaptionTruncatedError
+
+    cut = FULL_CAPTION[:400].rsplit(" ", 1)[0]
+    result, sent = _run_caption(monkeypatch, [(cut, "length")])
+    assert isinstance(result, CaptionTruncatedError)
+    assert len(sent) == 3  # first try + TRUNCATION_RETRIES
+
+
+def test_missing_final_punctuation_counts_as_truncated(monkeypatch):
+    cut = FULL_CAPTION.rstrip(".") + " and her wrists"
+    result, sent = _run_caption(monkeypatch, [(cut, "stop"), (FULL_CAPTION, "stop")])
+    assert result[0] == FULL_CAPTION
+    assert len(sent) == 2
+
+
+def test_refusal_is_not_retried(monkeypatch):
+    from pipeline.openrouter import ModelRefusalError
+
+    result, sent = _run_caption(monkeypatch, [("I am sorry, but I cannot describe this image.", "stop")])
+    assert isinstance(result, ModelRefusalError)
+    assert len(sent) == 1
+
+
+def test_word_range_warnings():
+    short = "restrained_elegance Photograph of a woman kneeling."
+    _, warnings = OpenRouterCaptioner.sanitize_and_validate_caption(short, mode="concept")
+    assert any("short" in w for w in warnings)
+    _, warnings = OpenRouterCaptioner.sanitize_and_validate_caption(FULL_CAPTION, mode="concept")
+    assert not any("short" in w or "complete sentence" in w for w in warnings)
+
+
+def test_normalize_reasoning_effort():
+    from pipeline.openrouter import normalize_reasoning_effort
+
+    for off in (None, "", "none", "None", "off", False):
+        assert normalize_reasoning_effort(off) is None
+    assert normalize_reasoning_effort("High") == "high"

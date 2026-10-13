@@ -5,6 +5,7 @@ description = "Video frame extraction, quality control, curation and dataset exp
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "fastapi>=0.115",
+    "httpx>=0.27",
     "uvicorn[standard]>=0.30",
     "av>=13.0",
     "opencv-python-headless>=4.10",
@@ -17,7 +18,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8.0", "httpx>=0.27"]
+dev = ["pytest>=8.0"]
 
 [build-system]
 requires = ["hatchling"]

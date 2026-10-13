@@ -29,7 +29,7 @@ export class DatasetService {
 
   async exportVideo(videoId: string | number): Promise<void> {
     try {
-      await this.api.post(`/api/videos/${videoId}/export`);
+      await this.api.post('/api/export', { video_id: String(videoId) });
       await this.loadDataset();
     } catch (err) {
       console.error(`Failed to export video ${videoId}:`, err);
@@ -40,7 +40,7 @@ export class DatasetService {
   async exportAllCurated(): Promise<void> {
     try {
       this.isLoading.set(true);
-      await this.api.post('/api/export_all');
+      await this.api.post('/api/export', {});
       await this.loadDataset();
     } catch (err) {
       console.error('Failed to export all curated videos:', err);

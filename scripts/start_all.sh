@@ -13,4 +13,4 @@ echo "[$(date '+%H:%M:%S')] 1. Compiling Angular frontend into src/web/dist/brow
 
 echo "[$(date '+%H:%M:%S')] 2. Launching Captioning Pipeline FastAPI server on http://0.0.0.0:8000..."
 source "$SCRIPT_DIR/env.sh"
-exec uv run uvicorn pipeline.api:app --host 0.0.0.0 --port 8000 --timeout-graceful-shutdown 1
+exec uv run uvicorn pipeline.api:app --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 1

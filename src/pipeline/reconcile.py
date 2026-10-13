@@ -15,6 +15,9 @@ logger = logging.getLogger("pipeline.reconcile")
 # Matches: {slug}_c{chunk_num:02d}_{pts_ms:07d}.txt
 CAPTION_FILE_REGEX = re.compile(r"^(.*)_c(\d+)_(\d+)\.txt$")
 
+# Frames the caption job and exporter act on (any role; mirrors the caption job query)
+APPROVED = "p.state IN ('keep', 'star')"
+
 
 def reconcile_captions_and_state(db: DB, settings: Settings | None = None) -> dict[str, Any]:
     """
@@ -126,11 +129,20 @@ def reconcile_captions_and_state(db: DB, settings: Settings | None = None) -> di
         )
         pick_count = picks_row["cnt"] if picks_row else 0
 
-        exports_row = db.one(
-            "SELECT COUNT(*) as cnt FROM exports e JOIN frames f ON e.frame_id=f.id WHERE f.video_id=?",
+        # Only approved frames are captioned/exported (same filter as the caption job), so rejected
+        # picks must not count towards "fully exported".
+        approved_row = db.one(
+            f"""
+            SELECT COUNT(*) as approved,
+                   SUM(CASE WHEN e.frame_id IS NOT NULL THEN 1 ELSE 0 END) as exported
+            FROM picks p JOIN frames f ON p.frame_id=f.id
+            LEFT JOIN exports e ON e.frame_id=f.id
+            WHERE f.video_id=? AND {APPROVED}
+            """,
             (vid,),
         )
-        export_count = exports_row["cnt"] if exports_row else 0
+        approved_count = approved_row["approved"] if approved_row else 0
+        export_count = (approved_row["exported"] or 0) if approved_row else 0
 
         chunks_row = db.one("SELECT COUNT(*) as cnt FROM chunks WHERE video_id=?", (vid,))
         chunk_count = chunks_row["cnt"] if chunks_row else 0
@@ -141,7 +153,7 @@ def reconcile_captions_and_state(db: DB, settings: Settings | None = None) -> di
         # Determine target status
         target_status = current_status
         if current_status not in ("skipped", "ignored", "broken"):
-            if pick_count > 0 and export_count >= pick_count:
+            if approved_count > 0 and export_count >= approved_count:
                 target_status = "exported"
             elif pick_count > 0:
                 # Video has curated picks; if it was stuck in captioning or extracting_750, heal to curating_300
@@ -163,6 +175,7 @@ def reconcile_captions_and_state(db: DB, settings: Settings | None = None) -> di
                 "from_status": current_status,
                 "to_status": target_status,
                 "picks": pick_count,
+                "approved": approved_count,
                 "exports": export_count,
             })
 
@@ -182,20 +195,30 @@ def get_video_scenes_caption_stats(db: DB, video_id: str) -> list[dict[str, Any]
             "SELECT COUNT(*) as cnt FROM picks p JOIN frames f ON p.frame_id=f.id WHERE f.chunk_id=? AND p.role='pick'",
             (cid,),
         )["cnt"]
+        # Approved (keep/star) frames are what gets captioned; rejected picks do not block "fully captioned"
+        approved_cnt = db.one(
+            f"SELECT COUNT(*) as cnt FROM picks p JOIN frames f ON p.frame_id=f.id WHERE f.chunk_id=? AND {APPROVED}",
+            (cid,),
+        )["cnt"]
 
         exports_cnt = db.one(
-            "SELECT COUNT(*) as cnt FROM exports e JOIN frames f ON e.frame_id=f.id WHERE f.chunk_id=?",
+            f"""
+            SELECT COUNT(*) as cnt FROM exports e JOIN frames f ON e.frame_id=f.id
+            JOIN picks p ON p.frame_id=f.id
+            WHERE f.chunk_id=? AND {APPROVED}
+            """,
             (cid,),
         )["cnt"]
 
         total_frames = db.one("SELECT COUNT(*) as cnt FROM frames WHERE chunk_id=?", (cid,))["cnt"]
 
-        is_full = (exports_cnt >= picks_cnt and picks_cnt > 0)
-        progress = round((exports_cnt / picks_cnt) * 100, 1) if picks_cnt > 0 else 0.0
+        is_full = (exports_cnt >= approved_cnt and approved_cnt > 0)
+        progress = round((exports_cnt / approved_cnt) * 100, 1) if approved_cnt > 0 else 0.0
 
         item = dict(ch)
         item.update({
             "picks_count": picks_cnt,
+            "approved_count": approved_cnt,
             "exports_count": exports_cnt,
             "captioned_count": exports_cnt,
             "total_frames": total_frames,

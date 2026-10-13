@@ -196,7 +196,8 @@ export class OpenRouterModalComponent implements OnInit {
         model: this.model || 'google/gemma-4-31b-it',
         fallback_layer2: 'deepseek/deepseek-v4.1-flash',
         fallback_layer3: 'x-ai/grok-4.7',
-        reasoning_effort: 'high',
+        // Reasoning shares the token budget with the caption and truncated it; the backend default is off
+        reasoning_effort: 'none',
         use_chunk_models: true,
         mode: this.mode || 'concept',
         trigger: this.triggerWord || 'restrained_elegance',

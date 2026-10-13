@@ -41,6 +41,34 @@ def clamp_max_edge(img: np.ndarray, max_edge: int = 2048) -> np.ndarray:
     return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
 
 
+def existing_caption_kind(txt_path: Path) -> str | None:
+    """Classify a caption file on disk: None (absent/empty), 'stub' (exporter-generated) or 'caption' (VLM).
+
+    Only the exporter writes a `.json` sidecar, and it marks stubs with `caption_source`. Legacy sidecars
+    without the field were always stubs. A `.txt` without a sidecar comes from the caption job.
+    """
+    if not txt_path.is_file() or txt_path.stat().st_size <= 10:
+        return None
+    sidecar = txt_path.with_suffix(".json")
+    if not sidecar.is_file():
+        return "caption"
+    try:
+        source = json.loads(sidecar.read_text(encoding="utf-8")).get("caption_source", "stub")
+    except Exception:
+        source = "stub"
+    return "stub" if source == "stub" else "caption"
+
+
+def link_or_copy(src: Path, dst: Path) -> None:
+    """Hard-link src to dst (replacing dst); copy when hard links are unsupported."""
+    if dst.exists():
+        dst.unlink()
+    try:
+        os.link(src, dst)
+    except OSError:
+        dst.write_bytes(src.read_bytes())
+
+
 class Exporter:
     def __init__(self, db: DB, settings: Settings | None = None):
         self.db = db
@@ -84,9 +112,33 @@ class Exporter:
             return {"exported": 0, "msg": "No frames marked for keep"}
 
         exported_count = 0
+        kept_captions = 0
         now = time.time()
 
         for item in kept_frames:
+            # File names
+            pts_ms = int(item["t"] * 1000)
+            chunk_num = item["chunk_pos"] + 1
+            base_name = f"{vslug}_c{chunk_num:02d}_{pts_ms:07d}"
+            img_filename = f"{base_name}.png"
+            txt_filename = f"{base_name}.txt"
+            json_filename = f"{base_name}.json"
+
+            per_img_path = per_video_dir / img_filename
+            per_txt_path = per_video_dir / txt_filename
+            per_json_path = per_video_dir / json_filename
+            merged_img_path = merged_dir / img_filename
+
+            # Never overwrite a VLM caption: re-link it and record the export only
+            has_caption = existing_caption_kind(per_txt_path) == "caption"
+            if has_caption and per_img_path.is_file():
+                for src_p, dst_p in [(per_img_path, merged_img_path), (per_txt_path, merged_dir / txt_filename)]:
+                    if not dst_p.exists():
+                        link_or_copy(src_p, dst_p)
+                self._record_export(item["id"], per_img_path, merged_img_path, now)
+                kept_captions += 1
+                continue
+
             full_path = Path(item["full_path"])
             if not full_path.is_file():
                 continue
@@ -117,20 +169,16 @@ class Exporter:
             # 4. Snap to multiples of 16 (for MMDiT/DiT latents)
             img = snap_to_multiple_of_16(img)
 
-            # File names
-            pts_ms = int(item["t"] * 1000)
-            chunk_num = item["chunk_pos"] + 1
-            base_name = f"{vslug}_c{chunk_num:02d}_{pts_ms:07d}"
-            img_filename = f"{base_name}.png"
-            txt_filename = f"{base_name}.txt"
-            json_filename = f"{base_name}.json"
-
-            per_img_path = per_video_dir / img_filename
-            per_txt_path = per_video_dir / txt_filename
-            per_json_path = per_video_dir / json_filename
-
             # Save PNG (sRGB, EXIF-free)
             cv2.imwrite(str(per_img_path), img)
+
+            if has_caption:
+                # The caption survived but its image did not: restore the PNG, leave the caption alone
+                for src_p, dst_p in [(per_img_path, merged_img_path), (per_txt_path, merged_dir / txt_filename)]:
+                    link_or_copy(src_p, dst_p)
+                self._record_export(item["id"], per_img_path, merged_img_path, now)
+                kept_captions += 1
+                continue
 
             # Generate caption stub
             raw_tags = item.get("chunk_tags")
@@ -169,6 +217,8 @@ class Exporter:
                 "width": img.shape[1],
                 "height": img.shape[0],
                 "caption": caption_text,
+                # Marks this .txt as a placeholder so the caption job re-captions it and later exports keep it
+                "caption_source": "stub",
                 "metrics": item.get("metrics"),
                 "zero_shot_scores": zs,
                 "exported_at": now,
@@ -176,36 +226,18 @@ class Exporter:
             per_json_path.write_text(json.dumps(meta_payload, indent=2), encoding="utf-8")
 
             # Link or copy to merged directory
-            merged_img_path = merged_dir / img_filename
-            merged_txt_path = merged_dir / txt_filename
-            merged_json_path = merged_dir / json_filename
-
-            for src_p, dst_p in [(per_img_path, merged_img_path), (per_txt_path, merged_txt_path), (per_json_path, merged_json_path)]:
-                if dst_p.exists():
-                    dst_p.unlink()
-                try:
-                    os.link(src_p, dst_p)
-                except OSError:
-                    dst_p.write_bytes(src_p.read_bytes())
+            for src_p, dst_p in [
+                (per_img_path, merged_img_path),
+                (per_txt_path, merged_dir / txt_filename),
+                (per_json_path, merged_dir / json_filename),
+            ]:
+                link_or_copy(src_p, dst_p)
 
             # Append to JSONL manifest
             with open(manifest_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(meta_payload) + "\n")
 
-            # Record in DB exports table
-            with self.db.write() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO exports (frame_id, per_video_path, merged_path, exported_at)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(frame_id) DO UPDATE SET
-                        per_video_path=excluded.per_video_path,
-                        merged_path=excluded.merged_path,
-                        exported_at=excluded.exported_at
-                    """,
-                    (item["id"], str(per_img_path), str(merged_img_path), now),
-                )
-
+            self._record_export(item["id"], per_img_path, merged_img_path, now)
             exported_count += 1
 
         # Update video status to exported
@@ -213,7 +245,23 @@ class Exporter:
             conn.execute("UPDATE videos SET status='exported' WHERE id=?", (video_id,))
 
         return {
-            "exported": exported_count,
+            "exported": exported_count + kept_captions,
+            "stubs_written": exported_count,
+            "captions_kept": kept_captions,
             "per_video_dir": str(per_video_dir),
             "merged_dir": str(merged_dir),
         }
+
+    def _record_export(self, frame_id: int, per_img_path: Path, merged_img_path: Path, now: float) -> None:
+        with self.db.write() as conn:
+            conn.execute(
+                """
+                INSERT INTO exports (frame_id, per_video_path, merged_path, exported_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(frame_id) DO UPDATE SET
+                    per_video_path=excluded.per_video_path,
+                    merged_path=excluded.merged_path,
+                    exported_at=excluded.exported_at
+                """,
+                (frame_id, str(per_img_path), str(merged_img_path), now),
+            )

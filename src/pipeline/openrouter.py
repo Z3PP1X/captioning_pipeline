@@ -22,6 +22,38 @@ BANNED_SLUDGE = [
     "award winning", "trending on artstation", "unreal engine"
 ]
 BRACKET_WEIGHT_REGEX = re.compile(r"(\([^\)]+:\d+(\.\d+)?\)|\[[^\]]+:\d+(\.\d+)?\]|\(\([^\)]+\)\))")
+
+# Visible-output budget. 180 words is ~250 tokens; the old hard cap of 300 left no headroom.
+DEFAULT_CAPTION_MAX_TOKENS = 600
+# With reasoning on, OpenRouter's max_tokens covers reasoning + output ("high" ~ 80% reasoning)
+MIN_MAX_TOKENS_WITH_REASONING = 1200
+MAX_CAPTION_MAX_TOKENS = 4000
+# Extra attempts when a caption comes back cut off or far too short
+TRUNCATION_RETRIES = 2
+
+# Target word range per mode (must match the ranges stated in load_system_prompt)
+MODE_WORD_RANGES = {"concept": (120, 180), "character": (80, 140), "style": (75, 130)}
+TERMINAL_PUNCTUATION = ('.', '!', '?', '"', "'", ')', '…', '»', '”', '’')
+
+
+def normalize_reasoning_effort(value: Any) -> str | None:
+    """None/''/'none'/'off'/False -> None (reasoning disabled); otherwise the effort string."""
+    if value is None or value is False:
+        return None
+    text = str(value).strip().lower()
+    return None if text in ("", "none", "off", "false", "0") else text
+
+
+def looks_truncated(text: str) -> bool:
+    """A caption that does not end a sentence was almost certainly cut off by the token limit."""
+    stripped = text.rstrip()
+    return bool(stripped) and not stripped.endswith(TERMINAL_PUNCTUATION)
+
+
+class CaptionTruncatedError(RuntimeError):
+    """The model kept returning a cut-off caption (finish_reason 'length' or no closing sentence)."""
+
+
 class ModelRefusalError(Exception):
     """Raised when the vision-language model refuses to caption the image due to safety or content filter."""
     def __init__(self, message: str, raw_response: str = "", model: str = ""):
@@ -179,12 +211,16 @@ class OpenRouterCaptioner:
         base64_jpeg: str,
         system_prompt: str,
         model: str = "google/gemma-4-31b-it",
-        max_tokens: int = 300,
+        max_tokens: int = DEFAULT_CAPTION_MAX_TOKENS,
         temperature: float = 0.80,
         top_p: float = 0.90,
         reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
-        """Builds OpenRouter API payload with max 300 tokens, optional reasoning budget, and tuned sampling."""
+        """Builds the OpenRouter payload. Enabling reasoning raises max_tokens so the visible caption fits."""
+        reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+        if reasoning_effort:
+            max_tokens = max(max_tokens, MIN_MAX_TOKENS_WITH_REASONING)
+        max_tokens = max(64, min(int(max_tokens), MAX_CAPTION_MAX_TOKENS))
         payload: dict[str, Any] = {
             "model": model,
             "messages": [
@@ -204,7 +240,7 @@ class OpenRouterCaptioner:
                     ],
                 },
             ],
-            "max_tokens": min(max_tokens, 300),
+            "max_tokens": max_tokens,
             "temperature": temperature,
             "top_p": top_p,
         }
@@ -251,12 +287,15 @@ class OpenRouterCaptioner:
                 cleaned = f"{trigger} {cleaned}"
                 warnings.append(f"Prepend trigger '{trigger}' to Token 0 position")
 
-        # 4. Token estimate audit
-        tok_est = int(len(cleaned.split()) * 1.25)
-        if tok_est < 40:
-            warnings.append(f"Caption is brief (~{tok_est} tokens)")
-        elif tok_est > 300:
-            warnings.append(f"Caption exceeds budget (~{tok_est} tokens)")
+        # 4. Length audit against the mode's requested word range
+        n_words = len(cleaned.split())
+        lo, hi = MODE_WORD_RANGES.get(mode, MODE_WORD_RANGES["concept"])
+        if n_words < lo:
+            warnings.append(f"Caption is short ({n_words} words, expected {lo}-{hi})")
+        elif n_words > hi:
+            warnings.append(f"Caption is long ({n_words} words, expected {lo}-{hi})")
+        if looks_truncated(cleaned):
+            warnings.append("Caption does not end with a complete sentence")
 
         return cleaned, warnings
 
@@ -269,7 +308,7 @@ class OpenRouterCaptioner:
         mode: str = "concept",
         trigger: str = "restrained_elegance",
         class_noun: str = "woman",
-        max_tokens: int = 300,
+        max_tokens: int = DEFAULT_CAPTION_MAX_TOKENS,
         temperature: float = 0.80,
         top_p: float = 0.90,
         reasoning_effort: str | None = None,
@@ -295,11 +334,14 @@ class OpenRouterCaptioner:
             "X-Title": "Captioning Pipeline Local Extractor",
         }
 
-        # Send with retries on HTTP 429
+        # Send with retries on HTTP 429 and separate retries for cut-off captions
         max_retries = 3
         backoff = 2.0
+        rate_limit_attempts = 0
+        truncation_retries = 0
+        min_words = MODE_WORD_RANGES.get(mode, MODE_WORD_RANGES["concept"])[0]
 
-        for attempt in range(max_retries):
+        while True:
             resp = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 json=payload,
@@ -311,18 +353,32 @@ class OpenRouterCaptioner:
                 data = resp.json()
                 choice = data["choices"][0]
                 raw_text = choice["message"].get("content") or ""
+                hit_limit = choice.get("finish_reason") == "length"
 
-                # If internal reasoning tokens consumed the 300 max_tokens ceiling, retry once with direct output
-                if not raw_text.strip() and choice.get("finish_reason") == "length" and "reasoning" in payload:
-                    payload.pop("reasoning", None)
-                    continue
-
-                if is_refusal_response(raw_text, choice_data=choice):
+                # Refusals are short and complete; detect them before the too-short retry re-bills them.
+                # (Empty content with finish_reason 'length' is a reasoning-starved reply, not a refusal.)
+                if not hit_limit and is_refusal_response(raw_text, choice_data=choice):
                     raise ModelRefusalError(
                         f"Model '{model}' refused image description: {raw_text[:120]}",
                         raw_response=raw_text,
                         model=model,
                     )
+
+                # A caption cut off by the token limit (or a fragment far below the requested length) is
+                # never accepted: retry without reasoning and with a larger budget, then give up loudly.
+                too_short = bool(raw_text.strip()) and len(raw_text.split()) < min_words // 2
+                if hit_limit or (raw_text.strip() and (looks_truncated(raw_text) or too_short)):
+                    if truncation_retries < TRUNCATION_RETRIES:
+                        truncation_retries += 1
+                        payload.pop("reasoning", None)
+                        payload["max_tokens"] = min(MAX_CAPTION_MAX_TOKENS, int(payload["max_tokens"]) * 2)
+                        continue
+                    if hit_limit or looks_truncated(raw_text):
+                        raise CaptionTruncatedError(
+                            f"Model '{model}' returned a cut-off caption after {truncation_retries + 1} attempts "
+                            f"(finish_reason={choice.get('finish_reason')}, {len(raw_text.split())} words)"
+                        )
+                    # Complete but short after retries: accept, sanitize_and_validate_caption warns
 
                 return self.sanitize_and_validate_caption(raw_text, mode=mode, trigger=trigger)
 
@@ -336,11 +392,10 @@ class OpenRouterCaptioner:
                     )
                 raise RuntimeError(f"OpenRouter API Error {resp.status_code}: {err_text}")
             elif resp.status_code == 429:
-                if attempt == max_retries - 1:
+                rate_limit_attempts += 1
+                if rate_limit_attempts >= max_retries:
                     raise RuntimeError(f"OpenRouter Rate Limited (429): {resp.text}")
                 await asyncio.sleep(backoff)
                 backoff *= 2.0
             else:
                 raise RuntimeError(f"OpenRouter API Error {resp.status_code}: {resp.text}")
-
-        raise RuntimeError("OpenRouter API call failed after retries")

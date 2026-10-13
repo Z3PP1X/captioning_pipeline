@@ -12,6 +12,19 @@ from pipeline.indexer import Indexer
 from pipeline.metrics import compute_tier1_metrics, hard_filter_check
 
 
+class DestructiveRechunkError(ValueError):
+    """Saving would delete chunks that hold picks or exports (cascades to frames/picks/exports)."""
+
+    def __init__(self, affected: list[dict[str, Any]]):
+        picks = sum(a["picks"] for a in affected)
+        exports = sum(a["exports"] for a in affected)
+        super().__init__(
+            f"Re-chunking would delete {len(affected)} chunk(s) with {picks} curated pick(s) "
+            f"and {exports} export record(s). Resend with confirm_destructive=true to proceed."
+        )
+        self.affected = affected
+
+
 class AutoChunker:
     """Detects scene boundaries, drops intros/standstills, and distributes frame budgets."""
 
@@ -26,6 +39,7 @@ class AutoChunker:
         target_frames: int = 150,
         min_scene_s: float = 25.0,
         max_scene_s: float = 360.0,
+        confirm_destructive: bool = False,
     ) -> list[dict[str, Any]]:
         """Automatically segment video into coherent scenes and allocate K to hit target_frames."""
         video = self.db.one("SELECT * FROM videos WHERE id=?", (video_id,))
@@ -161,33 +175,96 @@ class AutoChunker:
                 "notes": f"Auto scene #{idx + 1}",
             })
 
-        # Save to database
-        with self.db.write() as conn:
-            conn.execute("DELETE FROM chunks WHERE video_id=?", (video_id,))
-            for ch in chunks:
-                conn.execute(
+        # Suggestions carry no ids, so every existing chunk is replaced (guarded when it holds picks)
+        return self.persist_chunks(video_id, chunks, confirm_destructive=confirm_destructive)
+
+    def persist_chunks(
+        self,
+        video_id: str,
+        chunks: list[dict[str, Any]],
+        confirm_destructive: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Upsert chunks by id; delete only chunks missing from `chunks`.
+
+        Deleting a chunk cascades to its frames, picks and exports, so removing a chunk that holds picks
+        requires `confirm_destructive`. A chunk whose time range changed keeps its frames and is marked
+        dirty until the next extraction.
+        """
+        existing = {c["id"]: c for c in self.db.all("SELECT * FROM chunks WHERE video_id=?", (video_id,))}
+        keep_ids = {c.get("id") for c in chunks if c.get("id") in existing}
+        removed_ids = [cid for cid in existing if cid not in keep_ids]
+
+        if removed_ids and not confirm_destructive:
+            affected = []
+            for cid in removed_ids:
+                counts = self.db.one(
                     """
-                    INSERT INTO chunks (video_id, position, start_s, end_s, k, budget_pct, caption_model, rule, tags, notes, dirty)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                    SELECT
+                        (SELECT COUNT(*) FROM picks WHERE chunk_id=? AND role='pick') AS picks,
+                        (SELECT COUNT(*) FROM exports e JOIN frames f ON e.frame_id=f.id WHERE f.chunk_id=?) AS exports
                     """,
-                    (
-                        video_id,
-                        ch["position"],
-                        ch["start_s"],
-                        ch["end_s"],
-                        ch["k"],
-                        ch["budget_pct"],
-                        ch.get("caption_model", "google/gemma-4-31b-it"),
-                        ch["rule"],
-                        json.dumps(ch["tags"]),
-                        ch["notes"],
-                    ),
+                    (cid, cid),
                 )
-            conn.execute("UPDATE videos SET status='chunked' WHERE id=?", (video_id,))
+                if counts["picks"] or counts["exports"]:
+                    affected.append({"id": cid, "position": existing[cid]["position"], **counts})
+            if affected:
+                raise DestructiveRechunkError(affected)
+
+        with self.db.write() as conn:
+            for cid in removed_ids:
+                conn.execute("DELETE FROM chunks WHERE id=?", (cid,))
+            for idx, ch in enumerate(chunks):
+                tags = ch.get("tags", [])
+                values = (
+                    idx,
+                    round(float(ch["start_s"]), 2),
+                    round(float(ch["end_s"]), 2),
+                    ch["k"],
+                    ch["budget_pct"],
+                    ch.get("caption_model") or "google/gemma-4-31b-it",
+                    ch.get("rule", "person"),
+                    json.dumps(tags) if isinstance(tags, list) else tags,
+                    ch.get("notes", f"Scene #{idx + 1}"),
+                )
+                old = existing.get(ch.get("id"))
+                if old is None:
+                    conn.execute(
+                        """
+                        INSERT INTO chunks (video_id, position, start_s, end_s, k, budget_pct, caption_model, rule, tags, notes, dirty)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                        """,
+                        (video_id, *values),
+                    )
+                else:
+                    moved = (abs(float(old["start_s"]) - values[1]) > 1e-6
+                             or abs(float(old["end_s"]) - values[2]) > 1e-6)
+                    conn.execute(
+                        """
+                        UPDATE chunks SET position=?, start_s=?, end_s=?, k=?, budget_pct=?, caption_model=?,
+                                          rule=?, tags=?, notes=?, dirty=?
+                        WHERE id=?
+                        """,
+                        (*values, 1 if moved else old["dirty"], old["id"]),
+                    )
+            # Only a video without curation work goes back to 'chunked'; editing the budgets of a curated
+            # or exported video must not demote it.
+            conn.execute(
+                """
+                UPDATE videos SET status='chunked'
+                WHERE id=? AND status NOT IN ('extracting', 'extracting_750', 'captioning')
+                  AND (status IN ('new', 'chunking', 'chunked') OR NOT EXISTS (SELECT 1 FROM picks p JOIN frames f ON p.frame_id=f.id WHERE f.video_id=?))
+                """,
+                (video_id, video_id),
+            )
 
         return self.db.all("SELECT * FROM chunks WHERE video_id=? ORDER BY position ASC", (video_id,))
 
-    def save_user_chunks(self, video_id: str, chunks_data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def save_user_chunks(
+        self,
+        video_id: str,
+        chunks_data: list[dict[str, Any]],
+        confirm_destructive: bool = False,
+    ) -> list[dict[str, Any]]:
         """Human-in-the-loop update: save modified chunk timecodes and budget weights (max 15 chunks)."""
         if not chunks_data:
             raise ValueError("Chunks list cannot be empty")
@@ -205,32 +282,12 @@ class AutoChunker:
             max_idx = norm_pcts.index(max(norm_pcts))
             norm_pcts[max_idx] = round(norm_pcts[max_idx] + diff, 1)
 
-        with self.db.write() as conn:
-            conn.execute("DELETE FROM chunks WHERE video_id=?", (video_id,))
-            for idx, c in enumerate(chunks_data):
-                bpct = norm_pcts[idx]
-                chunk_k = max(5, int(c.get("k", round(300 * (bpct / 100.0)))))
-                tags = c.get("tags", [])
-                tags_json = json.dumps(tags) if isinstance(tags, list) else tags
-                cap_model = c.get("caption_model") or "google/gemma-4-31b-it"
-                conn.execute(
-                    """
-                    INSERT INTO chunks (video_id, position, start_s, end_s, k, budget_pct, caption_model, rule, tags, notes, dirty)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-                    """,
-                    (
-                        video_id,
-                        idx,
-                        round(float(c["start_s"]), 2),
-                        round(float(c["end_s"]), 2),
-                        chunk_k,
-                        bpct,
-                        cap_model,
-                        c.get("rule", "person"),
-                        tags_json,
-                        c.get("notes", f"Scene #{idx + 1}"),
-                    ),
-                )
-            conn.execute("UPDATE videos SET status='chunked' WHERE id=?", (video_id,))
-
-        return self.db.all("SELECT * FROM chunks WHERE video_id=? ORDER BY position ASC", (video_id,))
+        rows = []
+        for idx, c in enumerate(chunks_data):
+            bpct = norm_pcts[idx]
+            rows.append({
+                **c,
+                "k": max(5, int(c.get("k", round(300 * (bpct / 100.0))))),
+                "budget_pct": bpct,
+            })
+        return self.persist_chunks(video_id, rows, confirm_destructive=confirm_destructive)

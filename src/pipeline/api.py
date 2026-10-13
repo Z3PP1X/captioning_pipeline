@@ -15,12 +15,13 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from pipeline.autochunk import AutoChunker
+from pipeline.autochunk import AutoChunker, DestructiveRechunkError
 from pipeline.config import DEFAULT_USER_SETTINGS, Settings, get_settings, merged_user_settings
 from pipeline.db import DB
 from pipeline.export import Exporter
 from pipeline.indexer import Indexer
 from pipeline.jobs import JobManager
+from pipeline.openrouter import DEFAULT_CAPTION_MAX_TOKENS
 from pipeline.rag import (
     CHARACTERS,
     CURATED_PRESETS,
@@ -65,10 +66,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Captioning Pipeline API", version="0.1.0", lifespan=lifespan)
 
+# The UI is same-origin (served below, or proxied by `ng serve`). Only the dev server origin is allowed
+# cross-origin; a wildcard would let any website in the browser start paid jobs or change settings.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=["http://localhost:4200", "http://127.0.0.1:4200"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -104,12 +107,15 @@ class ChunkPatch(BaseModel):
 
 class ChunksUpdate(BaseModel):
     chunks: list[ChunkItem]
+    # Required to delete chunks that hold picks/exports (the delete cascades to frames, picks and exports)
+    confirm_destructive: bool = False
 
 
 class SuggestChunksRequest(BaseModel):
     min_len_s: float = 4.0
     k: int = 5
     rule: str = "person"
+    confirm_destructive: bool = False
 
 
 class JobCreate(BaseModel):
@@ -132,12 +138,13 @@ class OpenRouterCaptionRequest(BaseModel):
     model: str = "google/gemma-4-31b-it"
     fallback_layer2: str = "deepseek/deepseek-v4.1-flash"
     fallback_layer3: str = "x-ai/grok-4.7"
-    reasoning_effort: str = "high"
+    # "none" by default: reasoning shares max_tokens with the caption and truncated it (review C3)
+    reasoning_effort: str = "none"
     use_chunk_models: bool = True
     mode: str = "concept"
     trigger: str = "restrained_elegance"
     class_noun: str = "woman"
-    max_tokens: int = 300
+    max_tokens: int = DEFAULT_CAPTION_MAX_TOKENS
     temperature: float = 0.80
     top_p: float = 0.90
 
@@ -273,8 +280,9 @@ def get_filmstrip(video_id: str):
 
 @app.get("/api/videos/{video_id}/filmstrip/{filename}")
 def get_filmstrip_thumb(video_id: str, filename: str):
-    p = settings.filmstrip_dir / video_id / filename
-    if not p.is_file():
+    root = settings.filmstrip_dir.resolve()
+    p = (root / video_id / filename).resolve()
+    if not p.is_relative_to(root) or not p.is_file():
         raise HTTPException(status_code=404, detail="Thumbnail not found")
     return FileResponse(p, media_type="image/webp")
 
@@ -298,10 +306,23 @@ def save_chunks(video_id: str, update: ChunksUpdate):
         raise HTTPException(status_code=404, detail="Video not found")
 
     try:
-        saved = autochunker.save_user_chunks(video_id, [c.model_dump() for c in update.chunks])
+        saved = autochunker.save_user_chunks(
+            video_id,
+            [c.model_dump() for c in update.chunks],
+            confirm_destructive=update.confirm_destructive,
+        )
         return {"chunks": saved}
+    except DestructiveRechunkError as e:
+        raise _rechunk_conflict(e) from e
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+def _rechunk_conflict(err: DestructiveRechunkError) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={"message": str(err), "requires_confirm": True, "affected_chunks": err.affected},
+    )
 
 
 @app.patch("/api/chunks/{chunk_id}")
@@ -343,7 +364,12 @@ def suggest_chunks(video_id: str, req: SuggestChunksRequest = None):
         raise HTTPException(status_code=404, detail="Video not found")
 
     # Generates maximum 15 balanced scene chunks with budget percentages summing to 100%
-    chunks = autochunker.generate_balanced_chunks(video_id, target_frames=300)
+    try:
+        chunks = autochunker.generate_balanced_chunks(
+            video_id, target_frames=300, confirm_destructive=bool(req and req.confirm_destructive)
+        )
+    except DestructiveRechunkError as e:
+        raise _rechunk_conflict(e) from e
     return {"suggested": chunks}
 
 
@@ -513,7 +539,7 @@ def list_openrouter_models():
         "models": [
             {
                 "id": "google/gemma-4-31b-it",
-                "name": "Google Gemma 4 31B (Default, High Reasoning, max 300 tokens)",
+                "name": "Google Gemma 4 31B (Default)",
                 "recommended": True,
             },
             {
@@ -746,8 +772,15 @@ def run_export(req: ExportRequest):
         res = exporter.export_video(req.video_id, custom_trigger=req.trigger_word)
         return res
     else:
-        # Export all curated videos
-        curated = db.all("SELECT id FROM videos WHERE status IN ('curating', 'chunked', 'exported')")
+        # Export all curated videos. 'exported' is excluded: those are finished (and captioned); re-running
+        # the exporter there could only re-link files. Videos with a job in flight are skipped.
+        curated = db.all(
+            """
+            SELECT id FROM videos v
+            WHERE status IN ('curating', 'curating_300', 'chunked') AND missing = 0
+              AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.video_id = v.id AND j.status IN ('queued', 'running'))
+            """
+        )
         total = 0
         for v in curated:
             r = exporter.export_video(v["id"], custom_trigger=req.trigger_word)
@@ -777,19 +810,35 @@ def get_dataset_summary():
 
 
 # ----------------------------------------------------------------------------- Settings
+SECRET_SETTINGS = ("openrouter_api_key",)
+
+
+def _redact_settings(values: dict[str, Any]) -> dict[str, Any]:
+    """Secrets never leave the server; the client only learns whether one is stored (`<key>_set`)."""
+    out = {k: v for k, v in values.items() if k not in SECRET_SETTINGS}
+    for key in SECRET_SETTINGS:
+        out[f"{key}_set"] = bool(str(values.get(key) or "").strip())
+    return out
+
+
 @app.get("/api/settings")
 def get_user_settings():
     stored = db.get_setting("user_settings", {})
-    return {"settings": merged_user_settings(stored)}
+    return {"settings": _redact_settings(merged_user_settings(stored))}
 
 
 @app.put("/api/settings")
 def update_user_settings(payload: dict[str, Any]):
     current = db.get_setting("user_settings", {})
     merged = merged_user_settings(current)
+    for key in SECRET_SETTINGS:
+        payload.pop(f"{key}_set", None)
+        # A client that never saw the secret sends it back empty; that must not wipe the stored one
+        if key in payload and not str(payload[key] or "").strip():
+            payload.pop(key)
     merged.update(payload)
     db.set_setting("user_settings", merged)
-    return {"settings": merged}
+    return {"settings": _redact_settings(merged)}
 
 
 # ----------------------------------------------------------------------------- RAG Prompt Director
@@ -925,8 +974,10 @@ def serve_spa(full_path: str):
     # Unknown API routes must 404 as JSON, not fall through to index.html (200 HTML breaks res.json())
     if full_path == "api" or full_path.startswith("api/"):
         raise HTTPException(status_code=404, detail=f"Unknown API route: /{full_path}")
-    file_path = STATIC_DIR / full_path
-    if full_path and file_path.is_file():
+    # Path params are not normalised: `..` segments (raw or %2e%2e) must not escape the web root
+    static_root = STATIC_DIR.resolve()
+    file_path = (static_root / full_path).resolve()
+    if full_path and file_path.is_relative_to(static_root) and file_path.is_file():
         return FileResponse(file_path)
     index_file = STATIC_DIR / "index.html"
     if index_file.exists():

@@ -83,13 +83,14 @@ DEFAULT_USER_SETTINGS: dict = {
         "tools_equipment_min": 0.20,
         "tools_equipment_max": 0.25,
     },
-    # OpenRouter API settings targeting google/gemma-4-31b-it (high reasoning) with cascade fallback to deepseek and grok
+    # OpenRouter API settings targeting google/gemma-4-31b-it with cascade fallback to deepseek and grok.
+    # Reasoning is off: it shares max_tokens with the caption and truncated it.
     "openrouter_api_key": "",
     "openrouter_model": "google/gemma-4-31b-it",
     "openrouter_fallback_layer2": "deepseek/deepseek-v4.1-flash",
     "openrouter_fallback_layer3": "x-ai/grok-4.7",
-    "openrouter_reasoning_effort": "high",
-    "openrouter_max_tokens": 300,
+    "openrouter_reasoning_effort": "none",
+    "openrouter_max_tokens": 600,
     "openrouter_temperature": 0.80,
     "openrouter_top_p": 0.90,
     "openrouter_mode": "concept",  # 'concept', 'character', or 'style'
