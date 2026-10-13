@@ -20,11 +20,11 @@ def safe_decode_frames(container: av.container.Container, stream: av.video.Video
                     yield frame
             except GeneratorExit:
                 return
-            except av.AVError:
+            except (av.error.FFmpegError, Exception):
                 continue
     except GeneratorExit:
         return
-    except av.AVError:
+    except (av.error.FFmpegError, Exception):
         pass
 
 
@@ -61,7 +61,10 @@ def sample_chunk_frames(
 
         # Seek to keyframe just before start_s
         seek_pts = int(max(0.0, start_s - 0.2) / tb)
-        container.seek(seek_pts, stream=stream, backward=True, any_frame=False)
+        try:
+            container.seek(seek_pts, stream=stream, backward=True, any_frame=False)
+        except Exception:
+            pass
 
         next_sample_t = start_s
 
@@ -118,7 +121,10 @@ def decode_exact_frames(
             c_start = cluster[0]
             c_end = cluster[-1]
             seek_pts = int(max(0.0, c_start - 0.5) / tb)
-            container.seek(seek_pts, stream=stream, backward=True, any_frame=False)
+            try:
+                container.seek(seek_pts, stream=stream, backward=True, any_frame=False)
+            except Exception:
+                pass
 
             for frame in safe_decode_frames(container, stream):
                 if frame.pts is None:
@@ -153,28 +159,34 @@ def decode_exact_frames(
 
 def decode_exact_frame(path: Path, target_t: float) -> np.ndarray | None:
     """Seek and decode the frame at or closest to exact target_t."""
-    with av.open(str(path)) as container:
-        stream = container.streams.video[0]
-        stream.thread_type = "AUTO"
-        tb = stream.time_base
+    try:
+        with av.open(str(path)) as container:
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
+            tb = stream.time_base
 
-        seek_pts = int(max(0.0, target_t - 0.5) / tb)
-        container.seek(seek_pts, stream=stream, backward=True, any_frame=False)
+            seek_pts = int(max(0.0, target_t - 0.5) / tb)
+            try:
+                container.seek(seek_pts, stream=stream, backward=True, any_frame=False)
+            except Exception:
+                pass
 
-        best_frame: np.ndarray | None = None
-        min_diff = float("inf")
+            best_frame: np.ndarray | None = None
+            min_diff = float("inf")
 
-        for frame in safe_decode_frames(container, stream):
-            if frame.pts is None:
-                continue
-            t = float(frame.pts * tb)
-            diff = abs(t - target_t)
-            if diff <= 0.35 and diff < min_diff:
-                min_diff = diff
-                best_frame = frame.to_ndarray(format="bgr24")
+            for frame in safe_decode_frames(container, stream):
+                if frame.pts is None:
+                    continue
+                t = float(frame.pts * tb)
+                diff = abs(t - target_t)
+                if diff <= 0.35 and diff < min_diff:
+                    min_diff = diff
+                    best_frame = frame.to_ndarray(format="bgr24")
 
-            if t > target_t + 0.15:
-                break
+                if t > target_t + 0.15:
+                    break
 
-        return best_frame
+            return best_frame
+    except Exception:
+        return None
 

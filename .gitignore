@@ -28,15 +28,8 @@ ENV/
 *.db-wal
 *.db-shm
 
-# Data and dataset output (keep target_videos.txt, ignore bulky binary frames & finished dataset)
-data/finished/
-data/cache/
-data/previews/
-data/proxies/
-data/*.mp4
-data/*.png
-data/*.jpg
-data/*.jpeg
+# Data and datasets (strictly ignored from repository)
+data/
 
 # Logs
 *.log
@@ -48,3 +41,13 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# Node & Frontend Build
+node_modules/
+.angular/
+src/web/dist/
+dist/
+*.legacy.js
+*.legacy.html
+*.legacy.css
+

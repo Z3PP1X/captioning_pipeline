@@ -17,7 +17,15 @@ if txt_files:
 manifest_path = Path("/mnt/c/Users/Patri/Documents/captioning_pipeline/data/finished/merged/manifest.jsonl")
 if manifest_path.exists():
     with manifest_path.open() as f:
-        records = [json.loads(line) for line in f if line.strip()]
+        records = []
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except Exception:
+                pass
     print(f"Total merged manifest records: {len(records)}")
     if records:
         last = records[-1]

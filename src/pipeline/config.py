@@ -26,6 +26,19 @@ class Settings(BaseSettings):
     min_duration_s: float = 30.0
 
     @property
+    def project_root(self) -> Path:
+        return self.finished_dir.parent.parent
+
+    @property
+    def curated_dir(self) -> Path:
+        return self.project_root / "data" / "curated_2500"
+
+    @property
+    def openrouter_api_key(self) -> str:
+        import os
+        return os.environ.get("OPENROUTER_API_KEY", "")
+
+    @property
     def db_path(self) -> Path:
         return self.cache_dir / "state.db"
 

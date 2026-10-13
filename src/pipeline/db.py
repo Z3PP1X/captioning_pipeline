@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     start_s REAL NOT NULL, end_s REAL NOT NULL,
     k INTEGER NOT NULL DEFAULT 5,
     budget_pct REAL NOT NULL DEFAULT 0.0,
+    caption_model TEXT NOT NULL DEFAULT 'google/gemma-4-31b-it',
     rule TEXT NOT NULL DEFAULT 'person',
     tags TEXT NOT NULL DEFAULT '[]',
     notes TEXT NOT NULL DEFAULT '',
@@ -77,10 +78,12 @@ class DB:
         with self.conn() as c:
             c.execute("PRAGMA journal_mode=WAL")
             c.executescript(SCHEMA)
-            # Safe migration: ensure budget_pct column exists in chunks
+            # Safe migrations: ensure required columns exist in chunks
             cols = [r["name"] for r in c.execute("PRAGMA table_info(chunks)").fetchall()]
             if "budget_pct" not in cols:
                 c.execute("ALTER TABLE chunks ADD COLUMN budget_pct REAL NOT NULL DEFAULT 0.0")
+            if "caption_model" not in cols:
+                c.execute("ALTER TABLE chunks ADD COLUMN caption_model TEXT NOT NULL DEFAULT 'google/gemma-4-31b-it'")
 
     @contextmanager
     def conn(self) -> Iterator[sqlite3.Connection]:

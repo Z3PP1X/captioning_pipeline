@@ -143,3 +143,159 @@ def test_reduction_750_to_300_budget_weights():
     assert "one_person_pct" in stats
     assert "tools_equipment_pct" in stats
     assert "face_visible_pct" in stats
+
+
+def test_chiaroscuro_low_key_quality_scoring():
+    mock_classifier = MagicMock()
+    mock_classifier.embed_texts.side_effect = lambda texts: np.tile(
+        np.array([1.0] + [0.0] * 511, dtype=np.float32), (len(texts), 1)
+    )
+    engine = ScoringEngine(classifier=mock_classifier)
+    emb = np.array([1.0] + [0.0] * 511, dtype=np.float32)
+
+    # Frame A: Low luma (80), High contrast (50) -> Chiaroscuro artistic lighting
+    cand_chiaroscuro = {
+        "chunk_id": 1,
+        "t": 1.0,
+        "metrics": {
+            "tile_sharp": 300.0,
+            "mean_luma": 80.0,
+            "contrast": 50.0,
+            "clipping": 0.01,
+            "entropy": 6.8,
+        },
+    }
+    # Frame B: Low luma (80), Low contrast (15) -> Underexposed flat muddy image
+    cand_flat_dark = {
+        "chunk_id": 1,
+        "t": 2.0,
+        "metrics": {
+            "tile_sharp": 300.0,
+            "mean_luma": 80.0,
+            "contrast": 15.0,
+            "clipping": 0.01,
+            "entropy": 4.5,
+        },
+    }
+
+    scored = engine.score_candidates_batch([cand_chiaroscuro, cand_flat_dark], np.array([emb, emb]))
+    assert len(scored) == 2
+    sc_chia = scored[0]["scores"]
+    sc_flat = scored[1]["scores"]
+
+    # Chiaroscuro must score noticeably higher quality than flat underexposed frame
+    assert sc_chia["quality"] > sc_flat["quality"] + 0.20
+
+
+def test_rule_aware_quota_prioritization():
+    mock_classifier = MagicMock()
+    mock_classifier.embed_texts.side_effect = lambda texts: np.tile(
+        np.array([1.0] + [0.0] * 511, dtype=np.float32), (len(texts), 1)
+    )
+    engine = ScoringEngine(classifier=mock_classifier)
+
+    chunks = [
+        {"id": 1, "budget_pct": 50.0, "rule": "equipment"},
+        {"id": 2, "budget_pct": 50.0, "rule": "person"},
+    ]
+
+    # Chunk 1 has an equipment candidate and a person candidate
+    emb1 = np.random.randn(512).astype(np.float32)
+    emb1 /= np.linalg.norm(emb1)
+    emb2 = np.random.randn(512).astype(np.float32)
+    emb2 /= np.linalg.norm(emb2)
+
+    cand_equipment = {
+        "id": "c_equip",
+        "chunk_id": 1,
+        "t": 1.0,
+        "embedding": emb1,
+        "composite": 0.70,
+        "scores": {
+            "multiple_persons": 0.1,
+            "one_person": 0.1,
+            "tools": 0.9,
+            "equipment": 0.9,
+            "face_score": 0.1,
+            "face_visible_50pct": False,
+        },
+    }
+    cand_person = {
+        "id": "c_person",
+        "chunk_id": 1,
+        "t": 2.0,
+        "embedding": emb2,
+        "composite": 0.70,
+        "scores": {
+            "multiple_persons": 0.8,
+            "one_person": 0.2,
+            "tools": 0.1,
+            "equipment": 0.1,
+            "face_score": 0.8,
+            "face_visible_50pct": True,
+        },
+    }
+
+    # In an equipment chunk, target_k = 1 -> equipment candidate should win
+    picks, runners, _ = engine.reduce_750_to_300([cand_equipment, cand_person], [chunks[0]], target_total=1)
+    assert len(picks) == 1
+    assert picks[0]["id"] == "c_equip"
+
+
+def test_cross_chunk_deduplication():
+    mock_classifier = MagicMock()
+    mock_classifier.embed_texts.side_effect = lambda texts: np.tile(
+        np.array([1.0] + [0.0] * 511, dtype=np.float32), (len(texts), 1)
+    )
+    engine = ScoringEngine(classifier=mock_classifier)
+
+    chunks = [
+        {"id": 1, "budget_pct": 50.0},
+        {"id": 2, "budget_pct": 50.0},
+    ]
+
+    base_emb = np.random.randn(512).astype(np.float32)
+    base_emb /= np.linalg.norm(base_emb)
+    # Clone embedding for near-identical duplicate in chunk 2
+    near_emb = base_emb.copy()
+
+    diff_emb = np.random.randn(512).astype(np.float32)
+    diff_emb /= np.linalg.norm(diff_emb)
+
+    c1_pick = {
+        "id": "c1_pick",
+        "chunk_id": 1,
+        "t": 10.0,
+        "embedding": base_emb,
+        "composite": 0.9,
+        "metrics": {"phash": "1111111111111111"},
+        "scores": {},
+    }
+    c2_dupe = {
+        "id": "c2_dupe",
+        "chunk_id": 2,
+        "t": 100.0,
+        "embedding": near_emb,
+        "composite": 0.95,  # higher score, would normally be picked
+        "metrics": {"phash": "1111111111111111"},
+        "scores": {},
+    }
+    c2_runner = {
+        "id": "c2_runner",
+        "chunk_id": 2,
+        "t": 120.0,
+        "embedding": diff_emb,
+        "composite": 0.70,
+        "metrics": {"phash": "0000000000000000"},
+        "scores": {},
+    }
+
+    candidates = [c1_pick, c2_dupe, c2_runner]
+    picks, runners, _ = engine.reduce_750_to_300(candidates, chunks, target_total=2)
+
+    pick_ids = {p["id"] for p in picks}
+    # c2_dupe must have been replaced by c2_runner because it duplicated c1_pick across chunks
+    assert "c1_pick" in pick_ids
+    assert "c2_runner" in pick_ids
+    assert "c2_dupe" not in pick_ids
+

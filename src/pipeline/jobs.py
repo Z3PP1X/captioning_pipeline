@@ -354,6 +354,17 @@ class JobManager:
         except Exception as ex:
             with self.db.write() as conn:
                 conn.execute("UPDATE jobs SET status='error', error=?, finished_at=? WHERE id=?", (str(ex), time.time(), job_id))
+                # Never leave video stuck in 'extracting_750'
+                conn.execute(
+                    """
+                    UPDATE videos SET status = CASE
+                        WHEN (SELECT COUNT(*) FROM picks p JOIN frames f ON p.frame_id=f.id WHERE f.video_id=videos.id AND p.role='pick') > 0 THEN 'curating_300'
+                        ELSE 'chunked'
+                    END
+                    WHERE id=? AND status='extracting_750'
+                    """,
+                    (video_id,),
+                )
             self.broadcast_event("job_error", {
                 "job_id": job_id,
                 "video_id": video_id,
@@ -440,7 +451,7 @@ class JobManager:
 
             query = """
                 SELECT f.id, f.chunk_id, f.t, f.full_path, f.metrics, f.zs_scores,
-                       c.position as chunk_pos
+                       c.position as chunk_pos, c.caption_model
                 FROM frames f
                 JOIN picks p ON f.id = p.frame_id
                 JOIN chunks c ON f.chunk_id = c.id
@@ -489,14 +500,32 @@ class JobManager:
                         out_png = per_video_dir / f"{fname_stem}.png"
                         out_txt = per_video_dir / f"{fname_stem}.txt"
 
+                        # Per-chunk model dispatch: if use_chunk_models is True, use chunk's assigned model
+                        use_chunk_models = options.get("use_chunk_models", True)
+                        item_cap_model = (item.get("caption_model") or "").strip()
+                        l1_model = item_cap_model if (use_chunk_models and item_cap_model) else primary_model
+
                         # Resume support: if already captioned, keep existing caption without re-billing
                         if out_txt.is_file() and out_txt.stat().st_size > 10 and out_png.is_file():
                             caption_text = out_txt.read_text(encoding="utf-8").strip()
                             l1_success_count += 1
                             completed_count += 1
+                            # Ensure recorded in DB exports table
+                            with self.db.write() as conn:
+                                conn.execute(
+                                    """
+                                    INSERT INTO exports (frame_id, per_video_path, merged_path, exported_at)
+                                    VALUES (?, ?, ?, ?)
+                                    ON CONFLICT(frame_id) DO UPDATE SET
+                                        per_video_path=excluded.per_video_path,
+                                        merged_path=excluded.merged_path,
+                                        exported_at=excluded.exported_at
+                                    """,
+                                    (item["id"], str(out_png), str(merged_dir / out_png.name), time.time()),
+                                )
                             update_prog(
                                 completed_count,
-                                f"Captioned {completed_count}/{total_frames} [L1 Gemma: {l1_success_count} | L2 DeepSeek: {l2_success_count} | L3 Grok: {l3_success_count}]"
+                                f"Captioned {completed_count}/{total_frames} [L1: {l1_success_count} | L2 DeepSeek: {l2_success_count} | L3 Grok: {l3_success_count}]"
                             )
                             return {
                                 "source_video": video["name"],
@@ -504,7 +533,7 @@ class JobManager:
                                 "chunk_id": item["chunk_id"],
                                 "timestamp_s": item["t"],
                                 "caption": caption_text,
-                                "model": primary_model,
+                                "model": l1_model,
                                 "layer": "layer1_cached",
                             }
 
@@ -525,7 +554,7 @@ class JobManager:
                             h, w = img_snapped.shape[:2]
                             cv2.imwrite(str(out_png), img_snapped)
 
-                            caption_model_used = primary_model
+                            caption_model_used = l1_model
                             layer_used = "layer1"
                             warnings: list[str] = []
 
@@ -533,19 +562,20 @@ class JobManager:
                             # 3-Layer Cascade: Only send refused images to the next layer!
                             # -------------------------------------------------------------
                             try:
-                                # Layer 1: Google Gemma 4 31B (High reasoning budget, max 300 tokens)
+                                # Layer 1: Chunk-specific Model (Default: Google Gemma 4 31B)
+                                l1_reasoning = reasoning_effort if "gemma" in l1_model.lower() else None
                                 caption_text, warnings = await self.captioner.caption_single_frame(
                                     client=client,
                                     img_bgr=img_snapped,
                                     api_key=api_key,
-                                    model=primary_model,
+                                    model=l1_model,
                                     mode=mode,
                                     trigger=trigger,
                                     class_noun=class_noun,
                                     max_tokens=max_tokens,
                                     temperature=gemma_temp,
                                     top_p=top_p,
-                                    reasoning_effort=reasoning_effort,
+                                    reasoning_effort=l1_reasoning,
                                 )
                                 l1_success_count += 1
                             except ModelRefusalError:
@@ -628,6 +658,18 @@ class JobManager:
                             async with file_lock:
                                 with open(manifest_path, "a", encoding="utf-8") as mf:
                                     mf.write(json.dumps(manifest_entry) + "\n")
+                                with self.db.write() as conn:
+                                    conn.execute(
+                                        """
+                                        INSERT INTO exports (frame_id, per_video_path, merged_path, exported_at)
+                                        VALUES (?, ?, ?, ?)
+                                        ON CONFLICT(frame_id) DO UPDATE SET
+                                            per_video_path=excluded.per_video_path,
+                                            merged_path=excluded.merged_path,
+                                            exported_at=excluded.exported_at
+                                        """,
+                                        (item["id"], str(out_png), str(merged_png), time.time()),
+                                    )
                                 completed_count += 1
                                 update_prog(
                                     completed_count,
@@ -646,7 +688,6 @@ class JobManager:
                     "UPDATE jobs SET status='finished', error=NULL, progress=1.0, finished_at=? WHERE id=?",
                     (time.time(), job_id),
                 )
-
                 conn.execute("UPDATE videos SET status='exported' WHERE id=?", (video_id,))
 
             self.broadcast_event("job_finished", {
@@ -658,8 +699,20 @@ class JobManager:
             })
 
         except Exception as ex:
+            err_msg = f"{type(ex).__name__}: {str(ex)}".strip(": ")
             with self.db.write() as conn:
-                conn.execute("UPDATE jobs SET status='error', error=?, finished_at=? WHERE id=?", (str(ex), time.time(), job_id))
+                conn.execute("UPDATE jobs SET status='error', error=?, finished_at=? WHERE id=?", (err_msg, time.time(), job_id))
+                # Never leave video stuck in 'captioning'
+                conn.execute(
+                    """
+                    UPDATE videos SET status = CASE
+                        WHEN (SELECT COUNT(*) FROM picks p JOIN frames f ON p.frame_id=f.id WHERE f.video_id=videos.id AND p.role='pick') > 0 THEN 'curating_300'
+                        ELSE 'chunked'
+                    END
+                    WHERE id=? AND status='captioning'
+                    """,
+                    (video_id,),
+                )
             self.broadcast_event("job_error", {
                 "job_id": job_id,
                 "video_id": video_id,

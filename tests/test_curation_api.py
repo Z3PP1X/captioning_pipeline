@@ -57,22 +57,125 @@ def test_curation_endpoints_and_swap():
             assert "runners" in curation
             assert "distribution" in curation
             assert "stats" in curation
+            assert "caption_model" in saved[0]
+
+            # 3. Test patch chunk caption model
+            chunk_id = saved[0]["id"]
+            patch_res = client.patch(f"/api/chunks/{chunk_id}", json={"caption_model": "deepseek/deepseek-v4.1-flash"})
+            assert patch_res.status_code == 200
+            assert patch_res.json()["chunk"]["caption_model"] == "deepseek/deepseek-v4.1-flash"
         finally:
             with db.write() as conn:
                 conn.execute("DELETE FROM chunks WHERE video_id=?", (test_vid_id,))
                 conn.execute("DELETE FROM videos WHERE id=?", (test_vid_id,))
 
-        # 3. Test frame swap if picks and runners exist
-        picks = curation["picks"]
-        runners = curation["runners"]
-        if picks and runners:
-            drop_cand = picks[0]
-            res = client.post(
-                f"/api/videos/{video_id}/swap-frame",
-                json={"deselected_frame_id": drop_cand["id"]},
+
+def test_pure_deselect_and_promotion_over_budget():
+    """Verify deselecting a frame marks it rejected without auto-swapping, and promoting runner increases count without eviction."""
+    with TestClient(app) as client:
+        test_vid_id = "test_vid_deselect_promote"
+        with db.write() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO videos (id, path, name, slug, status, duration) VALUES (?, ?, ?, ?, 'chunked', 120.0)",
+                (test_vid_id, "/tmp/dummy_dp.mp4", "Dummy DP.mp4", "dummy_dp"),
             )
+            c_cur = conn.execute(
+                "INSERT INTO chunks (video_id, position, start_s, end_s, k, budget_pct, caption_model) VALUES (?, 0, 0.0, 60.0, 5, 100.0, 'google/gemma-4-31b-it')",
+                (test_vid_id,),
+            )
+            chunk_id = c_cur.lastrowid
+
+            # Insert 3 frames
+            f1 = conn.execute("INSERT INTO frames (video_id, chunk_id, t, metrics) VALUES (?, ?, 1.0, '{}')", (test_vid_id, chunk_id)).lastrowid
+            f2 = conn.execute("INSERT INTO frames (video_id, chunk_id, t, metrics) VALUES (?, ?, 2.0, '{}')", (test_vid_id, chunk_id)).lastrowid
+            f3 = conn.execute("INSERT INTO frames (video_id, chunk_id, t, metrics) VALUES (?, ?, 3.0, '{}')", (test_vid_id, chunk_id)).lastrowid
+
+            # Frame 1 and 2 are picks, Frame 3 is runner_up
+            conn.execute("INSERT INTO picks (frame_id, chunk_id, role, rank, state) VALUES (?, ?, 'pick', 0, 'keep')", (f1, chunk_id))
+            conn.execute("INSERT INTO picks (frame_id, chunk_id, role, rank, state) VALUES (?, ?, 'pick', 1, 'keep')", (f2, chunk_id))
+            conn.execute("INSERT INTO picks (frame_id, chunk_id, role, rank, state) VALUES (?, ?, 'runner_up', 2, 'candidate')", (f3, chunk_id))
+
+        try:
+            # 1. Pure Deselect: PATCH f1 state to reject
+            res = client.patch(f"/api/picks/{f1}", json={"state": "reject"})
             assert res.status_code == 200
-            swap_res = res.json()
-            assert swap_res["status"] == "ok"
-            assert "swapped_in" in swap_res
-            assert "distribution" in swap_res
+            assert res.json()["pick"]["state"] == "reject"
+            assert res.json()["pick"]["role"] == "pick"
+
+            # Verify f2 is still keep and f3 is still candidate (NO auto-swap happened)
+            p2 = db.one("SELECT * FROM picks WHERE frame_id=?", (f2,))
+            p3 = db.one("SELECT * FROM picks WHERE frame_id=?", (f3,))
+            assert p2["state"] == "keep"
+            assert p3["role"] == "runner_up"
+            assert p3["state"] == "candidate"
+
+            # 2. Promote f3 to pick WITHOUT eviction
+            res = client.patch(f"/api/picks/{f3}", json={"role": "pick", "state": "keep"})
+            assert res.status_code == 200
+            p3_after = db.one("SELECT * FROM picks WHERE frame_id=?", (f3,))
+            assert p3_after["role"] == "pick"
+            assert p3_after["state"] == "keep"
+
+            # p2 is still keep! (No forced demotion)
+            p2_after = db.one("SELECT * FROM picks WHERE frame_id=?", (f2,))
+            assert p2_after["role"] == "pick"
+            assert p2_after["state"] == "keep"
+
+            # 3. Check curation-300 returns both active picks
+            res = client.get(f"/api/videos/{test_vid_id}/curation-300")
+            assert res.status_code == 200
+            cur = res.json()
+            active_picks = [p for p in cur["picks"] if p["state"] == "keep"]
+            assert len(active_picks) == 2
+            assert {p["id"] for p in active_picks} == {f2, f3}
+        finally:
+            with db.write() as conn:
+                conn.execute("DELETE FROM frames WHERE video_id=?", (test_vid_id,))
+                conn.execute("DELETE FROM chunks WHERE video_id=?", (test_vid_id,))
+                conn.execute("DELETE FROM videos WHERE id=?", (test_vid_id,))
+
+
+def test_openrouter_caption_endpoints():
+    """Verify both /api/videos/{video_id}/caption-openrouter and /api/openrouter/batch_caption endpoints."""
+    with TestClient(app) as client:
+        test_vid_id = "test_vid_openrouter_caption"
+        with db.write() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO videos (id, path, name, slug, status, duration) VALUES (?, ?, ?, ?, 'curating_300', 120.0)",
+                (test_vid_id, "/tmp/dummy_cap.mp4", "Dummy Cap.mp4", "dummy_cap"),
+            )
+
+        try:
+            # 1. Direct video caption endpoint
+            res1 = client.post(
+                f"/api/videos/{test_vid_id}/caption-openrouter",
+                json={
+                    "model": "google/gemma-4-31b-it",
+                    "mode": "concept",
+                    "trigger": "restrained_elegance",
+                    "class_noun": "woman, ropes",
+                },
+            )
+            assert res1.status_code == 200
+            assert "job_id" in res1.json()
+            assert res1.json()["status"] == "queued"
+
+            # 2. Batch caption alias endpoint
+            res2 = client.post(
+                "/api/openrouter/batch_caption",
+                json={
+                    "video_id": test_vid_id,
+                    "model": "google/gemma-4-31b-it",
+                    "mode": "concept",
+                    "trigger_word": "restrained_elegance",
+                    "class_noun": "woman, ropes",
+                },
+            )
+            assert res2.status_code == 200
+            assert "job_id" in res2.json()
+            assert res2.json()["status"] == "queued"
+        finally:
+            with db.write() as conn:
+                conn.execute("DELETE FROM jobs WHERE video_id=?", (test_vid_id,))
+                conn.execute("DELETE FROM videos WHERE id=?", (test_vid_id,))
+

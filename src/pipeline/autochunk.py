@@ -155,6 +155,7 @@ class AutoChunker:
                 "end_s": s_end,
                 "k": chunk_k,
                 "budget_pct": bpct,
+                "caption_model": "google/gemma-4-31b-it",
                 "rule": "person",
                 "tags": [],
                 "notes": f"Auto scene #{idx + 1}",
@@ -166,8 +167,8 @@ class AutoChunker:
             for ch in chunks:
                 conn.execute(
                     """
-                    INSERT INTO chunks (video_id, position, start_s, end_s, k, budget_pct, rule, tags, notes, dirty)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                    INSERT INTO chunks (video_id, position, start_s, end_s, k, budget_pct, caption_model, rule, tags, notes, dirty)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                     """,
                     (
                         video_id,
@@ -176,6 +177,7 @@ class AutoChunker:
                         ch["end_s"],
                         ch["k"],
                         ch["budget_pct"],
+                        ch.get("caption_model", "google/gemma-4-31b-it"),
                         ch["rule"],
                         json.dumps(ch["tags"]),
                         ch["notes"],
@@ -210,10 +212,11 @@ class AutoChunker:
                 chunk_k = max(5, int(c.get("k", round(300 * (bpct / 100.0)))))
                 tags = c.get("tags", [])
                 tags_json = json.dumps(tags) if isinstance(tags, list) else tags
+                cap_model = c.get("caption_model") or "google/gemma-4-31b-it"
                 conn.execute(
                     """
-                    INSERT INTO chunks (video_id, position, start_s, end_s, k, budget_pct, rule, tags, notes, dirty)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                    INSERT INTO chunks (video_id, position, start_s, end_s, k, budget_pct, caption_model, rule, tags, notes, dirty)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                     """,
                     (
                         video_id,
@@ -222,6 +225,7 @@ class AutoChunker:
                         round(float(c["end_s"]), 2),
                         chunk_k,
                         bpct,
+                        cap_model,
                         c.get("rule", "person"),
                         tags_json,
                         c.get("notes", f"Scene #{idx + 1}"),

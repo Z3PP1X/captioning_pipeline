@@ -94,8 +94,15 @@ class ScoringEngine:
 
             # 2. Tier-1 Quality (composite of exposure balance, contrast, entropy, clipping)
             luma = metrics.get("mean_luma", 128.0)
-            exp_score = max(0.0, 1.0 - abs(luma - 128.0) / 115.0)
-            contrast_score = min(1.0, metrics.get("contrast", 0.0) / 60.0)
+            contrast_val = metrics.get("contrast", 0.0)
+            if luma < 128.0 and contrast_val >= 35.0:
+                # Chiaroscuro adaptation: artistic low-key studio lighting with strong subject contrast
+                luma_target = 85.0 if contrast_val >= 45.0 else 110.0
+                exp_score = max(0.2, 1.0 - abs(luma - luma_target) / 95.0)
+            else:
+                exp_score = max(0.0, 1.0 - abs(luma - 128.0) / 115.0)
+
+            contrast_score = min(1.0, contrast_val / 60.0)
             clipping_penalty = max(0.0, 1.0 - metrics.get("clipping", 0.0) * 10.0)
             entropy_score = min(1.0, metrics.get("entropy", 0.0) / 7.5)
             quality_score = round(
@@ -250,10 +257,20 @@ class ScoringEngine:
                 best_score = -float("inf")
                 best_idx = -1
 
-                # Quota urgency weights
-                need_mult = 1.0 if curr_multiple < target_multiple else 0.4
-                need_solo = 1.0 if curr_solo < target_solo else 0.4
-                need_tools = 1.0 if curr_tools_equip < target_tools_equip else 0.4
+                # Quota urgency weights masked by chunk rule
+                chunk_rule = ch.get("rule", "person")
+                if chunk_rule == "equipment":
+                    need_mult = 0.2
+                    need_solo = 0.3
+                    need_tools = 1.3
+                elif chunk_rule == "none":
+                    need_mult = 0.5
+                    need_solo = 0.5
+                    need_tools = 0.5
+                else:
+                    need_mult = 1.0 if curr_multiple < target_multiple else 0.4
+                    need_solo = 1.0 if curr_solo < target_solo else 0.4
+                    need_tools = 1.0 if curr_tools_equip < target_tools_equip else 0.4
 
                 for i, cand in enumerate(c_pool):
                     if i in selected_indices:
@@ -323,6 +340,43 @@ class ScoringEngine:
                     cand["role"] = "runner_up"
                     cand["state"] = "candidate"
                     all_runners.append(cand)
+
+        # 4. Cross-chunk near-duplicate deduplication pass
+        from pipeline.metrics import phash_hamming_distance
+        runners_by_chunk: dict[int, list[dict[str, Any]]] = {}
+        for r in all_runners:
+            runners_by_chunk.setdefault(r["chunk_id"], []).append(r)
+
+        for i in range(len(all_picks)):
+            for j in range(i + 1, min(len(all_picks), i + 20)):
+                p1 = all_picks[i]
+                p2 = all_picks[j]
+                if p1.get("chunk_id") == p2.get("chunk_id"):
+                    continue
+
+                ph1 = (p1.get("metrics") or {}).get("phash")
+                ph2 = (p2.get("metrics") or {}).get("phash")
+                is_dupe = False
+                if ph1 and ph2 and phash_hamming_distance(ph1, ph2) <= 4:
+                    is_dupe = True
+                elif float(np.dot(p1["embedding"], p2["embedding"])) >= 0.94:
+                    is_dupe = True
+
+                if is_dupe:
+                    cid = p2.get("chunk_id")
+                    c_runners = runners_by_chunk.get(cid, [])
+                    if c_runners:
+                        replacement = c_runners.pop(0)
+                        replacement["role"] = "pick"
+                        replacement["rank"] = p2["rank"]
+                        replacement["state"] = "keep"
+
+                        p2["role"] = "runner_up"
+                        p2["state"] = "candidate"
+
+                        all_picks[j] = replacement
+                        all_runners.append(p2)
+                        break
 
         stats = self.compute_distribution_stats(all_picks)
         return all_picks, all_runners, stats

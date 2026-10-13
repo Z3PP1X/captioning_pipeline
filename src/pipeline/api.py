@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -10,7 +11,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -20,6 +21,14 @@ from pipeline.db import DB
 from pipeline.export import Exporter
 from pipeline.indexer import Indexer
 from pipeline.jobs import JobManager
+from pipeline.rag import (
+    CHARACTERS,
+    CURATED_PRESETS,
+    TAXONOMY_CATEGORIES,
+    RagPromptGenerator,
+    RagRetriever,
+)
+from pipeline.reconcile import get_video_scenes_caption_stats, reconcile_captions_and_state
 from pipeline.select import select_diverse_top_k
 from pipeline.streaming import stream_video
 
@@ -29,6 +38,8 @@ indexer = Indexer(db, settings)
 jobs = JobManager(db, settings)
 exporter = Exporter(db, settings)
 autochunker = AutoChunker(db, settings)
+rag_retriever = RagRetriever(settings)
+rag_generator = RagPromptGenerator(settings)
 
 
 @asynccontextmanager
@@ -41,7 +52,8 @@ async def lifespan(app: FastAPI):
             "UPDATE jobs SET status='error', error='Server restarted while job was running', finished_at=? WHERE status IN ('running', 'queued')",
             (time.time(),),
         )
-        conn.execute("UPDATE videos SET status='chunked' WHERE status IN ('extracting', 'extracting_750')")
+    # Sync disk captions and auto-heal stuck statuses
+    reconcile_captions_and_state(db, settings)
     indexer.scan_and_sync()
     yield
 
@@ -71,9 +83,18 @@ class ChunkItem(BaseModel):
     end_s: float
     k: int = 5
     budget_pct: float = 0.0
+    caption_model: str = "google/gemma-4-31b-it"
     rule: str = "person"
     tags: list[str] = Field(default_factory=list)
     notes: str = ""
+
+
+class ChunkPatch(BaseModel):
+    caption_model: str | None = None
+    budget_pct: float | None = None
+    rule: str | None = None
+    tags: list[str] | None = None
+    notes: str | None = None
 
 
 class ChunksUpdate(BaseModel):
@@ -97,12 +118,17 @@ class PickPatch(BaseModel):
     crop: dict[str, float] | None = None
 
 
+class CandidateStateRequest(BaseModel):
+    state: str | None = None
+
+
 class OpenRouterCaptionRequest(BaseModel):
     api_key: str | None = None
     model: str = "google/gemma-4-31b-it"
     fallback_layer2: str = "deepseek/deepseek-v4.1-flash"
     fallback_layer3: str = "x-ai/grok-4.7"
     reasoning_effort: str = "high"
+    use_chunk_models: bool = True
     mode: str = "concept"
     trigger: str = "restrained_elegance"
     class_noun: str = "woman"
@@ -138,8 +164,13 @@ def list_videos(status: str | None = None, search: str | None = None):
     params: list[Any] = []
 
     if status:
-        query += " AND v.status = ?"
-        params.append(status)
+        if status in ("curating", "curating_300"):
+            query += " AND v.status IN ('curating', 'curating_300')"
+        elif status in ("extracting", "extracting_750"):
+            query += " AND v.status IN ('extracting', 'extracting_750')"
+        else:
+            query += " AND v.status = ?"
+            params.append(status)
 
     if search:
         query += " AND (v.name LIKE ? OR v.slug LIKE ?)"
@@ -152,9 +183,17 @@ def list_videos(status: str | None = None, search: str | None = None):
 
 
 @app.post("/api/videos/scan")
+@app.post("/api/videos/rescan")
 def scan_videos():
+    sync_stats = reconcile_captions_and_state(db, settings)
     vids = indexer.scan_and_sync()
-    return {"scanned": len(vids)}
+    return {"scanned": len(vids), "sync_stats": sync_stats}
+
+
+@app.post("/api/videos/sync-captions")
+def sync_captions_endpoint():
+    sync_stats = reconcile_captions_and_state(db, settings)
+    return {"status": "ok", "sync_stats": sync_stats}
 
 
 @app.get("/api/videos/next")
@@ -238,8 +277,13 @@ def get_filmstrip_thumb(video_id: str, filename: str):
 # ----------------------------------------------------------------------------- Chunks
 @app.get("/api/videos/{video_id}/chunks")
 def get_chunks(video_id: str):
-    chunks = db.all("SELECT * FROM chunks WHERE video_id=? ORDER BY position ASC, start_s ASC", (video_id,))
+    chunks = get_video_scenes_caption_stats(db, video_id)
     return {"chunks": chunks}
+
+
+@app.get("/api/videos/{video_id}/scenes")
+def get_video_scenes(video_id: str):
+    return {"scenes": get_video_scenes_caption_stats(db, video_id)}
 
 
 @app.put("/api/videos/{video_id}/chunks")
@@ -255,9 +299,41 @@ def save_chunks(video_id: str, update: ChunksUpdate):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@app.patch("/api/chunks/{chunk_id}")
+def update_chunk(chunk_id: int, patch: ChunkPatch):
+    existing = db.one("SELECT * FROM chunks WHERE id=?", (chunk_id,))
+    if not existing:
+        raise HTTPException(status_code=404, detail="Chunk not found")
+
+    updates = []
+    params = []
+    if patch.caption_model is not None:
+        updates.append("caption_model = ?")
+        params.append(patch.caption_model)
+    if patch.budget_pct is not None:
+        updates.append("budget_pct = ?")
+        params.append(patch.budget_pct)
+    if patch.rule is not None:
+        updates.append("rule = ?")
+        params.append(patch.rule)
+    if patch.tags is not None:
+        updates.append("tags = ?")
+        params.append(json.dumps(patch.tags))
+    if patch.notes is not None:
+        updates.append("notes = ?")
+        params.append(patch.notes)
+
+    if updates:
+        params.append(chunk_id)
+        with db.write() as conn:
+            conn.execute(f"UPDATE chunks SET {', '.join(updates)} WHERE id = ?", tuple(params))
+
+    return {"chunk": db.one("SELECT * FROM chunks WHERE id=?", (chunk_id,))}
+
+
 @app.post("/api/videos/{video_id}/chunks/suggest")
 def suggest_chunks(video_id: str, req: SuggestChunksRequest = None):
-    vid = db.one("SELECT * FROM videos WHERE id=?", (video_id,))
+    vid = db.one("SELECT id FROM videos WHERE id=?", (video_id,))
     if not vid:
         raise HTTPException(status_code=404, detail="Video not found")
 
@@ -267,6 +343,7 @@ def suggest_chunks(video_id: str, req: SuggestChunksRequest = None):
 
 
 @app.post("/api/videos/{video_id}/extract-750")
+@app.post("/api/videos/{video_id}/extract_750")
 def trigger_extract_750(video_id: str):
     vid = db.one("SELECT id FROM videos WHERE id=?", (video_id,))
     if not vid:
@@ -281,11 +358,11 @@ def get_curation_300(video_id: str):
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    chunks = db.all("SELECT * FROM chunks WHERE video_id=? ORDER BY position ASC", (video_id,))
+    chunks = get_video_scenes_caption_stats(db, video_id)
     picks = db.all(
         """
-        SELECT f.id, f.chunk_id, f.t, f.metrics, f.zs_scores, f.preview_path, f.full_path,
-               p.role, p.rank, p.state, p.crop, c.position as chunk_pos, c.budget_pct
+        SELECT f.id, f.video_id, f.chunk_id, f.t, f.metrics, f.zs_scores, f.preview_path, f.full_path,
+               p.role, p.rank, p.state, p.crop, c.position as chunk_pos, c.budget_pct, c.caption_model
         FROM frames f
         JOIN picks p ON f.id = p.frame_id
         JOIN chunks c ON f.chunk_id = c.id
@@ -296,8 +373,8 @@ def get_curation_300(video_id: str):
     )
     runners = db.all(
         """
-        SELECT f.id, f.chunk_id, f.t, f.metrics, f.zs_scores, f.preview_path, f.full_path,
-               p.role, p.rank, p.state, p.crop, c.position as chunk_pos, c.budget_pct
+        SELECT f.id, f.video_id, f.chunk_id, f.t, f.metrics, f.zs_scores, f.preview_path, f.full_path,
+               p.role, p.rank, p.state, p.crop, c.position as chunk_pos, c.budget_pct, c.caption_model
         FROM frames f
         JOIN picks p ON f.id = p.frame_id
         JOIN chunks c ON f.chunk_id = c.id
@@ -308,15 +385,22 @@ def get_curation_300(video_id: str):
     )
 
     stats = jobs.scoring_engine.compute_distribution_stats(picks)
+    exported_ids = {r["frame_id"] for r in db.all("SELECT e.frame_id FROM exports e JOIN frames f ON e.frame_id=f.id WHERE f.video_id=?", (video_id,))}
     for f in picks + runners:
         f["preview_url"] = f"/api/frames/{f['id']}/preview"
         f["full_url"] = f"/api/frames/{f['id']}/full"
+        f["thumb_url"] = f"/api/frames/{f['id']}/preview"
+        f["time_s"] = f["t"]
+        f["is_pick"] = (f.get("role") == "pick")
+        f["is_captioned"] = (f["id"] in exported_ids)
 
     return {
         "video": video,
         "chunks": chunks,
+        "scene_stats": chunks,
         "picks": picks,
         "runners": runners,
+        "candidates": picks + runners,
         "stats": stats,
         "distribution": stats,
     }
@@ -351,8 +435,8 @@ def swap_frame(video_id: str, req: SwapFrameRequest):
 
     picks = db.all(
         """
-        SELECT f.id, f.chunk_id, f.t, f.metrics, f.zs_scores, f.preview_path, f.full_path,
-               p.role, p.rank, p.state, p.crop, c.position as chunk_pos, c.budget_pct
+        SELECT f.id, f.video_id, f.chunk_id, f.t, f.metrics, f.zs_scores, f.preview_path, f.full_path,
+               p.role, p.rank, p.state, p.crop, c.position as chunk_pos, c.budget_pct, c.caption_model
         FROM frames f
         JOIN picks p ON f.id = p.frame_id
         JOIN chunks c ON f.chunk_id = c.id
@@ -363,8 +447,8 @@ def swap_frame(video_id: str, req: SwapFrameRequest):
     )
     runners = db.all(
         """
-        SELECT f.id, f.chunk_id, f.t, f.metrics, f.zs_scores, f.preview_path, f.full_path,
-               p.role, p.rank, p.state, p.crop, c.position as chunk_pos, c.budget_pct
+        SELECT f.id, f.video_id, f.chunk_id, f.t, f.metrics, f.zs_scores, f.preview_path, f.full_path,
+               p.role, p.rank, p.state, p.crop, c.position as chunk_pos, c.budget_pct, c.caption_model
         FROM frames f
         JOIN picks p ON f.id = p.frame_id
         JOIN chunks c ON f.chunk_id = c.id
@@ -373,9 +457,14 @@ def swap_frame(video_id: str, req: SwapFrameRequest):
         """,
         (video_id,),
     )
+    exported_ids = {r["frame_id"] for r in db.all("SELECT e.frame_id FROM exports e JOIN frames f ON e.frame_id=f.id WHERE f.video_id=?", (video_id,))}
     for f in picks + runners:
         f["preview_url"] = f"/api/frames/{f['id']}/preview"
         f["full_url"] = f"/api/frames/{f['id']}/full"
+        f["thumb_url"] = f"/api/frames/{f['id']}/preview"
+        f["time_s"] = f["t"]
+        f["is_pick"] = (f.get("role") == "pick")
+        f["is_captioned"] = (f["id"] in exported_ids)
 
     stats = jobs.scoring_engine.compute_distribution_stats(picks)
     return {
@@ -385,6 +474,7 @@ def swap_frame(video_id: str, req: SwapFrameRequest):
         "dropped": drop_id,
         "picks": picks,
         "runners": runners,
+        "candidates": picks + runners,
         "stats": stats,
         "distribution": stats,
     }
@@ -397,6 +487,19 @@ def trigger_caption_openrouter(video_id: str, req: OpenRouterCaptionRequest):
         raise HTTPException(status_code=404, detail="Video not found")
     job_id = jobs.submit_openrouter_caption_job(video_id, req.model_dump())
     return {"job_id": job_id, "status": "queued"}
+
+
+@app.post("/api/openrouter/batch_caption")
+def trigger_openrouter_batch_caption_alias(req: dict[str, Any]):
+    vid = req.get("video_id")
+    if not vid:
+        raise HTTPException(status_code=400, detail="video_id required")
+    # map trigger_word -> trigger
+    if "trigger_word" in req and "trigger" not in req:
+        req["trigger"] = req["trigger_word"]
+    clean_params = {k: v for k, v in req.items() if k != "video_id" and v is not None}
+    caption_req = OpenRouterCaptionRequest(**clean_params)
+    return trigger_caption_openrouter(str(vid), caption_req)
 
 
 @app.get("/api/openrouter/models")
@@ -486,7 +589,7 @@ def get_video_candidates(video_id: str):
                f.preview_path, p.role, p.rank, p.state, p.crop,
                c.position AS chunk_position, c.start_s AS chunk_start,
                c.end_s AS chunk_end, c.rule AS chunk_rule, c.tags AS chunk_tags,
-               c.notes AS chunk_notes
+               c.notes AS chunk_notes, c.caption_model AS chunk_caption_model
         FROM frames f
         JOIN picks p ON f.id = p.frame_id
         LEFT JOIN chunks c ON f.chunk_id = c.id
@@ -494,10 +597,73 @@ def get_video_candidates(video_id: str):
         ORDER BY c.position ASC, f.chunk_id ASC, p.role DESC, p.rank ASC
     """
     frames = db.all(query, (video_id,))
+    exported_ids = {r["frame_id"] for r in db.all("SELECT e.frame_id FROM exports e JOIN frames f ON e.frame_id=f.id WHERE f.video_id=?", (video_id,))}
     for f in frames:
         f["preview_url"] = f"/api/frames/{f['id']}/preview"
         f["full_url"] = f"/api/frames/{f['id']}/full"
-    return {"frames": frames}
+        f["thumb_url"] = f"/api/frames/{f['id']}/preview"
+        f["time_s"] = f["t"]
+        f["is_pick"] = (f.get("role") == "pick")
+        f["is_captioned"] = (f["id"] in exported_ids)
+
+    picks = [f for f in frames if f["is_pick"]]
+    runners = [f for f in frames if not f["is_pick"]]
+    stats = jobs.scoring_engine.compute_distribution_stats(picks)
+
+    return {
+        "frames": frames,
+        "candidates": frames,
+        "picks": picks,
+        "runners": runners,
+        "stats": stats,
+        "distribution": stats,
+        "scene_stats": get_video_scenes_caption_stats(db, video_id),
+    }
+
+
+@app.post("/api/videos/{video_id}/candidates/{frame_id}/state")
+def set_candidate_state_endpoint(video_id: str, frame_id: int, req: CandidateStateRequest):
+    with db.write() as conn:
+        cur = conn.execute("UPDATE picks SET state=? WHERE frame_id=?", (req.state, frame_id))
+        if cur.rowcount == 0:
+            frame = db.one("SELECT chunk_id FROM frames WHERE id=?", (frame_id,))
+            if frame:
+                conn.execute(
+                    "INSERT INTO picks (frame_id, chunk_id, role, rank, state) VALUES (?, ?, 'candidate', 999, ?)",
+                    (frame_id, frame["chunk_id"], req.state),
+                )
+    return {"status": "ok", "frame_id": frame_id, "state": req.state}
+
+
+@app.post("/api/videos/{video_id}/curate/keep_all")
+def bulk_keep_all_picks(video_id: str):
+    with db.write() as conn:
+        conn.execute(
+            """
+            UPDATE picks SET state='keep'
+            WHERE frame_id IN (SELECT id FROM frames WHERE video_id=?) AND role='pick'
+            """,
+            (video_id,),
+        )
+    return {"status": "ok", "video_id": video_id}
+
+
+@app.post("/api/videos/{video_id}/curate/reject_all")
+def bulk_reject_all_picks(video_id: str):
+    with db.write() as conn:
+        conn.execute(
+            """
+            UPDATE picks SET state='reject'
+            WHERE frame_id IN (SELECT id FROM frames WHERE video_id=?) AND role='pick'
+            """,
+            (video_id,),
+        )
+    return {"status": "ok", "video_id": video_id}
+
+
+@app.get("/api/videos/{video_id}/frames/{frame_id}/thumb")
+def get_video_frame_thumb(video_id: str, frame_id: int):
+    return get_frame_preview(frame_id)
 
 
 @app.get("/api/chunks/{chunk_id}/candidates")
@@ -507,7 +673,7 @@ def get_chunk_candidates(chunk_id: int):
                f.preview_path, p.role, p.rank, p.state, p.crop,
                c.position AS chunk_position, c.start_s AS chunk_start,
                c.end_s AS chunk_end, c.rule AS chunk_rule, c.tags AS chunk_tags,
-               c.notes AS chunk_notes
+               c.notes AS chunk_notes, c.caption_model AS chunk_caption_model
         FROM frames f
         JOIN picks p ON f.id = p.frame_id
         LEFT JOIN chunks c ON f.chunk_id = c.id
@@ -621,15 +787,93 @@ def update_user_settings(payload: dict[str, Any]):
     return {"settings": merged}
 
 
+# ----------------------------------------------------------------------------- RAG Prompt Director
+class RagRetrieveRequest(BaseModel):
+    selected_tags: dict[str, list[str]] = Field(default_factory=dict)
+    user_description: str = ""
+    top_k: int = 4
+
+
+class RagGenerateRequest(BaseModel):
+    selected_tags: dict[str, list[str]] = Field(default_factory=dict)
+    user_description: str = ""
+    character: str | None = None
+    top_k: int = 4
+    model: str = "google/gemma-4-31b-it"
+    trigger: str = "restrained_elegance"
+    local_url: str | None = None
+
+
+@app.get("/api/rag/categories")
+def get_rag_categories():
+    return {"categories": TAXONOMY_CATEGORIES}
+
+
+@app.get("/api/rag/presets")
+def get_rag_presets():
+    return {"presets": CURATED_PRESETS}
+
+
+@app.get("/api/rag/characters")
+def get_rag_characters():
+    return {"characters": CHARACTERS}
+
+
+@app.post("/api/rag/retrieve")
+def retrieve_rag_context(req: RagRetrieveRequest):
+    results = rag_retriever.retrieve(req.selected_tags, req.user_description, req.top_k)
+    return {"results": results}
+
+
+@app.post("/api/rag/generate")
+async def generate_rag_prompts(req: RagGenerateRequest):
+    retrieved = rag_retriever.retrieve(req.selected_tags, req.user_description, req.top_k)
+    result = await rag_generator.generate(
+        retrieved_items=retrieved,
+        selected_tags=req.selected_tags,
+        user_description=req.user_description,
+        character=req.character,
+        model=req.model,
+        trigger=req.trigger,
+        local_url=req.local_url,
+    )
+    return result
+
+
+@app.get("/api/rag/preview/{caption_id}")
+def get_rag_preview(caption_id: int):
+    rag_db_path = settings.cache_dir / "rag_index.sqlite"
+    if not rag_db_path.exists():
+        raise HTTPException(status_code=404, detail="RAG index not built yet")
+    with sqlite3.connect(rag_db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        r = conn.execute("SELECT img_rel_path FROM rag_captions WHERE id=?", (caption_id,)).fetchone()
+        if not r or not r["img_rel_path"]:
+            raise HTTPException(status_code=404, detail="Preview not found")
+        full_path = settings.project_root / r["img_rel_path"]
+        if not full_path.is_file():
+            raise HTTPException(status_code=404, detail="Image file not found on disk")
+        return FileResponse(full_path, media_type="image/png")
+
+
 # ----------------------------------------------------------------------------- Static Web
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
-if WEB_DIR.exists():
-    app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
+DIST_DIR = WEB_DIR / "dist" / "browser"
+if not DIST_DIR.exists():
+    DIST_DIR = WEB_DIR / "dist"
+
+STATIC_DIR = DIST_DIR if (DIST_DIR / "index.html").exists() else WEB_DIR
+
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
-@app.get("/")
-def serve_index():
-    index_file = WEB_DIR / "index.html"
+@app.get("/{full_path:path}")
+def serve_spa(full_path: str):
+    file_path = STATIC_DIR / full_path
+    if full_path and file_path.is_file():
+        return FileResponse(file_path)
+    index_file = STATIC_DIR / "index.html"
     if index_file.exists():
         return FileResponse(index_file)
     return JSONResponse({"status": "API running", "web": "frontend not yet mounted"})

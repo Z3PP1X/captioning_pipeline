@@ -581,6 +581,16 @@ function renderChunksList() {
         </select>
       </div>
       <div>
+        <select class="chunk-select-model" title="Captioning Model for Chunk #${index + 1}">
+          <option value="google/gemma-4-31b-it" ${(chunk.caption_model === 'google/gemma-4-31b-it' || !chunk.caption_model) ? 'selected' : ''}>Gemma 4 (Def)</option>
+          <option value="deepseek/deepseek-v4.1-flash" ${chunk.caption_model === 'deepseek/deepseek-v4.1-flash' ? 'selected' : ''}>DeepSeek V4.1</option>
+          <option value="google/gemini-2.0-flash-exp:free" ${chunk.caption_model === 'google/gemini-2.0-flash-exp:free' ? 'selected' : ''}>Gemini 2 Free</option>
+          <option value="qwen/qwen-2.5-vl-72b-instruct" ${chunk.caption_model === 'qwen/qwen-2.5-vl-72b-instruct' ? 'selected' : ''}>Qwen 2.5 VL</option>
+          <option value="x-ai/grok-4.7" ${chunk.caption_model === 'x-ai/grok-4.7' ? 'selected' : ''}>Grok 4.7</option>
+          <option value="mistralai/pixtral-12b" ${chunk.caption_model === 'mistralai/pixtral-12b' ? 'selected' : ''}>Pixtral 12B</option>
+        </select>
+      </div>
+      <div>
         <input type="text" class="chunk-input-tags" value="${(chunk.tags || []).join(', ')}" placeholder="tags (rope, chair, etc.)">
       </div>
       <div class="chunk-actions-col">
@@ -637,6 +647,19 @@ function renderChunksList() {
 
     const ruleSelect = card.querySelector('.chunk-select-rule');
     ruleSelect.onchange = (e) => chunk.rule = e.target.value;
+
+    const modelSelect = card.querySelector('.chunk-select-model');
+    if (modelSelect) {
+      modelSelect.onchange = (e) => {
+        chunk.caption_model = e.target.value;
+        if (chunk.id) {
+          api(`/api/chunks/${chunk.id}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ caption_model: e.target.value }),
+          }).catch(err => console.warn('Failed to patch chunk model:', err));
+        }
+      };
+    }
 
     const tagsInput = card.querySelector('.chunk-input-tags');
     tagsInput.onchange = (e) => chunk.tags = e.target.value.split(',').map(s => s.trim()).filter(Boolean);
@@ -961,6 +984,14 @@ function renderCurationGrid() {
           <span class="chunk-header-count">${picksInChunk} picks</span>
         </div>
         <div class="chunk-header-actions">
+          <select class="chunk-header-model-select" title="Captioning Model for Chunk #${chunkNum}">
+            <option value="google/gemma-4-31b-it" ${(first.chunk_caption_model === 'google/gemma-4-31b-it' || !first.chunk_caption_model) ? 'selected' : ''}>Gemma 4 (Def)</option>
+            <option value="deepseek/deepseek-v4.1-flash" ${first.chunk_caption_model === 'deepseek/deepseek-v4.1-flash' ? 'selected' : ''}>DeepSeek V4.1</option>
+            <option value="google/gemini-2.0-flash-exp:free" ${first.chunk_caption_model === 'google/gemini-2.0-flash-exp:free' ? 'selected' : ''}>Gemini 2 Free</option>
+            <option value="qwen/qwen-2.5-vl-72b-instruct" ${first.chunk_caption_model === 'qwen/qwen-2.5-vl-72b-instruct' ? 'selected' : ''}>Qwen 2.5 VL</option>
+            <option value="x-ai/grok-4.7" ${first.chunk_caption_model === 'x-ai/grok-4.7' ? 'selected' : ''}>Grok 4.7</option>
+            <option value="mistralai/pixtral-12b" ${first.chunk_caption_model === 'mistralai/pixtral-12b' ? 'selected' : ''}>Pixtral 12B</option>
+          </select>
           <button class="btn btn-small btn-keep-chunk" title="Keep all candidates in this chunk">✓ Keep All</button>
           <button class="btn btn-small btn-reject-chunk" title="Deselect all picks in this chunk">✕ Deselect All</button>
           <button class="btn btn-small btn-seek-chunk" title="Jump to chunk start in Studio">▶ Seek</button>
@@ -968,6 +999,21 @@ function renderCurationGrid() {
       </div>
       <div class="curate-chunk-cards"></div>
     `;
+
+    const modelSelect = section.querySelector('.chunk-header-model-select');
+    if (modelSelect) {
+      modelSelect.onchange = (e) => {
+        const newModel = e.target.value;
+        api(`/api/chunks/${chunkId}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ caption_model: newModel }),
+        }).catch(err => console.warn('Failed to patch chunk model:', err));
+        chunkCands.forEach(c => c.chunk_caption_model = newModel);
+        const ch = (state.chunks || []).find(c => c.id === chunkId);
+        if (ch) ch.caption_model = newModel;
+        showToast('Model Updated', `Chunk #${chunkNum} model set to ${newModel}`);
+      };
+    }
 
     section.querySelector('.btn-keep-chunk').onclick = async () => {
       for (const cand of chunkCands) {
@@ -982,8 +1028,9 @@ function renderCurationGrid() {
 
     section.querySelector('.btn-reject-chunk').onclick = async () => {
       for (const cand of chunkCands) {
-        if (cand.role === 'pick') {
-          await swapCandidate(cand, false);
+        if (cand.role === 'pick' && cand.state !== 'reject') {
+          cand.state = 'reject';
+          api(`/api/picks/${cand.id}`, { method: 'PATCH', body: JSON.stringify({ state: 'reject' }) });
         }
       }
       updateDistributionBar();
@@ -1044,11 +1091,12 @@ function renderCandidateCard(cand) {
       <div class="card-actions-row">
         <div class="action-btn-group">
           ${isRunnerUp ? `
-            <button class="btn btn-small btn-promote btn-accent" title="Promote to 300 Pick set">⬆ Promote</button>
+            <button class="btn btn-small btn-promote btn-accent" title="Add frame to active picks set (does not evict other frames)">⬆ Add to Picks</button>
           ` : `
             <button class="btn btn-small btn-keep ${cand.state === 'keep' ? 'btn-accent' : ''}" title="Keep (K)">✓ Keep</button>
-            <button class="btn btn-small btn-swap btn-secondary" title="Deselect & Swap with next best candidate from chunk">✕ Swap</button>
+            <button class="btn btn-small btn-deselect ${cand.state === 'reject' ? 'btn-danger' : 'btn-secondary'}" title="Deselect frame (does not auto-swap)">✕ Deselect</button>
             <button class="btn btn-small btn-star ${cand.state === 'star' ? 'btn-accent' : ''}" title="Star (S)">★</button>
+            <button class="btn btn-small btn-swap btn-ghost" title="Auto-swap with next best candidate">⇄</button>
           `}
         </div>
         <button class="btn btn-small btn-zoom" title="Inspect Fullscreen">🔍 1:1</button>
@@ -1069,13 +1117,17 @@ function renderCandidateCard(cand) {
       e.stopPropagation();
       await updatePickState(cand, 'keep');
     };
+    card.querySelector('.btn-deselect').onclick = async (e) => {
+      e.stopPropagation();
+      await updatePickState(cand, cand.state === 'reject' ? 'keep' : 'reject');
+    };
     card.querySelector('.btn-swap').onclick = async (e) => {
       e.stopPropagation();
       await swapCandidate(cand, true);
     };
     card.querySelector('.btn-star').onclick = async (e) => {
       e.stopPropagation();
-      await updatePickState(cand, 'star');
+      await updatePickState(cand, cand.state === 'star' ? 'keep' : 'star');
     };
   }
 
@@ -1110,18 +1162,7 @@ async function swapCandidate(cand, notify = true) {
 }
 
 async function promoteRunnerUp(cand) {
-  // Promote runner up to pick, swap out lowest scoring pick from the same chunk
-  const chunkPicks = state.candidates.filter(c => c.chunk_id === cand.chunk_id && c.role === 'pick');
-  let lowestPick = chunkPicks[chunkPicks.length - 1];
-  if (lowestPick) {
-    await api(`/api/picks/${lowestPick.id}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ role: 'runner_up', state: 'reject' }),
-    });
-    lowestPick.role = 'runner_up';
-    lowestPick.state = 'reject';
-  }
-
+  // Promote runner up to pick WITHOUT evicting any existing pick
   await api(`/api/picks/${cand.id}`, {
     method: 'PATCH',
     body: JSON.stringify({ role: 'pick', state: 'keep' }),
@@ -1132,7 +1173,7 @@ async function promoteRunnerUp(cand) {
   updateDistributionBar();
   updateCurateChunkFilterOptions();
   renderCurationGrid();
-  showToast('Candidate Promoted', `Frame #${cand.id} promoted to active 300 pick set.`);
+  showToast('Candidate Added', `Frame #${cand.id} added to active picks set.`);
 }
 
 async function updatePickState(cand, newState) {
@@ -1142,6 +1183,7 @@ async function updatePickState(cand, newState) {
       body: JSON.stringify({ state: newState }),
     });
     cand.state = newState;
+    updateDistributionBar();
     updateCurateChunkFilterOptions();
     renderCurationGrid();
   } catch (e) {
@@ -1476,10 +1518,12 @@ function setupEventListeners() {
     const chunkFilter = document.getElementById('curate-chunk-filter')?.value || 'all';
     for (const c of state.candidates) {
       if (chunkFilter !== 'all' && String(c.chunk_id) !== chunkFilter) continue;
-      if (c.role === 'pick') {
-        await swapCandidate(c, false);
+      if (c.role === 'pick' && c.state !== 'reject') {
+        c.state = 'reject';
+        api(`/api/picks/${c.id}`, { method: 'PATCH', body: JSON.stringify({ state: 'reject' }) });
       }
     }
+    updateDistributionBar();
     updateCurateChunkFilterOptions();
     renderCurationGrid();
   };
@@ -1497,10 +1541,13 @@ function setupEventListeners() {
         alert('Please select a video first.');
         return;
       }
-      const picks = (state.candidates || []).filter(c => c.role === 'pick');
+      const picks = (state.candidates || []).filter(c => c.role === 'pick' && c.state !== 'reject');
       if (picks.length === 0) {
-        alert('No curated picks found for this video. Please run Extract & Score 750 first!');
+        alert('No curated picks found for this video. Please select frames or run Extract & Score 750 first!');
         return;
+      }
+      if (btnStartOpenRouter) {
+        btnStartOpenRouter.textContent = `🚀 Start Batch Captioning (${picks.length} Frames)`;
       }
       const savedKey = localStorage.getItem('cp_openrouter_api_key') || '';
       const keyInput = document.getElementById('openrouter-api-key');
@@ -1523,6 +1570,8 @@ function setupEventListeners() {
       const trigger = document.getElementById('openrouter-trigger-input').value.trim();
       const classNoun = document.getElementById('openrouter-class-input').value.trim();
 
+      const pickCount = (state.candidates || []).filter(c => c.role === 'pick' && c.state !== 'reject').length;
+
       try {
         btnStartOpenRouter.disabled = true;
         btnStartOpenRouter.textContent = 'Queueing Batch...';
@@ -1534,6 +1583,7 @@ function setupEventListeners() {
           reasoning_effort: 'high',
           max_tokens: 300,
           temperature: 0.80,
+          use_chunk_models: true,
           mode: mode || 'concept',
           trigger: trigger || 'restrained_elegance',
           class_noun: classNoun || 'woman, ropes',
@@ -1550,8 +1600,8 @@ function setupEventListeners() {
 
         if (openRouterModal) openRouterModal.style.display = 'none';
         showToast(
-          'OpenRouter 3-Layer Cascade Queued',
-          `Queued ${res.candidate_count || 300} frames: L1 ${payload.model} (High Reasoning, max 300 tok) ➜ Refusal Fallback L2 ${payload.fallback_layer2} ➜ L3 ${payload.fallback_layer3}!`,
+          'OpenRouter Cascade Queued',
+          `Queued ${pickCount} frames with per-chunk models (Layer 1 Default: Gemma 4) ➜ Refusal Fallback L2 DeepSeek ➜ L3 Grok!`,
           state.currentVideo.id
         );
 
@@ -1559,10 +1609,10 @@ function setupEventListeners() {
         alert('Failed to launch OpenRouter batch: ' + err.message);
       } finally {
         btnStartOpenRouter.disabled = false;
-        btnStartOpenRouter.textContent = '🚀 Start Batch Captioning (300 Frames)';
+        btnStartOpenRouter.textContent = `🚀 Start Batch Captioning (${pickCount || 300} Frames)`;
       }
     };
-  };
+  }
 
   // Export video button
   document.getElementById('btn-export-this-video').onclick = async () => {

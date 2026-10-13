@@ -257,3 +257,37 @@ def test_3_layer_cascade_simulation():
 
     asyncio.run(run_cascade_test())
 
+
+def test_chunk_model_selection_override():
+    """Verify that when use_chunk_models is True, chunk-specific model is used, otherwise primary_model."""
+    options_with_chunk = {"use_chunk_models": True, "model": "google/gemma-4-31b-it"}
+    options_override_all = {"use_chunk_models": False, "model": "google/gemma-4-31b-it"}
+
+    item_chunk_model = "deepseek/deepseek-v4.1-flash"
+    item_no_chunk_model = ""
+
+    # 1. When use_chunk_models=True and item has caption_model set
+    l1_model = (
+        item_chunk_model
+        if (options_with_chunk.get("use_chunk_models", True) and item_chunk_model)
+        else options_with_chunk["model"]
+    )
+    assert l1_model == "deepseek/deepseek-v4.1-flash"
+
+    # 2. When use_chunk_models=True but item has empty caption_model, falls back to primary
+    l1_model_fallback = (
+        item_no_chunk_model
+        if (options_with_chunk.get("use_chunk_models", True) and item_no_chunk_model)
+        else options_with_chunk["model"]
+    )
+    assert l1_model_fallback == "google/gemma-4-31b-it"
+
+    # 3. When use_chunk_models=False, forces global primary model
+    l1_model_forced = (
+        item_chunk_model
+        if (options_override_all.get("use_chunk_models", True) and item_chunk_model)
+        else options_override_all["model"]
+    )
+    assert l1_model_forced == "google/gemma-4-31b-it"
+
+

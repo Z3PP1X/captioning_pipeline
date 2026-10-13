@@ -50,15 +50,22 @@ class ClipClassifier:
     def _ensure_vision_model(self) -> ort.InferenceSession:
         with self._lock:
             if self._vision_sess is None:
-                v_path = hf_hub_download(self.repo, "onnx/vision_model_quantized.onnx", cache_dir=str(self.models_dir))
+                try:
+                    v_path = hf_hub_download(self.repo, "onnx/vision_model_quantized.onnx", cache_dir=str(self.models_dir), local_files_only=True)
+                except Exception:
+                    v_path = hf_hub_download(self.repo, "onnx/vision_model_quantized.onnx", cache_dir=str(self.models_dir))
                 self._vision_sess = ort.InferenceSession(v_path, self.opts, providers=["CPUExecutionProvider"])
             return self._vision_sess
 
     def _ensure_text_model(self) -> tuple[ort.InferenceSession, Tokenizer]:
         with self._lock:
             if self._text_sess is None or self._tokenizer is None:
-                t_path = hf_hub_download(self.repo, "onnx/text_model_quantized.onnx", cache_dir=str(self.models_dir))
-                tok_path = hf_hub_download(self.repo, "tokenizer.json", cache_dir=str(self.models_dir))
+                try:
+                    t_path = hf_hub_download(self.repo, "onnx/text_model_quantized.onnx", cache_dir=str(self.models_dir), local_files_only=True)
+                    tok_path = hf_hub_download(self.repo, "tokenizer.json", cache_dir=str(self.models_dir), local_files_only=True)
+                except Exception:
+                    t_path = hf_hub_download(self.repo, "onnx/text_model_quantized.onnx", cache_dir=str(self.models_dir))
+                    tok_path = hf_hub_download(self.repo, "tokenizer.json", cache_dir=str(self.models_dir))
                 self._text_sess = ort.InferenceSession(t_path, self.opts, providers=["CPUExecutionProvider"])
                 self._tokenizer = Tokenizer.from_file(tok_path)
                 # Enable padding to 77 tokens (CLIP standard)
