@@ -1,0 +1,361 @@
+# Handoff - design overhaul, pipeline review, Prompt Director fix, Phase A
+
+Date: 2026-10-13. Branch `main`. Everything below is committed and pushed (see §2).
+**Phase A (§4) is done** (§1.3). Next: verify in WSL (§5), then Phase B.
+This document supersedes the "Suggested order" in `GAP_REPORT.md` §7. `GAP_REPORT.md` stays valid as the
+inventory of Angular migration gaps; its IDs (F*, B*, T1) are reused below.
+
+## 0. Read first
+
+| Document | Content | IDs used below |
+| --- | --- | --- |
+| `GAP_REPORT.md` | Angular migration gaps (prior handover) | F1-F13, B1-B6, T1 |
+| `docs/reviews/pipeline-review.md` | Backend correctness, performance, new extraction, quality, diversity and caption process | C1-C4, H1-H9, M1-M10 |
+| `docs/reviews/design-overhaul-plan.md` | View-by-view design audit, workflow IA, wireframes, spacing, colour, contrast | Q1-Q14, P1-P10, W1-W10, K1-K5 |
+| `docs/reviews/prompt-clicker-review.md` | Prompt Director root cause, changes made, design and RAG review | R1-R10 (= its §5 table rows) |
+| `.claude/skills/*` | Domain, API contract, UI spec, Angular architecture, styling and design-system rules | - |
+
+Hard rules (unchanged): all Python/Node/uv commands run **inside WSL 2** on the Windows host (`AGENTS.md`).
+Tests use fixtures, never the video library. Never commit `.env`, `*.db`, frames or `data/`.
+
+## 1. What this session did
+
+The work ran on a **macOS** machine, with no WSL, `uv` or `ffmpeg`. Three subagents ran in parallel:
+
+1. **Design review** (read-only). The report is `docs/reviews/design-overhaul-plan.md`.
+2. **Pipeline review** (read-only, static analysis). The report is `docs/reviews/pipeline-review.md`.
+3. **Prompt Director ("clicker tool") fix** (code changes) plus a review. The report is `docs/reviews/prompt-clicker-review.md`.
+
+### 1.1 Prompt Director: root cause and fix (code changed, uncommitted)
+
+**Why it was "not available":**
+- The tab always existed and compiled. But with no RAG index, `/api/rag/retrieve` and `/api/rag/generate`
+  returned a bare 500, and the UI showed only "Internal Server Error".
+- The index could almost never be built: `scripts/index_rag.py` read only `data/curated_2500/{train,val}`,
+  which only the ad-hoc `scripts/curate_dataset.py` writes. With 0 captions found, it wrote nothing.
+- A missing API key, an unreachable Ollama or an upstream 4xx were also bare 500s. "Local Ollama" with no URL crashed.
+
+**Changed files:**
+- `src/pipeline/rag/{__init__,generator,indexer,linter,retriever}.py`
+- new `src/pipeline/rag/index_job.py`
+- RAG routes plus the `/api/*` catch-all 404 in `src/pipeline/api.py`
+- `scripts/index_rag.py`
+- `src/web/app/core/{models/prompt-rag.model.ts,services/prompt-rag.service.ts}`
+- `src/web/app/features/prompt-clicker/prompt-clicker-view.component.ts` (rewritten: helm controls,
+  lucide icons, no `ngModel`, data-driven categories)
+- new `tests/test_rag_api.py` (11 tests)
+
+**New behaviour:**
+- `GET /api/rag/status` and `POST /api/rag/index` run a background build, separate from `JobManager`
+  because those jobs are per-video.
+- The indexer falls back to `finished/merged` and writes atomically. The server hot-reloads a rebuilt index.
+- Retrieve returns an empty result with `index_ready: false`. Generate works ungrounded (`grounded`, `notices`).
+- Errors are readable: 400 for a missing key, 502 for an upstream failure.
+- Retrieval adds MMR and a 0.98 near-duplicate cutoff. Embeddings are matched to captions by id.
+- `is_valid` in the linter is fixed.
+
+**Verification (Mac only):**
+- `ng build --configuration production` is clean.
+- `pytest tests/`: 48 passed, 1 failed. The failure is `test_phase1.py::test_api_routes`, which needs the
+  `/mnt/c/.../_girls` library (environmental).
+- Headless Chrome, end to end with 40 synthetic captions: the guided panel rendered, the build showed
+  progress, preview returned exemplars, and generate ran against a fake Ollama.
+- **Not yet run in WSL**; the commands are in §5.
+
+### 1.3 Phase A: data-loss and security fixes (session 3, done)
+
+Also run on macOS (no WSL/uv/ffmpeg). Tests ran in a scratch venv with `CP_CACHE_DIR`/`CP_FINISHED_DIR`/`CP_VIDEO_DIR`
+pointed at temp dirs (the default `/mnt/c` paths make the lifespan fail on a Mac).
+
+| # | What changed | Where |
+| --- | --- | --- |
+| A1 | The exporter never overwrites a VLM caption: frames with a caption are only re-linked and recorded. Stubs are written only for uncaptioned frames and marked by a `.json` sidecar with `caption_source: "stub"` (legacy sidecars without the field count as stubs). `existing_caption_kind()` classifies files. The caption job replaces stubs, deletes their sidecars, and also re-captions captions cut off mid-sentence. | `export.py`, `jobs.py` |
+| A2 | Export-all selects `curating, curating_300, chunked`, skips `exported` and videos with a queued/running job. **New finding:** the Angular `DatasetService` called `POST /api/videos/{id}/export` and `POST /api/export_all`, which never existed, so UI export was broken; it now calls `POST /api/export`. | `api.py`, `dataset.service.ts` |
+| A3 | Chunks are upserted by id; only removed chunks are deleted. A moved range marks the chunk `dirty` and keeps its frames. Removing a chunk with picks/exports (PUT or Suggest) returns **409** unless `confirm_destructive: true`. Saving no longer demotes a curated/exported video to `chunked`. UI: `ApiError` (status + detail) and a confirm-then-retry in the chunks panel (**interim `window.confirm`; B4 replaces it with an alert-dialog**). | `autochunk.py`, `api.py`, `api.service.ts`, `chunk.service.ts`, `chunks-panel.component.ts` |
+| A4 | Reasoning defaults to off (`"none"`, also in the caption dialog and `DEFAULT_USER_SETTINGS`); the 300-token cap is gone (default 600, reasoning forces ≥1200). A reply with `finish_reason == "length"`, no closing sentence, or under half the mode's minimum words is retried twice without reasoning and with a doubled budget; still cut off → `CaptionTruncatedError`. Word-range warnings per mode. Refusals are detected before the retry so they are not billed twice. New read-only `scripts/audit_captions.py` (word histogram, truncated, stubs, `--list`, `--json`). | `openrouter.py`, `jobs.py`, `api.py`, `config.py`, `openrouter-modal.component.ts` |
+| A4+ | Pulled forward from C7 because A4 makes per-frame failures more likely: one frame's error no longer fails the caption job. The job ends `finished` with a failure summary in `jobs.error`; the video becomes `exported` only if every keep/star frame has an export. | `jobs.py` |
+| A5 | `cancel_job` refuses finished jobs; a queued job is cancelled at once and its video settled; workers start only if the row is still `queued`. Extract-750 checks the flag between stages and before writing files or committing, so a cancel never deletes frames. The caption job ends `cancelled`, not `exported`. Flags are cleared in `finally`. Error and cancel paths share one "settle video status" SQL (`exported` / `curating_300` / `chunked` / `new`); auto-process and legacy extract errors no longer leave videos in `extracting`. | `jobs.py` |
+| A6 | Reconcile counts keep/star frames for "fully exported", so rejected picks no longer demote `exported` videos. Chunk stats add `approved_count`. | `reconcile.py` |
+| A7 | SSE: `loop.call_soon_threadsafe` per listener, queues bounded at 500 (drop oldest), `: keepalive` every 15 s. | `jobs.py` |
+| A8 | `serve_spa` and the filmstrip route contain resolved paths in their root. CORS only for `localhost:4200`/`127.0.0.1:4200`, no credentials. `GET/PUT /settings` never return `openrouter_api_key` (only `openrouter_api_key_set`); a PUT with an empty key keeps the stored one. The caption job also reads the stored key. `run.sh`, `start_all.sh` and `start_web.sh` bind `127.0.0.1`. | `api.py`, `jobs.py`, `scripts/*.sh` |
+| A9 | `httpx` moved to runtime dependencies. **`uv.lock` was edited by hand** (no uv on the Mac); `uv sync` re-locks if anything disagrees. | `pyproject.toml`, `uv.lock` |
+
+**Tests:** new `tests/test_phase_a.py` (16 tests, temp DB, one or more per item). `test_openrouter.py` now asserts
+the new token contract (the old asserts encoded the 300 cap) plus 6 truncation tests. `test_full_pipeline.py::test_concurrent_job_manager`
+was racy (the jobs finished before the cancel) and now holds jobs in the queue and checks the new cancel semantics.
+**Result: 70 passed** (`test_phase1::test_api_routes` deselected: needs the library). `ng build --configuration production` is clean.
+
+**Not done in Phase A, on purpose:**
+- Extract-750 still deletes and replaces all frames of a video when it commits. That is the explicit "re-extract" action; the UI guard is B4.
+- The short-video branch of `generate_balanced_chunks` (duration < 25 s) still returns unsaved chunks. This is unreachable with `min_duration_s = 30`.
+- Per-video job lock (C3/H4) and runner re-decode (C1/H1) are still open.
+- `api-contract` skill updated for everything above. The RAG routes from session 2 are still missing there (Phase I).
+
+### 1.2 Headline findings (details in the reports)
+
+**Data-loss bugs (all fixed in Phase A, §1.3).**
+- **C1:** Export overwrites VLM captions with a trigger-only stub, and export-all already includes `exported` videos.
+- **C2:** Chunk save or suggest deletes all frames, picks and exports through `ON DELETE CASCADE`.
+- **C3:** Captions are truncated: reasoning is "high" with `max_tokens` 300.
+- **C4:** Cancel corrupts state.
+- **H3:** Reconcile counts rejected picks and demotes `exported` videos.
+
+**Security (H7):**
+- `serve_spa` has no path containment.
+- CORS is `*` with credentials.
+- The API key is returned from `GET /settings`.
+
+**Design:**
+- There is no workflow guidance: four equal tabs, and nothing driven by `video.status`.
+- 23 text pairs fail WCAG AA contrast, mostly the queue status badges, budget badges and the "Captioned" chip.
+- Brand red is overused.
+- Keyboard use is mostly broken (F1). Disabled buttons cannot show why they are disabled (`hlm-button`
+  sets `pointer-events: none`).
+- Toasts always say "Curate Now".
+
+**Pipeline quality:**
+- Extract-750 has no hard gates or dedup.
+- The category bonus (up to 0.75) outweighs the 0-1 quality score.
+- CLIP centre-crop embeddings make diversity nearly inert.
+- Runner frames are stored at 720 px or less, so swaps export low-resolution images.
+- Memory is about 6 GB per 1080p job.
+
+**RAG:**
+- The CLIP text encoder truncates at 77 tokens: the dense score sees only about the first 55 words of each caption.
+- Tag matching is substring-based (`light` matches "slightly").
+
+## 2. Repository state
+
+- **Committed and pushed in session 3**, as four commits: skills + `GAP_REPORT.md`; the Prompt Director fix + tests;
+  Phase A + tests; `docs/reviews/` + this file. A git stash `skills-wip` still exists as a backup of the old skills;
+  drop it after reviewing the skills.
+- **Build artefacts:** `node_modules/` and `src/web/dist/` were built on macOS (gitignored). Do not copy them
+  to WSL; run `npm install` / `npm run build` there.
+- **Duplicate skill tree:** `.agents/skills/{design-system,styling}` duplicates `.claude/skills/*` and has
+  drifted. Pick one canonical tree.
+- Nothing has run in WSL yet; §5 is still the first thing to do.
+
+## 3. Decisions needed from the product owner
+
+These block or shape the items listed in brackets.
+
+1. **Character vs concept LoRA profile** [pipeline Phase 3-5, C-profile].
+   - The current defaults (`openrouter_mode="concept"`, a single trigger, a 50% multi-person target) suit a
+     concept LoRA, but the stated goal is a character LoRA.
+   - Proposal: a per-video or per-chunk `profile` + `character_id`, an identity gate, and solo or cropped frames.
+2. **Angular Router vs tabs** [W1, F9]. The design plan proposes `/board`, `/v/:id/:step`, `/dataset` and
+   `/tools/prompt-director`.
+3. **Status UI** [F3, W3]: replace the status `<select>` with a derived status plus an overflow menu
+   (Skip / Restore / advanced)?
+4. **Tokens** [Q2, 6.5 in the design plan]: a new `info` badge variant, plus optional `--success-strong` and
+   `--warning-strong` tokens.
+5. **Export semantics** [W9]: does the caption job count as export ("Done" right after "Caption"), or is
+   export a separate step?
+6. **API key persistence** [F7, H7]: `localStorage` vs server-only. Never return the key from `GET /settings`.
+7. **Prompt Director guardrail wording** [R8]:
+   - The generator system prompt says "adults 25+", while both character profiles specify age 21.
+   - Make the rule consistent: a clear adult-only rule, with each character's adult age stated explicitly.
+   - Replace the `CHARACTERS["lene"]["avatar"]` emoji, which no longer renders, or drop the field.
+
+## 4. Implementation plan (ordered)
+
+Each item lists its source IDs. Effort is for one developer and includes tests.
+
+### Phase A - Stop the bleeding - **DONE (session 3, §1.3)**
+
+Kept for reference; the regression tests are in `tests/test_phase_a.py`.
+
+| # | Work | Source | Notes |
+| --- | --- | --- | --- |
+| A1 | Exporter never overwrites an existing VLM caption. Interim: drop `exported` from the export-all query and skip existing `.txt` files. | C1 | **Must land before A2.** |
+| A2 | Export-all includes `curating_300`. | B1 | Only after A1. |
+| A3 | Chunk upsert by id; delete only removed ids; mark changed ranges `dirty`. Backend requires an explicit confirm flag for a destructive re-chunk when picks exist. | C2 | Prerequisite for B3/B4 (save-before-extract). |
+| A4 | Captioning: reasoning off (or `effort: low`, `max_tokens` ≥ 1200). Reject `finish_reason == "length"` and retry. Word-count validation. Audit existing captions for truncation and stubs. | C3 | |
+| A5 | Cancellation: check the flag before destructive writes, no DB mutation on cancel, check at job start, clear flags at the end. | C4 | |
+| A6 | Reconcile counts only `keep`/`star` picks. | H3 | |
+| A7 | SSE: `loop.call_soon_threadsafe`, bounded queues, 15 s heartbeat. | H6 | |
+| A8 | Security: `serve_spa` containment check, CORS limited to `localhost:4200` or removed, no key in `GET /settings`, bind `127.0.0.1`. | H7 | Also flagged by the clicker review §6. |
+| A9 | Move `httpx` from the dev group to runtime dependencies in `pyproject.toml`. | clicker §6 | `uv sync --no-dev` would break the API. |
+
+### Phase B - Frontend quick wins (about 2-3 days)
+
+See design plan §7 Phase 0 for files and line numbers.
+
+| # | Work | Source |
+| --- | --- | --- |
+| B1 | Light-first: remove `class="dark"`, the `.dark` block, the theme toggle and Google Fonts; remove `user-select:none` from body. | T1, Q1 |
+| B2 | One status mapping (`core/ui/status.ts`) plus `hlmBadge`; all `VideoStatus` values selectable and labelled. Fixes most contrast failures. | Q2, Q3, F3 |
+| B3 | Extract = save (normalise to 100%), then extract; dirty flag and "Unsaved changes" pill. **Requires A3.** | F2, Q7 |
+| B4 | Re-chunk guard (alert-dialog once status ≥ curating), wired to A3's confirm flag. | Q8, F6 |
+| B5 | Hotkeys: no `preventDefault` on interactive targets; register every key in the spec table; lightbox ←/→ and K/X/S with auto-advance. | F1, Q5 |
+| B6 | Disabled-with-reason helper text; replace the 3 `alert()` calls; confirm bulk reject/deselect. | Q6, F5, F6 |
+| B7 | Toast actions typed per event (only extraction-complete gets "Start curating"); errors persist. | Q4 |
+| B8 | One primary button per view; tokens for media surfaces; remove raw palette and hex values. | Q9, Q10 |
+| B9 | Type-scale pass (82 `text-[Npx]`, `font-mono` → `tabular-nums`, bare `rounded`); emoji → lucide. | Q11, Q14 |
+| B10 | Settings dialog: re-read on open (stale-form bug), validation, `snap_window_s`. | Q12, F8, F4 |
+| B11 | Curate loading skeleton and distinct empty states. | Q13 |
+| B12 | Add an Angular `test` target and specs for `time.utils`, chunk budget/snap, `CurateService` filters and `HotkeyService`. | GAP §5 |
+
+### Phase C - Pipeline correctness and resources (about 2-3 days)
+
+| # | Work | Source |
+| --- | --- | --- |
+| C1 | Re-decode the native frame when a runner is promoted or swapped in; record `native=1`. | H1 |
+| C2 | Rank runners; similarity-based replacement on swap. | H2 |
+| C3 | Per-video job lock (409); separate decode (1-2 workers) and caption executors. | H4 |
+| C4 | Stream extract-750: small in-RAM copies, write native picks immediately. Target peak RSS below 2.5 GB for 1 h of 1080p. | H5 |
+| C5 | Hard gates and pHash dedup in the 750 flow; apply letterbox/watermark crop before metrics. | H8, H9 |
+| C6 | Wire up or remove unused settings (quotas, MMR knobs, concurrency, max_dim). | H9 |
+| C7 | Budget shortfall redistribution, caption-job robustness (`return_exceptions`, 5xx retry), status validation, cache cleanup, response-shape unification (B2/B3: one chunk mapper). | M5, M7, M8, M9, B2, B3 |
+| C8 | Run `scripts/bench.py` in WSL and record a baseline. The timings in the review are estimates. | §3 |
+
+### Phase D - Spartan primitives and tokens (about 1-1.5 weeks)
+
+Design plan P1-P10:
+- `components.json` and the missing helm primitives
+- `hlm-dialog` / `alert-dialog`
+- sonner toasts
+- Signal Forms in place of `ngModel` (about 42 uses)
+- tooltips + `kbd`
+- distribution bar on `hlm-progress`
+- candidate card redesign
+- keyboard-accessible timeline
+- model list from `GET /api/openrouter/models` (F7)
+- landmarks and a skip link
+
+### Phase E - Workflow IA (about 2 weeks; needs decisions 2, 3 and 5)
+
+Design plan W1-W10 (state machine in its §3.1, wireframes in §3.3):
+- Router
+- `WorkflowService` state machine
+- per-video workspace with a stepper (Chunk → Extract → Curate → Caption → Done) and a sticky "next action" bar
+- Pipeline board as the landing page; the backend needs `kept_count`/`captioned_count` on `GET /api/videos`
+- queue rail
+- Jobs popover with SSE connection state (F11)
+- two-column Studio
+- inline Caption and Done steps
+- Dataset table (requires A2)
+
+### Phase F - Extraction / quality / selection v2 (about 8-14 days; needs decision 1)
+
+Pipeline review §4-6 and roadmap Phases 2-4:
+- **Extraction v2:**
+  - a single analysis decode, cached as an npz plus a `frame_features` table
+  - frame-accurate cuts (TransNetV2 or PySceneDetect)
+  - window-peak sampling (sharpest and stillest per 1-2 s within a shot)
+  - dHash pre-dedup
+  - YuNet face detection and SFace identity gate (OpenCV, no new dependency)
+- **Quality v2:**
+  - gates, then per-video percentile-normalised components (subject sharpness, noise, exposure, face size and pose)
+  - weights fitted from logged keep/reject history (`curation_events`)
+  - optional TOPIQ/MUSIQ
+- **Selection v2:**
+  - DINOv2-S ONNX embeddings on letterboxed frames
+  - quality-weighted facility location with per-chunk floor/cap, an elasticity knob, axis caps and cross-dataset dedup
+  - `POST /videos/{id}/reselect`, with the knobs exposed in the Curate toolbar
+  - pseudocode in §6.3
+
+### Phase G - Captioning v2 (about 2-3 days)
+
+Pipeline review §7:
+- a `captions` table as the source of truth (the exporter and RAG read from it)
+- prompts versioned in `src/pipeline/prompts/`, no runtime read of `~/.gemini`
+- temperature 0.3-0.5
+- validation gate
+- per-profile trigger handling
+- one shared `render_export_image()`
+- cost logging
+
+### Phase H - Prompt Director v2 (about 3-5 days)
+
+Clicker review §4-5.
+
+**Quick:**
+- R7: warm the model and cache query embeddings
+- R2: word-boundary matching plus FTS5 BM25 with RRF
+- R8: prompt fixes; `max_tokens` around 1200; `json_schema` output with a retry
+- R4: cap exemplars per source video
+- R9: Qwen tokenizer for token counts
+
+**Then:**
+- R1: per-domain embeddings, or a 512-token text embedder
+- R6: incremental reindex after export or caption jobs
+- R10: eval set from the val split
+- R3: SigLIP image embeddings, "more like this frame"
+
+**UX:**
+- history and favourites in SQLite (`rag_history`), the biggest workflow win
+- batch "Generate N"
+- export prompt lists (`.txt`/`.jsonl`)
+- "Use as prompt seed" from Curate/Dataset
+- inline edit plus re-lint
+- `1/2/3` copy shortcuts via `HotkeyService`
+- Prompt Director design pass (K4)
+
+### Phase I - Cleanup and docs (continuous)
+
+- Delete `src/web/app.js` and `src/web/shared/components/**` after parity sign-off.
+- Resolve the `.agents/skills` duplication and drop the `skills-wip` stash.
+- Tooling: ext4 Node/cache, Node in `setup.sh`, production build in `start_all.sh`, and fail loudly if `src/web/dist` is missing.
+- **Update the skills as items close:**
+  - `api-contract`: Phase A is done (session 3). Still to add: the new RAG routes (`/rag/status`, `/rag/index`), plus `/retrieve` `index_ready`,
+    `/generate` `grounded`/`notices`/`api_key` and the 400/502 codes. Also the `/api/*` JSON 404.
+  - `studio-ui-spec`: the Prompt Director section, then the port status.
+  - `angular-migration`: remaining work.
+
+**Dependencies:**
+- A1 → A2; A2 → E (Dataset)
+- A3 → B3/B4
+- B2 → D (cards) / E (board)
+- D (P1) → D forms / timeline / K1
+- decisions 2, 3, 5 → E
+- decision 1 → F/G
+- A4 before re-captioning anything
+
+## 5. Verify the current state in WSL (do this first)
+
+```bash
+# from Windows: wsl bash -lc "<command>"; inside WSL:
+cd /mnt/c/Users/Patri/Documents/captioning_pipeline
+bash scripts/setup.sh
+npm install
+bash scripts/test.sh tests/test_rag.py tests/test_rag_api.py tests/test_phase_a.py tests/test_openrouter.py
+bash scripts/test.sh                # full suite; test_phase1::test_api_routes needs the real library
+bash scripts/start_all.sh           # builds the UI, serves :8000
+curl -s localhost:8000/api/rag/status | python3 -m json.tool
+uv run python scripts/audit_captions.py --list   # read-only: truncated captions and stubs from earlier runs
+```
+
+0. **Phase A checks:**
+   - `localhost:8000` must still open from the Windows browser now that uvicorn binds `127.0.0.1`. WSL 2 localhost
+     forwarding should cover it. If not, set `localhostForwarding=true` in `.wslconfig`; do not go back to `0.0.0.0`.
+   - `uv sync` should accept the hand-edited `uv.lock` (or re-lock it); commit any lock change.
+   - Run the audit before re-captioning. A caption job on an affected video re-captions only the truncated or stub
+     files and reuses the rest.
+
+1. **Prompt Director:** open `http://localhost:8000` → Prompt Director.
+   - You should see the guided panel with **Build index**. The first build downloads the CLIP text model
+     into `~/.cache/captioning_pipeline/models`.
+   - Then pick a preset → Preview exemplars → Generate (Ctrl/Cmd+Enter).
+   - With no key you get a readable 400. Set `OPENROUTER_API_KEY` in `.env`, or use Local Ollama with a URL.
+2. **Golden path:** select a video → suggest → save → extract → curate → caption → export.
+   - A1-A5 have landed but have not run against real data. Use a copied video for the first pass.
+
+## 6. Unverified - confirm before relying on it
+
+- **Not run in WSL:** nothing from sessions 2 and 3.
+- **Phase A assumptions:** WSL 2 forwards `127.0.0.1` binds to Windows `localhost`. The OpenRouter `finish_reason`
+  values match the mocked ones. The hand-edited `uv.lock` is accepted.
+- **Runtime behaviour, inferred from source:**
+  - Space-key `preventDefault` blocking button presses
+  - the settings stale-form bug
+  - `py-0.2` producing no CSS
+  - the lightbox showing the DB `chunk_id`
+- **Estimates:**
+  - pipeline timings and memory figures
+  - CLIP cosine ranges
+  - path-traversal exploitability
+  - asyncio cross-thread behaviour
+  - wheel availability on aarch64 (TransNetV2 port, MediaPipe, PyAV hwaccel)
+- **Machine profile:** `scripts/bench.py` says "WSL aarch64, CPU only", so the plan assumes CPU/ARM64.
+  The GPU items in pipeline Phase 6 are optional.
