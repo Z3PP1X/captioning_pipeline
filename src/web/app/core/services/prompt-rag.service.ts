@@ -3,12 +3,17 @@ import { ApiService } from './api.service';
 import {
   CharacterProfile,
   CuratedPreset,
-  PromptArchetype,
   RagGenerateResponse,
+  RagIndexStatus,
   RagItemPreview,
+  RagRetrieveResponse,
   SelectedTags,
   TaxonomyCategory,
 } from '../models/prompt-rag.model';
+
+/** Same key the caption dialog stores (`openrouter-modal.component.ts`). */
+const OPENROUTER_KEY_STORAGE = 'cp_openrouter_api_key';
+const STATUS_POLL_MS = 1000;
 
 @Injectable({
   providedIn: 'root',
@@ -38,6 +43,12 @@ export class PromptRagService {
   readonly retrievedContext = signal<RagItemPreview[]>([]);
   readonly errorMessage = signal<string | null>(null);
 
+  readonly indexStatus = signal<RagIndexStatus | null>(null);
+  readonly statusError = signal<string | null>(null);
+  readonly isIndexReady = computed(() => this.indexStatus()?.ready ?? false);
+  readonly isIndexBuilding = computed(() => this.indexStatus()?.build.state === 'running');
+  private statusTimer: ReturnType<typeof setTimeout> | null = null;
+
   readonly totalSelectedCount = computed(() => {
     const tags = this.selectedTags();
     return Object.values(tags).reduce((sum, list) => sum + (list?.length || 0), 0);
@@ -57,6 +68,48 @@ export class PromptRagService {
       console.error('Failed to load RAG metadata:', err);
       this.errorMessage.set(err?.message || 'Failed to load categories');
     }
+  }
+
+  async loadStatus(): Promise<void> {
+    try {
+      const status = await this.api.get<RagIndexStatus>('/api/rag/status');
+      this.applyStatus(status);
+      this.statusError.set(null);
+    } catch (err: any) {
+      console.error('Failed to load RAG index status:', err);
+      this.statusError.set(err?.message || 'Failed to load RAG index status');
+    }
+  }
+
+  async buildIndex(): Promise<void> {
+    this.statusError.set(null);
+    try {
+      this.applyStatus(await this.api.post<RagIndexStatus>('/api/rag/index', {}));
+    } catch (err: any) {
+      // 409 = already running: just resume polling
+      this.statusError.set(err?.message || 'Failed to start index build');
+      await this.loadStatus();
+    }
+  }
+
+  stopStatusPolling(): void {
+    if (this.statusTimer) {
+      clearTimeout(this.statusTimer);
+      this.statusTimer = null;
+    }
+  }
+
+  private applyStatus(status: RagIndexStatus): void {
+    this.indexStatus.set(status);
+    this.stopStatusPolling();
+    if (status.build.state === 'running') {
+      this.statusTimer = setTimeout(() => this.loadStatus(), STATUS_POLL_MS);
+    }
+  }
+
+  private storedApiKey(): string | undefined {
+    if (typeof localStorage === 'undefined') return undefined;
+    return localStorage.getItem(OPENROUTER_KEY_STORAGE)?.trim() || undefined;
   }
 
   selectCharacter(characterId: string | null): void {
@@ -110,12 +163,15 @@ export class PromptRagService {
     this.isRetrieving.set(true);
     this.errorMessage.set(null);
     try {
-      const res = await this.api.post<{ results: RagItemPreview[] }>('/api/rag/retrieve', {
+      const res = await this.api.post<RagRetrieveResponse>('/api/rag/retrieve', {
         selected_tags: this.selectedTags(),
         user_description: this.userDescription(),
         top_k: 4,
       });
       this.retrievedContext.set(res.results);
+      if (!res.index_ready) {
+        void this.loadStatus();
+      }
     } catch (err: any) {
       console.error('Failed to retrieve context:', err);
       this.errorMessage.set(err?.message || 'Failed to retrieve context');
@@ -136,11 +192,10 @@ export class PromptRagService {
         model: this.selectedModel(),
         trigger: this.selectedTrigger(),
         local_url: this.selectedModel() === 'local' ? this.localUrl() : undefined,
+        api_key: this.selectedModel() === 'local' ? undefined : this.storedApiKey(),
       });
       this.generationResult.set(res);
-      if (res.rag_context) {
-        this.retrievedContext.set(res.rag_context);
-      }
+      this.retrievedContext.set(res.rag_context ?? []);
     } catch (err: any) {
       console.error('Failed to generate prompts:', err);
       this.errorMessage.set(err?.message || 'Failed to generate prompts');

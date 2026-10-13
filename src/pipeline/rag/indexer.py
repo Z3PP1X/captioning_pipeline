@@ -1,4 +1,9 @@
-"""RAG Indexer: Parses 2,500 curated captions into 4 domains, tags taxonomy, and embeds vectors."""
+"""RAG Indexer: Parses curated captions into 4 domains, tags taxonomy, and embeds vectors.
+
+Caption source (first non-empty wins):
+1. ``data/curated_2500/{train,val}/*.txt`` written by ``scripts/curate_dataset.py``
+2. ``<finished_dir>/merged/*.txt`` written by the regular Export step
+"""
 from __future__ import annotations
 
 import json
@@ -8,7 +13,7 @@ import re
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -20,15 +25,43 @@ logger = logging.getLogger(__name__)
 
 SENTENCE_SPLIT_REGEX = re.compile(r"(?<=[.!?])\s+")
 
+ProgressCallback = Callable[[float, str], None]
+
+
+def rag_index_paths(settings: Settings) -> tuple[Path, Path]:
+    """Location of the RAG metadata DB and the embedding matrix."""
+    return settings.cache_dir / "rag_index.sqlite", settings.cache_dir / "rag_embeddings.npz"
+
+
+def resolve_caption_sources(settings: Settings, dataset_dir: Path | None = None) -> dict[str, Any]:
+    """Pick the caption folders to index: curated train/val split, else the merged export folder."""
+    curated = dataset_dir or settings.curated_dir
+    curated_splits = [(split, curated / split) for split in ("train", "val")]
+    curated_count = sum(len(list(d.glob("*.txt"))) for _, d in curated_splits if d.is_dir())
+    if curated_count or dataset_dir is not None:
+        return {"source": "curated", "path": str(curated), "splits": curated_splits, "caption_files": curated_count}
+
+    merged = settings.finished_dir / "merged"
+    merged_count = len(list(merged.glob("*.txt"))) if merged.is_dir() else 0
+    if merged_count:
+        return {"source": "finished_merged", "path": str(merged), "splits": [("finished", merged)], "caption_files": merged_count}
+
+    return {
+        "source": None,
+        "path": None,
+        "splits": [],
+        "caption_files": 0,
+        "searched": [str(curated / "train"), str(curated / "val"), str(merged)],
+    }
+
 
 class RagCaptionIndexer:
     """Indexes captions from curated_2500 train and val sets into categorized domain chunks and embeddings."""
 
-    def __init__(self, settings: Settings | None = None):
+    def __init__(self, settings: Settings | None = None, classifier: ClipClassifier | None = None):
         self.settings = settings or get_settings()
-        self.classifier = ClipClassifier(self.settings)
-        self.db_path = self.settings.cache_dir / "rag_index.sqlite"
-        self.npz_path = self.settings.cache_dir / "rag_embeddings.npz"
+        self.classifier = classifier or ClipClassifier(self.settings)
+        self.db_path, self.npz_path = rag_index_paths(self.settings)
         self._init_db()
 
     def _init_db(self) -> None:
@@ -58,6 +91,7 @@ class RagCaptionIndexer:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS ix_rag_split ON rag_captions(split)")
             conn.execute("CREATE INDEX IF NOT EXISTS ix_rag_stem ON rag_captions(stem)")
+            conn.execute("CREATE TABLE IF NOT EXISTS rag_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
 
     @staticmethod
     def segment_caption(caption: str) -> dict[str, str]:
@@ -124,18 +158,27 @@ class RagCaptionIndexer:
                         break
         return matched
 
-    def scan_dataset(self, dataset_dir: Path | None = None) -> list[dict[str, Any]]:
-        """Scans curated_2500 train and val directories and prepares raw records."""
-        base_dir = dataset_dir or self.settings.curated_dir
-        records: list[dict[str, Any]] = []
+    def _rel_path(self, path: Path) -> str:
+        """Path relative to the project root when possible (portable), else absolute."""
+        try:
+            return str(path.relative_to(self.settings.project_root))
+        except ValueError:
+            return str(path)
 
-        for split in ("train", "val"):
-            split_dir = base_dir / split
+    def scan_dataset(self, dataset_dir: Path | None = None) -> list[dict[str, Any]]:
+        """Scans the resolved caption source (curated train/val or merged export) and prepares raw records."""
+        sources = resolve_caption_sources(self.settings, dataset_dir)
+        records: list[dict[str, Any]] = []
+        seen_stems: set[str] = set()
+
+        for split, split_dir in sources["splits"]:
             if not split_dir.is_dir():
                 continue
 
             for txt_file in sorted(split_dir.glob("*.txt")):
                 stem = txt_file.stem
+                if stem in seen_stems:
+                    continue
                 img_file = txt_file.with_suffix(".png")
 
                 try:
@@ -146,6 +189,7 @@ class RagCaptionIndexer:
 
                 if not caption:
                     continue
+                seen_stems.add(stem)
 
                 segments = self.segment_caption(caption)
                 equip_tags = self.match_taxonomy_tags(segments["equipment"] or caption, "equipment")
@@ -153,8 +197,8 @@ class RagCaptionIndexer:
                 pos_tags = self.match_taxonomy_tags(segments["position"] or caption, "position")
                 light_tags = self.match_taxonomy_tags(segments["camera_lighting"] or caption, "camera_lighting")
 
-                img_rel = str(img_file.relative_to(self.settings.project_root)) if img_file.is_file() else None
-                txt_rel = str(txt_file.relative_to(self.settings.project_root))
+                img_rel = self._rel_path(img_file) if img_file.is_file() else None
+                txt_rel = self._rel_path(txt_file)
 
                 records.append({
                     "split": split,
@@ -175,29 +219,52 @@ class RagCaptionIndexer:
 
         return records
 
-    def build_index(self, limit: int | None = None, batch_size: int = 64) -> dict[str, Any]:
-        """Extracts domains, computes CLIP text embeddings, and updates SQLite + NPZ."""
+    def build_index(
+        self,
+        limit: int | None = None,
+        batch_size: int = 64,
+        progress_cb: ProgressCallback | None = None,
+    ) -> dict[str, Any]:
+        """Extracts domains, computes CLIP text embeddings, and replaces SQLite + NPZ atomically.
+
+        An existing index is left untouched when no captions are found.
+        """
         start_t = time.time()
+
+        def report(frac: float, step: str) -> None:
+            if progress_cb:
+                progress_cb(frac, step)
+
+        sources = resolve_caption_sources(self.settings)
+        report(0.02, f"Scanning captions ({sources['source'] or 'no source found'})")
         records = self.scan_dataset()
         if limit and limit > 0:
             records = records[:limit]
 
         total = len(records)
         if total == 0:
-            return {"indexed": 0, "duration": round(time.time() - start_t, 2)}
+            return {
+                "indexed": 0,
+                "source": sources["source"],
+                "source_path": sources["path"],
+                "searched": sources.get("searched", []),
+                "duration": round(time.time() - start_t, 2),
+            }
 
-        # 1. Compute CLIP embeddings in batches
+        # 1. Compute CLIP embeddings in batches (CLIP truncates each text to 77 tokens)
         all_captions = [r["full_caption"] for r in records]
         embeddings_list: list[np.ndarray] = []
 
         for i in range(0, total, batch_size):
             batch_texts = all_captions[i:i + batch_size]
-            emb_chunk = self.classifier.embed_texts(batch_texts)
-            embeddings_list.append(emb_chunk)
+            embeddings_list.append(self.classifier.embed_texts(batch_texts))
+            done = min(total, i + batch_size)
+            report(0.05 + 0.85 * done / total, f"Embedding captions {done}/{total}")
 
-        embeddings_matrix = np.concatenate(embeddings_list, axis=0) if embeddings_list else np.zeros((0, 512), dtype=np.float32)
+        embeddings_matrix = np.concatenate(embeddings_list, axis=0).astype(np.float32)
 
-        # 2. Persist to SQLite
+        # 2. Persist to SQLite in one transaction (readers keep seeing the old rows until commit)
+        report(0.92, "Writing index")
         now = time.time()
         record_ids: list[int] = []
 
@@ -233,18 +300,31 @@ class RagCaptionIndexer:
                     ),
                 )
                 record_ids.append(cursor.lastrowid)
+            meta = {
+                "source": sources["source"] or "",
+                "source_path": sources["path"] or "",
+                "built_at": str(now),
+                "count": str(total),
+                "embedding_model": getattr(self.classifier, "repo", "unknown"),
+            }
+            conn.executemany("INSERT OR REPLACE INTO rag_meta (key, value) VALUES (?, ?)", list(meta.items()))
             conn.commit()
 
-        # 3. Save NPZ vector file
+        # 3. Save NPZ vector file via temp file + rename so readers never see a partial matrix
+        tmp_path = self.npz_path.with_name(self.npz_path.stem + ".tmp.npz")
         np.savez_compressed(
-            self.npz_path,
+            tmp_path,
             ids=np.array(record_ids, dtype=np.int64),
-            embeddings=embeddings_matrix.astype(np.float32),
+            embeddings=embeddings_matrix,
         )
+        os.replace(tmp_path, self.npz_path)
+        report(1.0, f"Indexed {total} captions")
 
         duration = round(time.time() - start_t, 2)
         return {
             "indexed": total,
+            "source": sources["source"],
+            "source_path": sources["path"],
             "embeddings_shape": list(embeddings_matrix.shape),
             "db_path": str(self.db_path),
             "npz_path": str(self.npz_path),

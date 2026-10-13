@@ -42,6 +42,10 @@ Your mission is to synthesize the user's selected scene elements and custom desc
 """
 
 
+class RagUpstreamError(RuntimeError):
+    """The LLM backend (OpenRouter / Ollama) failed or was unreachable."""
+
+
 class RagPromptGenerator:
     """Generates Krea 2 prompts using Gemma models via OpenRouter or local Ollama."""
 
@@ -126,7 +130,7 @@ class RagPromptGenerator:
 
         # Dispatch to local Ollama or OpenRouter
         if model == "local" or (local_url and local_url.strip()):
-            url = (local_url.strip() or "http://localhost:11434").rstrip("/")
+            url = ((local_url or "").strip() or "http://localhost:11434").rstrip("/")
             raw_json_str = await self._call_ollama(url, system_prompt, user_content)
         else:
             key = (api_key or self.settings.openrouter_api_key or "").strip()
@@ -135,7 +139,12 @@ class RagPromptGenerator:
             raw_json_str = await self._call_openrouter(key, model, system_prompt, user_content)
 
         # Parse JSON
-        parsed_data = self._clean_and_parse_json(raw_json_str)
+        parsed_data = self._clean_and_parse_json(raw_json_str, effective_trigger)
+        notices: list[str] = []
+        if parsed_data.pop("_parse_fallback", False):
+            notices.append("Model did not return valid JSON; prompts were reconstructed from raw text.")
+        if not retrieved_items:
+            notices.append("No dataset exemplars retrieved; prompts are not grounded in your captions.")
 
         # Lint and validate all three archetypes
         arch_a_lint = lint_prompt(parsed_data.get("archetype_a", ""), archetype="tags", trigger=effective_trigger, character=character)
@@ -146,6 +155,8 @@ class RagPromptGenerator:
             "model": model,
             "trigger": effective_trigger,
             "character": character,
+            "grounded": bool(retrieved_items),
+            "notices": notices,
             "archetypes": {
                 "a": {
                     "name": "Archetype A (Tags)",
@@ -199,12 +210,17 @@ class RagPromptGenerator:
             "max_tokens": 800,
             "response_format": {"type": "json_object"},
         }
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
-            if resp.status_code != 200:
-                raise RuntimeError(f"OpenRouter error {resp.status_code}: {resp.text}")
-            data = resp.json()
-            return data["choices"][0]["message"].get("content") or ""
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
+        except httpx.HTTPError as err:
+            raise RagUpstreamError(f"OpenRouter request failed: {type(err).__name__}: {err}") from err
+        if resp.status_code != 200:
+            raise RagUpstreamError(f"OpenRouter error {resp.status_code}: {resp.text[:300]}")
+        try:
+            return resp.json()["choices"][0]["message"].get("content") or ""
+        except (ValueError, KeyError, IndexError, TypeError) as err:
+            raise RagUpstreamError(f"Unexpected OpenRouter response: {resp.text[:300]}") from err
 
     async def _call_ollama(self, base_url: str, system_prompt: str, user_prompt: str) -> str:
         payload = {
@@ -216,15 +232,19 @@ class RagPromptGenerator:
             "stream": False,
             "format": "json",
         }
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(f"{base_url}/api/chat", json=payload)
-            if resp.status_code != 200:
-                raise RuntimeError(f"Ollama error {resp.status_code}: {resp.text}")
-            data = resp.json()
-            return data.get("message", {}).get("content", "")
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(f"{base_url}/api/chat", json=payload)
+        except httpx.HTTPError as err:
+            raise RagUpstreamError(
+                f"Local model at {base_url} is unreachable ({type(err).__name__}). Is Ollama running with gemma2:2b pulled?"
+            ) from err
+        if resp.status_code != 200:
+            raise RagUpstreamError(f"Ollama error {resp.status_code}: {resp.text[:300]}")
+        return resp.json().get("message", {}).get("content", "")
 
     @staticmethod
-    def _clean_and_parse_json(text: str) -> dict[str, str]:
+    def _clean_and_parse_json(text: str, trigger: str = "restrained_elegance") -> dict[str, Any]:
         """Cleans and extracts JSON dict from LLM response."""
         cleaned = text.strip()
         # Remove markdown code block if present
@@ -248,9 +268,10 @@ class RagPromptGenerator:
             except Exception:
                 pass
 
-        # Return fallback with raw text
+        # Return fallback with raw text (flagged so the API can tell the user)
         return {
-            "archetype_a": "restrained_elegance, photograph, scene.",
-            "archetype_b": f"restrained_elegance Photograph of a scene. {cleaned[:100]}",
+            "archetype_a": f"{trigger}, photograph, scene.",
+            "archetype_b": f"{trigger} Photograph of a scene. {cleaned[:100]}",
             "archetype_c": cleaned,
+            "_parse_fallback": True,
         }

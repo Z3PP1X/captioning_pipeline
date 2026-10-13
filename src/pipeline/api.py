@@ -25,8 +25,11 @@ from pipeline.rag import (
     CHARACTERS,
     CURATED_PRESETS,
     TAXONOMY_CATEGORIES,
+    RagIndexJob,
+    RagIndexNotReady,
     RagPromptGenerator,
     RagRetriever,
+    RagUpstreamError,
 )
 from pipeline.reconcile import get_video_scenes_caption_stats, reconcile_captions_and_state
 from pipeline.select import select_diverse_top_k
@@ -38,8 +41,10 @@ indexer = Indexer(db, settings)
 jobs = JobManager(db, settings)
 exporter = Exporter(db, settings)
 autochunker = AutoChunker(db, settings)
-rag_retriever = RagRetriever(settings)
+# RAG shares the CLIP text model with the job manager (one copy in memory)
+rag_retriever = RagRetriever(settings, classifier=jobs.classifier)
 rag_generator = RagPromptGenerator(settings)
+rag_index_job = RagIndexJob(settings, classifier=jobs.classifier, on_finished=lambda _res: rag_retriever.invalidate())
 
 
 @asynccontextmanager
@@ -791,17 +796,38 @@ def update_user_settings(payload: dict[str, Any]):
 class RagRetrieveRequest(BaseModel):
     selected_tags: dict[str, list[str]] = Field(default_factory=dict)
     user_description: str = ""
-    top_k: int = 4
+    top_k: int = Field(default=4, ge=1, le=12)
 
 
 class RagGenerateRequest(BaseModel):
     selected_tags: dict[str, list[str]] = Field(default_factory=dict)
     user_description: str = ""
     character: str | None = None
-    top_k: int = 4
+    top_k: int = Field(default=4, ge=1, le=12)
     model: str = "google/gemma-4-31b-it"
     trigger: str = "restrained_elegance"
     local_url: str | None = None
+    api_key: str | None = None
+
+
+class RagIndexRequest(BaseModel):
+    limit: int | None = None
+
+
+def _rag_retrieve_or_empty(selected_tags: dict[str, list[str]], user_description: str, top_k: int) -> list[dict[str, Any]]:
+    """Retrieve exemplars; a missing index yields [] (the UI shows a build prompt instead of an error)."""
+    try:
+        return rag_retriever.retrieve(selected_tags, user_description, top_k)
+    except RagIndexNotReady:
+        return []
+
+
+def _openrouter_key(explicit: str | None) -> str:
+    """Request key, else the key saved in user settings, else OPENROUTER_API_KEY (env / .env via env.sh)."""
+    if explicit and explicit.strip():
+        return explicit.strip()
+    stored = (db.get_setting("user_settings", {}) or {}).get("openrouter_api_key") or ""
+    return str(stored).strip() or settings.openrouter_api_key.strip()
 
 
 @app.get("/api/rag/categories")
@@ -819,24 +845,50 @@ def get_rag_characters():
     return {"characters": CHARACTERS}
 
 
+@app.get("/api/rag/status")
+def get_rag_status():
+    status = rag_index_job.status()
+    status["openrouter_key_configured"] = bool(_openrouter_key(None))
+    return status
+
+
+@app.post("/api/rag/index")
+def build_rag_index(req: RagIndexRequest | None = None):
+    started = rag_index_job.start(limit=req.limit if req else None)
+    if not started:
+        raise HTTPException(status_code=409, detail="RAG index build already running")
+    return rag_index_job.status()
+
+
 @app.post("/api/rag/retrieve")
 def retrieve_rag_context(req: RagRetrieveRequest):
-    results = rag_retriever.retrieve(req.selected_tags, req.user_description, req.top_k)
-    return {"results": results}
+    results = _rag_retrieve_or_empty(req.selected_tags, req.user_description, req.top_k)
+    return {"results": results, "index_ready": rag_retriever.is_ready()}
 
 
 @app.post("/api/rag/generate")
 async def generate_rag_prompts(req: RagGenerateRequest):
-    retrieved = rag_retriever.retrieve(req.selected_tags, req.user_description, req.top_k)
-    result = await rag_generator.generate(
-        retrieved_items=retrieved,
-        selected_tags=req.selected_tags,
-        user_description=req.user_description,
-        character=req.character,
-        model=req.model,
-        trigger=req.trigger,
-        local_url=req.local_url,
-    )
+    retrieved = _rag_retrieve_or_empty(req.selected_tags, req.user_description, req.top_k)
+    use_local = req.model == "local" or bool(req.local_url and req.local_url.strip())
+    api_key = None if use_local else _openrouter_key(req.api_key)
+    if not use_local and not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="OpenRouter API key missing: set OPENROUTER_API_KEY in .env, save it in the caption dialog, or use the local model.",
+        )
+    try:
+        result = await rag_generator.generate(
+            retrieved_items=retrieved,
+            selected_tags=req.selected_tags,
+            user_description=req.user_description,
+            character=req.character,
+            model=req.model,
+            trigger=req.trigger,
+            api_key=api_key,
+            local_url=req.local_url if use_local else None,
+        )
+    except RagUpstreamError as err:
+        raise HTTPException(status_code=502, detail=str(err)) from err
     return result
 
 
@@ -870,6 +922,9 @@ if STATIC_DIR.exists():
 
 @app.get("/{full_path:path}")
 def serve_spa(full_path: str):
+    # Unknown API routes must 404 as JSON, not fall through to index.html (200 HTML breaks res.json())
+    if full_path == "api" or full_path.startswith("api/"):
+        raise HTTPException(status_code=404, detail=f"Unknown API route: /{full_path}")
     file_path = STATIC_DIR / full_path
     if full_path and file_path.is_file():
         return FileResponse(file_path)

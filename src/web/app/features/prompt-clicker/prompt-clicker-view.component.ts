@@ -1,13 +1,13 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  OnDestroy,
   OnInit,
   computed,
   inject,
   signal,
 } from '@angular/core';
-import { CommonModule } from '@angular/common';
-import { FormsModule } from '@angular/forms';
+import { DatePipe } from '@angular/common';
 import { NgIcon, provideIcons } from '@ng-icons/core';
 import {
   lucideSparkles,
@@ -15,24 +15,65 @@ import {
   lucideCheck,
   lucideRefreshCw,
   lucideTrash2,
-  lucideExternalLink,
-  lucideInfo,
-  lucideSliders,
-  lucideLayers,
-  lucideChevronDown,
-  lucideChevronUp,
   lucideEye,
-  lucideCheckCircle2,
-  lucideAlertCircle,
+  lucideLayers,
+  lucideCircleAlert,
+  lucideTriangleAlert,
+  lucideDatabase,
+  lucideImageOff,
+  lucideLink,
+  lucideMapPin,
+  lucidePersonStanding,
+  lucideCamera,
+  lucideUserRound,
+  lucideTerminal,
 } from '@ng-icons/lucide';
 import { HlmButtonImports } from '@spartan-ng/helm/button';
 import { HlmBadgeImports } from '@spartan-ng/helm/badge';
+import { HlmAlertImports } from '@spartan-ng/helm/alert';
+import { HlmProgressImports } from '@spartan-ng/helm/progress';
+import { HlmNativeSelectImports } from '@spartan-ng/helm/native-select';
+import { HlmInputImports } from '@spartan-ng/helm/input';
+import { HlmTextareaImports } from '@spartan-ng/helm/textarea';
 import { PromptRagService } from '../../core/services/prompt-rag.service';
-import { CuratedPreset, PromptArchetype } from '../../core/models/prompt-rag.model';
+import {
+  CharacterProfile,
+  CuratedPreset,
+  PromptArchetype,
+  RagGenerateResponse,
+  TaxonomyOption,
+} from '../../core/models/prompt-rag.model';
+
+/** Display order of the taxonomy categories and their lucide icons (backend `icon` is an emoji). */
+const CATEGORY_ORDER = ['equipment', 'surroundings', 'position', 'camera_lighting'] as const;
+const CATEGORY_ICONS: Record<string, string> = {
+  equipment: 'lucideLink',
+  surroundings: 'lucideMapPin',
+  position: 'lucidePersonStanding',
+  camera_lighting: 'lucideCamera',
+};
+/** B first: it is the recommended format for Krea. */
+const ARCHETYPE_ORDER = ['b', 'a', 'c'] as const;
+type ArchetypeKey = (typeof ARCHETYPE_ORDER)[number];
+
+const SOURCE_LABELS: Record<string, string> = {
+  curated: 'curated train/val split',
+  finished_merged: 'exported dataset (finished/merged)',
+};
 
 @Component({
   selector: 'app-prompt-clicker-view',
-  imports: [CommonModule, FormsModule, NgIcon, HlmButtonImports, HlmBadgeImports],
+  imports: [
+    DatePipe,
+    NgIcon,
+    HlmButtonImports,
+    HlmBadgeImports,
+    HlmAlertImports,
+    HlmProgressImports,
+    HlmNativeSelectImports,
+    HlmInputImports,
+    HlmTextareaImports,
+  ],
   providers: [
     provideIcons({
       lucideSparkles,
@@ -40,657 +81,564 @@ import { CuratedPreset, PromptArchetype } from '../../core/models/prompt-rag.mod
       lucideCheck,
       lucideRefreshCw,
       lucideTrash2,
-      lucideExternalLink,
-      lucideInfo,
-      lucideSliders,
-      lucideLayers,
-      lucideChevronDown,
-      lucideChevronUp,
       lucideEye,
-      lucideCheckCircle2,
-      lucideAlertCircle,
+      lucideLayers,
+      lucideCircleAlert,
+      lucideTriangleAlert,
+      lucideDatabase,
+      lucideImageOff,
+      lucideLink,
+      lucideMapPin,
+      lucidePersonStanding,
+      lucideCamera,
+      lucideUserRound,
+      lucideTerminal,
     }),
   ],
   changeDetection: ChangeDetectionStrategy.OnPush,
+  host: {
+    class: 'block',
+    '(document:keydown)': 'onKeydown($event)',
+  },
   template: `
-    <div class="flex flex-col h-full w-full overflow-hidden bg-background text-foreground select-none">
-      <!-- Top Bar: Title, Model Selection, Presets -->
-      <header class="flex flex-wrap items-center justify-between gap-4 border-b border-border bg-card px-6 py-3 shrink-0">
-        <div class="flex items-center gap-3">
-          <div class="flex size-9 items-center justify-center rounded-xl bg-primary/10 text-primary border border-primary/20 shadow-xs">
-            <ng-icon name="lucideSparkles" class="size-5" />
-          </div>
-          <div>
-            <div class="flex items-center gap-2">
-              <h1 class="font-sans font-black text-base md:text-lg tracking-tight text-foreground">
-                Prompt Director & RAG Clicker
-              </h1>
-              <span hlmBadge variant="outline" class="text-[10px] uppercase font-bold tracking-wider text-primary border-primary/30">
-                Krea 2 Grounded
+    <div class="flex flex-col h-full w-full overflow-hidden bg-canvas text-foreground">
+      <!-- Top bar: title + index status, model, trigger -->
+      <header class="flex flex-wrap items-center justify-between gap-4 border-b border-border bg-card px-4 md:px-6 py-3 shrink-0">
+        <div class="min-w-0">
+          <h1 class="font-display font-black uppercase tracking-wide text-2xl leading-none">Prompt Director</h1>
+          <p class="mt-1 text-xs text-muted-foreground tracking-wide flex items-center gap-1.5">
+            <ng-icon name="lucideDatabase" class="size-3.5" aria-hidden="true" />
+            @if (rag.isIndexReady()) {
+              <span>
+                Grounded in <span class="tabular-nums">{{ rag.indexStatus()?.indexed }}</span> captions
+                from the {{ sourceLabel(rag.indexStatus()?.index?.source) }}
               </span>
-            </div>
-            <p class="text-xs text-muted-foreground">
-              2,500 curated image captions indexed across 4 descriptive domains
-            </p>
-          </div>
+            } @else if (rag.indexStatus()) {
+              <span>RAG index not built - prompts are not grounded in your dataset</span>
+            } @else {
+              <span>Checking RAG index...</span>
+            }
+          </p>
         </div>
 
-        <!-- Presets & Settings -->
-        <div class="flex flex-wrap items-center gap-2 text-xs">
-          <!-- Preset Selector -->
-          <div class="flex items-center gap-1.5 bg-muted/50 rounded-lg p-1 border border-border">
-            <span class="text-[11px] font-medium text-muted-foreground px-1.5 flex items-center gap-1">
-              <ng-icon name="lucideLayers" class="size-3.5" /> Presets:
-            </span>
-            @for (preset of ragService.presets(); track preset.id) {
-              <button
-                hlmBtn
-                variant="ghost"
-                size="sm"
-                class="h-7 text-xs px-2.5 rounded-md hover:bg-card hover:text-foreground transition-all cursor-pointer"
-                (click)="onSelectPreset(preset)"
-                [title]="preset.description"
-              >
-                {{ preset.title }}
-              </button>
-            }
-          </div>
-
-          <!-- Model Switcher -->
-          <select
-            [ngModel]="ragService.selectedModel()"
-            (ngModelChange)="ragService.selectedModel.set($event)"
-            class="h-8 rounded-lg border border-input bg-card px-2.5 text-xs text-foreground focus:ring-1 focus:ring-ring font-medium"
+        <div class="flex flex-wrap items-center gap-2">
+          <label class="sr-only" for="pd-model">Language model</label>
+          <hlm-native-select
+            size="sm"
+            selectId="pd-model"
+            [value]="rag.selectedModel()"
+            (valueChange)="rag.selectedModel.set($event ?? 'google/gemma-4-31b-it')"
           >
             <option value="google/gemma-4-31b-it">Gemma 4 31B (OpenRouter)</option>
-            <option value="google/gemma-2-9b-it">Gemma 2 9B (OpenRouter - Fast)</option>
+            <option value="google/gemma-2-9b-it">Gemma 2 9B (OpenRouter, fast)</option>
             <option value="local">Local Ollama (gemma2:2b)</option>
-          </select>
+          </hlm-native-select>
 
-          <!-- Trigger Word Input -->
-          <div class="flex items-center gap-1 bg-card rounded-lg border border-input px-2 h-8">
-            <span class="text-[10px] text-muted-foreground font-mono">Trigger:</span>
+          @if (rag.selectedModel() === 'local') {
+            <label class="sr-only" for="pd-local-url">Ollama URL</label>
             <input
-              type="text"
-              [ngModel]="ragService.selectedTrigger()"
-              (ngModelChange)="ragService.selectedTrigger.set($event)"
-              placeholder="restrained_elegance"
-              class="w-32 bg-transparent text-xs text-foreground focus:outline-hidden font-mono"
+              hlmInput
+              id="pd-local-url"
+              class="h-8 md:h-8 w-56 text-sm"
+              [value]="rag.localUrl()"
+              (input)="rag.localUrl.set($any($event.target).value)"
+              placeholder="http://localhost:11434"
             />
-          </div>
+          }
+
+          <label class="text-xs text-muted-foreground" for="pd-trigger">Trigger</label>
+          <input
+            hlmInput
+            id="pd-trigger"
+            class="h-8 md:h-8 w-44 text-sm"
+            [value]="rag.selectedTrigger()"
+            (input)="rag.selectedTrigger.set($any($event.target).value)"
+            placeholder="restrained_elegance"
+          />
         </div>
       </header>
 
-      <!-- Main Workspace: Split 2-Column Grid -->
-      <div class="flex flex-1 min-h-0 overflow-hidden">
-        <!-- Left Column: Category Clicker & Prompt Idea (Scrollable) -->
-        <div class="w-full lg:w-7/12 flex flex-col border-r border-border min-h-0 overflow-y-auto p-4 md:p-6 space-y-5">
-          <!-- Categories Accordion / Cards -->
-          <div class="space-y-4">
-            <!-- 0. Character Selection -->
-            <div class="rounded-xl border border-border bg-card p-4 shadow-2xs">
-              <div class="flex items-center justify-between pb-2 border-b border-border/50 mb-3">
-                <div class="flex items-center gap-2">
-                  <span class="text-base">👤</span>
-                  <h3 class="font-sans font-bold text-sm text-foreground">Character Identity</h3>
-                </div>
-                <span class="text-[11px] text-muted-foreground">Select a character model or use anonymous subject</span>
-              </div>
-
-              <div class="grid grid-cols-1 md:grid-cols-3 gap-2.5">
-                <!-- Anonymous / Generic -->
-                <button
-                  type="button"
-                  (click)="ragService.selectCharacter(null)"
-                  class="flex flex-col items-start gap-1 p-2.5 rounded-lg border text-left transition-all cursor-pointer"
-                  [ngClass]="
-                    !ragService.selectedCharacter()
-                      ? 'bg-primary/10 border-primary text-primary ring-1 ring-primary/40'
-                      : 'bg-muted/30 border-border text-muted-foreground hover:bg-muted hover:text-foreground'
-                  "
-                >
-                  <div class="flex items-center justify-between w-full">
-                    <span class="text-xs font-semibold flex items-center gap-1.5">🎭 Anonymous</span>
-                    @if (!ragService.selectedCharacter()) {
-                      <span class="text-[9px] bg-primary/20 text-primary px-1.5 py-0.2 rounded font-mono font-medium">Selected</span>
+      <!-- Index guidance: missing / building / failed -->
+      @if (rag.indexStatus(); as st) {
+        @if (!st.ready || st.build.state === 'running' || st.build.state === 'error') {
+          <div class="px-4 md:px-6 pt-4 shrink-0">
+            <div hlmAlert [variant]="st.build.state === 'error' ? 'destructive' : 'default'">
+              <ng-icon [name]="st.build.state === 'error' ? 'lucideCircleAlert' : 'lucideDatabase'" />
+              <h2 hlmAlertTitle>
+                @switch (st.build.state) {
+                  @case ('running') { Building RAG index... }
+                  @case ('error') { RAG index build failed }
+                  @default { RAG index not built yet }
+                }
+              </h2>
+              <div hlmAlertDescription class="space-y-2">
+                @if (st.build.state === 'running') {
+                  <p>{{ st.build.step }}</p>
+                  <hlm-progress class="max-w-md" [value]="st.build.progress * 100" aria-label="Index build progress">
+                    <hlm-progress-indicator />
+                  </hlm-progress>
+                } @else {
+                  @if (st.build.state === 'error') {
+                    <p>{{ st.build.error }}</p>
+                  }
+                  @if (!st.ready) {
+                    @if (st.sources?.source) {
+                      <p>
+                        Found <span class="tabular-nums">{{ st.sources.caption_files }}</span> captions in the
+                        {{ sourceLabel(st.sources.source) }}. Build the index once (a few minutes on CPU) to ground
+                        prompts in real exemplars. Until then prompts are generated without dataset context.
+                      </p>
+                    } @else {
+                      <p>
+                        No captioned frames found yet. Caption and export frames first (Curate, then Finished
+                        Dataset), optionally run <code class="text-xs">scripts/curate_dataset.py</code>; searched:
+                      </p>
+                      <ul class="list-disc ps-5 text-xs">
+                        @for (p of st.sources?.searched ?? []; track p) {
+                          <li class="break-all">{{ p }}</li>
+                        }
+                      </ul>
                     }
+                  }
+                  <div class="flex flex-wrap items-center gap-3 pt-1">
+                    <button
+                      hlmBtn
+                      size="sm"
+                      variant="outline"
+                      type="button"
+                      (click)="rag.buildIndex()"
+                      [disabled]="!st.sources?.source"
+                    >
+                      <ng-icon name="lucideDatabase" class="size-4" aria-hidden="true" />
+                      {{ st.index ? 'Rebuild index' : 'Build index' }}
+                    </button>
+                    <span class="text-xs text-muted-foreground flex items-center gap-1">
+                      <ng-icon name="lucideTerminal" class="size-3.5" aria-hidden="true" />
+                      or in WSL: <code class="select-all">{{ st.build_command }}</code>
+                    </span>
                   </div>
-                  <p class="text-[11px] opacity-80 leading-snug">Default generic adult subjects</p>
-                </button>
-
-                <!-- Sara -->
-                <button
-                  type="button"
-                  (click)="ragService.selectCharacter('sara')"
-                  class="flex flex-col items-start gap-1 p-2.5 rounded-lg border text-left transition-all cursor-pointer"
-                  [ngClass]="
-                    ragService.selectedCharacter() === 'sara'
-                      ? 'bg-primary/10 border-primary text-primary ring-1 ring-primary/40'
-                      : 'bg-muted/30 border-border text-muted-foreground hover:bg-muted hover:text-foreground'
-                  "
-                >
-                  <div class="flex items-center justify-between w-full">
-                    <span class="text-xs font-semibold flex items-center gap-1.5">👩 Sara <span class="text-[10px] px-1 py-0.2 bg-muted rounded font-normal">21yo</span></span>
-                    @if (ragService.selectedCharacter() === 'sara') {
-                      <span class="text-[9px] bg-primary/20 text-primary px-1.5 py-0.2 rounded font-mono font-medium">Selected</span>
-                    }
-                  </div>
-                  <p class="text-[11px] opacity-80 leading-snug">21yo woman, brown hair, dark brown eyes</p>
-                </button>
-
-                <!-- Lene -->
-                <button
-                  type="button"
-                  (click)="ragService.selectCharacter('lene')"
-                  class="flex flex-col items-start gap-1 p-2.5 rounded-lg border text-left transition-all cursor-pointer"
-                  [ngClass]="
-                    ragService.selectedCharacter() === 'lene'
-                      ? 'bg-primary/10 border-primary text-primary ring-1 ring-primary/40'
-                      : 'bg-muted/30 border-border text-muted-foreground hover:bg-muted hover:text-foreground'
-                  "
-                >
-                  <div class="flex items-center justify-between w-full">
-                    <span class="text-xs font-semibold flex items-center gap-1.5">👧 Lene <span class="text-[10px] px-1 py-0.2 bg-muted rounded font-normal">21yo petite</span></span>
-                    @if (ragService.selectedCharacter() === 'lene') {
-                      <span class="text-[9px] bg-primary/20 text-primary px-1.5 py-0.2 rounded font-mono font-medium">Selected</span>
-                    }
-                  </div>
-                  <p class="text-[11px] opacity-80 leading-snug">21yo petite woman, dark brown hair, dark brown eyes</p>
-                </button>
+                }
               </div>
             </div>
+          </div>
+        }
+      } @else if (rag.statusError()) {
+        <div class="px-4 md:px-6 pt-4 shrink-0">
+          <div hlmAlert variant="destructive">
+            <ng-icon name="lucideCircleAlert" />
+            <h2 hlmAlertTitle>Prompt Director backend unavailable</h2>
+            <p hlmAlertDescription>
+              {{ rag.statusError() }}. Restart the server so it serves the current API (scripts/start_all.sh).
+            </p>
+          </div>
+        </div>
+      }
 
-            <!-- 1. Equipment Category -->
-            @if (ragService.categories()['equipment']; as cat) {
-              <div class="rounded-xl border border-border bg-card p-4 shadow-2xs">
-                <div class="flex items-center justify-between pb-2 border-b border-border/50 mb-3">
-                  <div class="flex items-center gap-2">
-                    <span class="text-base">{{ cat.icon }}</span>
-                    <h3 class="font-sans font-bold text-sm text-foreground">{{ cat.title }}</h3>
-                  </div>
-                  <span class="text-[11px] text-muted-foreground">{{ cat.description }}</span>
-                </div>
+      <!-- Workspace -->
+      <div class="flex flex-col lg:flex-row flex-1 min-h-0 overflow-y-auto lg:overflow-hidden">
+        <!-- Left: selections -->
+        <section
+          class="w-full lg:w-7/12 flex flex-col lg:border-r border-border lg:min-h-0 lg:overflow-y-auto p-4 md:p-6 gap-4"
+          aria-label="Prompt ingredients"
+        >
+          <!-- Presets -->
+          @if (rag.presets().length > 0) {
+            <div class="flex flex-wrap items-center gap-1.5">
+              <span class="text-xs font-bold uppercase tracking-widest text-muted-foreground flex items-center gap-1 pe-1">
+                <ng-icon name="lucideLayers" class="size-3.5" aria-hidden="true" /> Presets
+              </span>
+              @for (preset of rag.presets(); track preset.id) {
+                <button hlmBtn variant="outline" size="sm" type="button" (click)="onSelectPreset(preset)" [title]="preset.description">
+                  {{ preset.title }}
+                </button>
+              }
+            </div>
+          }
 
-                <div class="space-y-3">
-                  @for (group of getGroupEntries(cat.groups); track group.name) {
-                    <div>
-                      <div class="text-[10px] uppercase font-bold tracking-wider text-muted-foreground/80 mb-1.5">
-                        {{ group.name }}
-                      </div>
-                      <div class="flex flex-wrap gap-1.5">
-                        @for (opt of group.items; track opt.id) {
-                          <button
-                            type="button"
-                            (click)="ragService.toggleTag('equipment', opt.id)"
-                            class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-all cursor-pointer border"
-                            [ngClass]="
-                              ragService.isTagSelected('equipment', opt.id)
-                                ? 'bg-primary text-primary-foreground border-primary shadow-xs'
-                                : 'bg-muted/40 text-muted-foreground border-border hover:bg-muted hover:text-foreground'
-                            "
-                          >
-                            @if (ragService.isTagSelected('equipment', opt.id)) {
-                              <ng-icon name="lucideCheck" class="size-3" />
-                            }
-                            <span>{{ opt.label }}</span>
-                          </button>
-                        }
-                      </div>
-                    </div>
-                  }
-                </div>
-              </div>
-            }
-
-            <!-- 2. Surroundings Category -->
-            @if (ragService.categories()['surroundings']; as cat) {
-              <div class="rounded-xl border border-border bg-card p-4 shadow-2xs">
-                <div class="flex items-center justify-between pb-2 border-b border-border/50 mb-3">
-                  <div class="flex items-center gap-2">
-                    <span class="text-base">{{ cat.icon }}</span>
-                    <h3 class="font-sans font-bold text-sm text-foreground">{{ cat.title }}</h3>
-                  </div>
-                  <span class="text-[11px] text-muted-foreground">{{ cat.description }}</span>
-                </div>
-
-                <div class="space-y-3">
-                  @for (group of getGroupEntries(cat.groups); track group.name) {
-                    <div class="flex flex-wrap gap-1.5">
-                      @for (opt of group.items; track opt.id) {
-                        <button
-                          type="button"
-                          (click)="ragService.toggleTag('surroundings', opt.id)"
-                          class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-all cursor-pointer border"
-                          [ngClass]="
-                            ragService.isTagSelected('surroundings', opt.id)
-                              ? 'bg-primary text-primary-foreground border-primary shadow-xs'
-                              : 'bg-muted/40 text-muted-foreground border-border hover:bg-muted hover:text-foreground'
-                          "
-                        >
-                          @if (ragService.isTagSelected('surroundings', opt.id)) {
-                            <ng-icon name="lucideCheck" class="size-3" />
-                          }
-                          <span>{{ opt.label }}</span>
-                        </button>
-                      }
-                    </div>
-                  }
-                </div>
-              </div>
-            }
-
-            <!-- 3. Position Category -->
-            @if (ragService.categories()['position']; as cat) {
-              <div class="rounded-xl border border-border bg-card p-4 shadow-2xs">
-                <div class="flex items-center justify-between pb-2 border-b border-border/50 mb-3">
-                  <div class="flex items-center gap-2">
-                    <span class="text-base">{{ cat.icon }}</span>
-                    <h3 class="font-sans font-bold text-sm text-foreground">{{ cat.title }}</h3>
-                  </div>
-                  <span class="text-[11px] text-muted-foreground">{{ cat.description }}</span>
-                </div>
-
-                <div class="space-y-3">
-                  @for (group of getGroupEntries(cat.groups); track group.name) {
-                    <div class="flex flex-wrap gap-1.5">
-                      @for (opt of group.items; track opt.id) {
-                        <button
-                          type="button"
-                          (click)="ragService.toggleTag('position', opt.id)"
-                          class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-all cursor-pointer border"
-                          [ngClass]="
-                            ragService.isTagSelected('position', opt.id)
-                              ? 'bg-primary text-primary-foreground border-primary shadow-xs'
-                              : 'bg-muted/40 text-muted-foreground border-border hover:bg-muted hover:text-foreground'
-                          "
-                        >
-                          @if (ragService.isTagSelected('position', opt.id)) {
-                            <ng-icon name="lucideCheck" class="size-3" />
-                          }
-                          <span>{{ opt.label }}</span>
-                        </button>
-                      }
-                    </div>
-                  }
-                </div>
-              </div>
-            }
-
-            <!-- 4. Camera & Lighting Category -->
-            @if (ragService.categories()['camera_lighting']; as cat) {
-              <div class="rounded-xl border border-border bg-card p-4 shadow-2xs">
-                <div class="flex items-center justify-between pb-2 border-b border-border/50 mb-3">
-                  <div class="flex items-center gap-2">
-                    <span class="text-base">{{ cat.icon }}</span>
-                    <h3 class="font-sans font-bold text-sm text-foreground">{{ cat.title }}</h3>
-                  </div>
-                  <span class="text-[11px] text-muted-foreground">{{ cat.description }}</span>
-                </div>
-
-                <div class="space-y-3">
-                  @for (group of getGroupEntries(cat.groups); track group.name) {
-                    <div>
-                      <div class="text-[10px] uppercase font-bold tracking-wider text-muted-foreground/80 mb-1.5">
-                        {{ group.name }}
-                      </div>
-                      <div class="flex flex-wrap gap-1.5">
-                        @for (opt of group.items; track opt.id) {
-                          <button
-                            type="button"
-                            (click)="ragService.toggleTag('camera_lighting', opt.id)"
-                            class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-all cursor-pointer border"
-                            [ngClass]="
-                              ragService.isTagSelected('camera_lighting', opt.id)
-                                ? 'bg-primary text-primary-foreground border-primary shadow-xs'
-                                : 'bg-muted/40 text-muted-foreground border-border hover:bg-muted hover:text-foreground'
-                            "
-                          >
-                            @if (ragService.isTagSelected('camera_lighting', opt.id)) {
-                              <ng-icon name="lucideCheck" class="size-3" />
-                            }
-                            <span>{{ opt.label }}</span>
-                          </button>
-                        }
-                      </div>
-                    </div>
-                  }
-                </div>
-              </div>
-            }
+          <!-- Character -->
+          <div class="rounded-xl border border-border bg-card p-4 shadow-xs">
+            <div class="flex flex-wrap items-baseline justify-between gap-2 pb-3">
+              <h3 class="font-sans text-base font-semibold flex items-center gap-2">
+                <ng-icon name="lucideUserRound" class="size-4 text-muted-foreground" aria-hidden="true" />
+                Character
+              </h3>
+              <span class="text-xs text-muted-foreground">Optional identity for the LoRA subject</span>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-2" role="radiogroup" aria-label="Character">
+              @for (c of characterOptions(); track c.id) {
+                <button
+                  type="button"
+                  role="radio"
+                  [attr.aria-checked]="isCharacterSelected(c.id)"
+                  (click)="rag.selectCharacter(c.id)"
+                  class="flex flex-col items-start gap-0.5 rounded-lg border p-2.5 text-left transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  [class]="isCharacterSelected(c.id) ? 'border-primary bg-primary/5 ring-1 ring-primary' : 'border-border bg-card hover:bg-muted'"
+                >
+                  <span class="text-sm font-medium flex items-center gap-1.5">
+                    {{ c.name }}
+                    @if (isCharacterSelected(c.id)) {
+                      <ng-icon name="lucideCheck" class="size-3.5 text-primary" aria-hidden="true" />
+                    }
+                  </span>
+                  <span class="text-xs text-muted-foreground leading-snug">{{ c.summary }}</span>
+                </button>
+              }
+            </div>
           </div>
 
-          <!-- Freeform Custom Idea Textarea -->
-          <div class="rounded-xl border border-border bg-card p-4 shadow-2xs space-y-2">
-            <div class="flex items-center justify-between">
-              <label class="text-xs font-bold text-foreground flex items-center gap-1.5">
-                <span>Subject & Scene Details (Optional)</span>
-              </label>
-              <span class="text-[10px] text-muted-foreground">Demographics, hair, clothing, specific props</span>
+          <!-- Taxonomy categories -->
+          @for (catKey of categoryKeys(); track catKey) {
+            @if (rag.categories()[catKey]; as cat) {
+              <div class="rounded-xl border border-border bg-card p-4 shadow-xs">
+                <div class="flex flex-wrap items-baseline justify-between gap-2 pb-3">
+                  <h3 class="font-sans text-base font-semibold flex items-center gap-2">
+                    <ng-icon [name]="categoryIcon(catKey)" class="size-4 text-muted-foreground" aria-hidden="true" />
+                    {{ cat.title }}
+                    @if (selectedIn(catKey) > 0) {
+                      <span hlmBadge variant="muted" class="tabular-nums">{{ selectedIn(catKey) }}</span>
+                    }
+                  </h3>
+                  <span class="text-xs text-muted-foreground">{{ cat.description }}</span>
+                </div>
+                <div class="space-y-3">
+                  @for (group of getGroupEntries(cat.groups); track group.name) {
+                    <div>
+                      <div class="text-xs font-bold uppercase tracking-widest text-muted-foreground mb-1.5">{{ group.name }}</div>
+                      <div class="flex flex-wrap gap-1.5">
+                        @for (opt of group.items; track opt.id) {
+                          <button
+                            type="button"
+                            [attr.aria-pressed]="rag.isTagSelected(catKey, opt.id)"
+                            (click)="rag.toggleTag(catKey, opt.id)"
+                            class="inline-flex items-center gap-1 rounded-full border px-3 py-1 text-xs font-medium transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                            [class]="rag.isTagSelected(catKey, opt.id) ? 'bg-secondary text-secondary-foreground border-secondary' : 'bg-card text-foreground border-border hover:bg-muted'"
+                          >
+                            @if (rag.isTagSelected(catKey, opt.id)) {
+                              <ng-icon name="lucideCheck" class="size-3" aria-hidden="true" />
+                            }
+                            {{ opt.label }}
+                          </button>
+                        }
+                      </div>
+                    </div>
+                  }
+                </div>
+              </div>
+            }
+          }
+
+          <!-- Free text -->
+          <div class="rounded-xl border border-border bg-card p-4 shadow-xs space-y-2">
+            <div class="flex flex-wrap items-baseline justify-between gap-2">
+              <label for="pd-description" class="text-sm font-medium">Subject and scene details (optional)</label>
+              <span class="text-xs text-muted-foreground">Clothing, props, mood</span>
             </div>
             <textarea
+              hlmTextarea
+              id="pd-description"
               rows="3"
-              [ngModel]="ragService.userDescription()"
-              (ngModelChange)="ragService.userDescription.set($event)"
-              placeholder="e.g., athletic adult woman with silver hair wearing a black silk camisole, intense gaze..."
-              class="w-full rounded-lg border border-input bg-background p-3 text-xs text-foreground placeholder:text-muted-foreground/60 focus:outline-hidden focus:ring-1 focus:ring-ring resize-none font-sans"
+              class="resize-none"
+              [value]="rag.userDescription()"
+              (input)="rag.userDescription.set($any($event.target).value)"
+              placeholder="e.g. athletic adult woman wearing a black silk camisole, intense gaze"
             ></textarea>
           </div>
 
-          <!-- Action Buttons Bar -->
-          <div class="flex items-center justify-between gap-3 pt-2">
+          <!-- Actions -->
+          <div class="flex flex-col-reverse sm:flex-row sm:items-center sm:justify-between gap-3">
             <div class="flex items-center gap-2">
-              <button
-                hlmBtn
-                variant="ghost"
-                size="sm"
-                (click)="ragService.clearSelections()"
-                class="cursor-pointer text-xs text-muted-foreground hover:text-destructive gap-1.5"
-              >
-                <ng-icon name="lucideTrash2" class="size-3.5" />
-                <span>Reset</span>
+              <button hlmBtn variant="ghost" size="sm" type="button" (click)="rag.clearSelections()">
+                <ng-icon name="lucideTrash2" class="size-4" aria-hidden="true" />
+                Reset
               </button>
-
               <button
                 hlmBtn
                 variant="outline"
                 size="sm"
+                type="button"
                 (click)="onRetrieveOnly()"
-                [disabled]="ragService.isRetrieving() || ragService.isGenerating()"
-                class="cursor-pointer text-xs gap-1.5"
+                [disabled]="rag.isRetrieving() || rag.isGenerating() || !rag.isIndexReady()"
               >
-                @if (ragService.isRetrieving()) {
-                  <ng-icon name="lucideRefreshCw" class="size-3.5 animate-spin" />
-                  <span>Retrieving...</span>
-                } @else {
-                  <ng-icon name="lucideEye" class="size-3.5" />
-                  <span>Preview Context Only</span>
-                }
+                <ng-icon [name]="rag.isRetrieving() ? 'lucideRefreshCw' : 'lucideEye'" class="size-4" [class.animate-spin]="rag.isRetrieving()" aria-hidden="true" />
+                Preview exemplars
               </button>
             </div>
-
-            <!-- Primary Generate Button -->
             <button
               hlmBtn
-              variant="default"
-              size="default"
+              type="button"
+              class="w-full sm:w-auto"
               (click)="onGenerate()"
-              [disabled]="ragService.isGenerating() || ragService.isRetrieving()"
-              class="cursor-pointer text-xs font-bold tracking-wide gap-2 px-6 shadow-md"
+              [disabled]="rag.isGenerating() || rag.isRetrieving()"
+              title="Ctrl/Cmd + Enter"
             >
-              @if (ragService.isGenerating()) {
-                <ng-icon name="lucideRefreshCw" class="size-4 animate-spin" />
-                <span>Synthesizing Prompts...</span>
-              } @else {
-                <ng-icon name="lucideSparkles" class="size-4" />
-                <span>Generate Prompts (RAG)</span>
-                @if (ragService.totalSelectedCount() > 0) {
-                  <span class="ml-1 rounded-full bg-primary-foreground/20 px-1.5 py-0.2 text-[10px] font-bold">
-                    {{ ragService.totalSelectedCount() }}
-                  </span>
-                }
+              <ng-icon [name]="rag.isGenerating() ? 'lucideRefreshCw' : 'lucideSparkles'" class="size-4" [class.animate-spin]="rag.isGenerating()" aria-hidden="true" />
+              {{ rag.isGenerating() ? 'Generating...' : 'Generate prompts' }}
+              @if (rag.totalSelectedCount() > 0 && !rag.isGenerating()) {
+                <span class="rounded-full bg-primary-foreground/20 px-1.5 text-xs tabular-nums">{{ rag.totalSelectedCount() }}</span>
               }
             </button>
           </div>
+          <p class="text-xs text-muted-foreground -mt-2 sm:text-right">
+            <kbd class="rounded border border-border bg-muted px-1">Ctrl</kbd> /
+            <kbd class="rounded border border-border bg-muted px-1">Cmd</kbd> +
+            <kbd class="rounded border border-border bg-muted px-1">Enter</kbd> generates
+          </p>
 
-          <!-- Error Alert if any -->
-          @if (ragService.errorMessage()) {
-            <div class="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive flex items-center gap-2">
-              <ng-icon name="lucideAlertCircle" class="size-4 shrink-0" />
-              <span>{{ ragService.errorMessage() }}</span>
+          @if (rag.errorMessage()) {
+            <div hlmAlert variant="destructive">
+              <ng-icon name="lucideCircleAlert" />
+              <h2 hlmAlertTitle>Request failed</h2>
+              <p hlmAlertDescription>{{ rag.errorMessage() }}</p>
             </div>
           }
-        </div>
+        </section>
 
-        <!-- Right Column: Generated Prompts & Retrieved Context Preview -->
-        <div class="w-full lg:w-5/12 flex flex-col min-h-0 overflow-y-auto p-4 md:p-6 space-y-5 bg-card/30">
-          <!-- Prompts Output Area -->
-          @if (ragService.generationResult(); as result) {
-            <div class="space-y-4">
-              <div class="flex items-center justify-between">
-                <h2 class="text-sm font-bold text-foreground flex items-center gap-1.5">
-                  <ng-icon name="lucideSparkles" class="size-4 text-primary" />
-                  <span>Synthesized Prompts</span>
-                </h2>
-                <div class="flex items-center gap-2">
-                  @if (result.character) {
-                    <span class="text-[10px] font-semibold text-primary bg-primary/10 border border-primary/20 px-2 py-0.5 rounded-md uppercase tracking-wider">
-                      Character: {{ result.character }}
-                    </span>
-                  }
-                  <span class="text-[11px] text-muted-foreground font-mono">
-                    Model: {{ result.model }}
-                  </span>
-                </div>
-              </div>
-
-              <!-- Archetype Cards -->
-              <!-- 1. Archetype A: Tags -->
-              <div class="rounded-xl border border-border bg-card p-4 shadow-xs space-y-2.5">
-                <div class="flex items-center justify-between">
-                  <div class="flex items-center gap-2">
-                    <span class="font-sans font-bold text-xs text-foreground">
-                      {{ result.archetypes.a.name }}
-                    </span>
-                    <span hlmBadge variant="outline" class="text-[10px] py-0 font-mono">
-                      ~{{ result.archetypes.a.token_count }} tok
-                    </span>
-                  </div>
-                  <button
-                    hlmBtn
-                    variant="ghost"
-                    size="sm"
-                    class="h-7 text-xs px-2 gap-1 cursor-pointer"
-                    (click)="copyToClipboard('a', result.archetypes.a.prompt)"
-                  >
-                    @if (copiedMap()['a']) {
-                      <ng-icon name="lucideCheck" class="size-3.5 text-primary" />
-                      <span class="text-primary font-medium">Copied!</span>
-                    } @else {
-                      <ng-icon name="lucideCopy" class="size-3.5" />
-                      <span>Copy</span>
-                    }
-                  </button>
-                </div>
-                <div class="p-3 rounded-lg bg-muted/40 border border-border/60 text-xs font-mono leading-relaxed select-text text-foreground">
-                  {{ result.archetypes.a.prompt }}
-                </div>
-                @if (result.archetypes.a.warnings.length > 0) {
-                  <div class="text-[10px] text-muted-foreground space-y-0.5">
-                    @for (w of result.archetypes.a.warnings; track w) {
-                      <div>• {{ w }}</div>
-                    }
-                  </div>
+        <!-- Right: results -->
+        <section class="w-full lg:w-5/12 flex flex-col lg:min-h-0 lg:overflow-y-auto p-4 md:p-6 gap-4" aria-label="Generated prompts" aria-live="polite">
+          @if (rag.generationResult(); as result) {
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <h2 class="font-sans text-lg font-bold flex items-center gap-2">
+                <ng-icon name="lucideSparkles" class="size-4 text-primary" aria-hidden="true" />
+                Prompts
+              </h2>
+              <div class="flex flex-wrap items-center gap-1.5">
+                @if (result.character) {
+                  <span hlmBadge variant="outline">{{ characterName(result.character) }}</span>
                 }
-              </div>
-
-              <!-- 2. Archetype B: Short Anchor -->
-              <div class="rounded-xl border border-border bg-card p-4 shadow-xs space-y-2.5 ring-1 ring-primary/20">
-                <div class="flex items-center justify-between">
-                  <div class="flex items-center gap-2">
-                    <span class="font-sans font-bold text-xs text-foreground">
-                      {{ result.archetypes.b.name }}
-                    </span>
-                    <span hlmBadge variant="default" class="text-[10px] py-0 font-mono">
-                      Recommended
-                    </span>
-                    <span hlmBadge variant="outline" class="text-[10px] py-0 font-mono">
-                      ~{{ result.archetypes.b.token_count }} tok
-                    </span>
-                  </div>
-                  <button
-                    hlmBtn
-                    variant="ghost"
-                    size="sm"
-                    class="h-7 text-xs px-2 gap-1 cursor-pointer"
-                    (click)="copyToClipboard('b', result.archetypes.b.prompt)"
-                  >
-                    @if (copiedMap()['b']) {
-                      <ng-icon name="lucideCheck" class="size-3.5 text-primary" />
-                      <span class="text-primary font-medium">Copied!</span>
-                    } @else {
-                      <ng-icon name="lucideCopy" class="size-3.5" />
-                      <span>Copy</span>
-                    }
-                  </button>
-                </div>
-                <div class="p-3 rounded-lg bg-muted/40 border border-border/60 text-xs font-mono leading-relaxed select-text text-foreground">
-                  {{ result.archetypes.b.prompt }}
-                </div>
-                @if (result.archetypes.b.warnings.length > 0) {
-                  <div class="text-[10px] text-muted-foreground space-y-0.5">
-                    @for (w of result.archetypes.b.warnings; track w) {
-                      <div>• {{ w }}</div>
-                    }
-                  </div>
-                }
-              </div>
-
-              <!-- 3. Archetype C: Dense Narrative -->
-              <div class="rounded-xl border border-border bg-card p-4 shadow-xs space-y-2.5">
-                <div class="flex items-center justify-between">
-                  <div class="flex items-center gap-2">
-                    <span class="font-sans font-bold text-xs text-foreground">
-                      {{ result.archetypes.c.name }}
-                    </span>
-                    <span hlmBadge variant="outline" class="text-[10px] py-0 font-mono">
-                      ~{{ result.archetypes.c.token_count }} tok
-                    </span>
-                  </div>
-                  <button
-                    hlmBtn
-                    variant="ghost"
-                    size="sm"
-                    class="h-7 text-xs px-2 gap-1 cursor-pointer"
-                    (click)="copyToClipboard('c', result.archetypes.c.prompt)"
-                  >
-                    @if (copiedMap()['c']) {
-                      <ng-icon name="lucideCheck" class="size-3.5 text-primary" />
-                      <span class="text-primary font-medium">Copied!</span>
-                    } @else {
-                      <ng-icon name="lucideCopy" class="size-3.5" />
-                      <span>Copy</span>
-                    }
-                  </button>
-                </div>
-                <div class="p-3 rounded-lg bg-muted/40 border border-border/60 text-xs font-mono leading-relaxed select-text text-foreground max-h-48 overflow-y-auto">
-                  {{ result.archetypes.c.prompt }}
-                </div>
-                @if (result.archetypes.c.warnings.length > 0) {
-                  <div class="text-[10px] text-muted-foreground space-y-0.5">
-                    @for (w of result.archetypes.c.warnings; track w) {
-                      <div>• {{ w }}</div>
-                    }
-                  </div>
-                }
-              </div>
-            </div>
-          } @else {
-            <!-- Empty state when no prompts generated yet -->
-            <div class="flex flex-col items-center justify-center p-8 text-center rounded-xl border border-dashed border-border bg-card/20 space-y-3">
-              <div class="size-12 rounded-full bg-muted flex items-center justify-center text-muted-foreground">
-                <ng-icon name="lucideSparkles" class="size-6" />
-              </div>
-              <div>
-                <h3 class="font-sans font-bold text-sm text-foreground">Ready to Build Prompts</h3>
-                <p class="text-xs text-muted-foreground max-w-xs mt-1">
-                  Select your desired equipment, surroundings, stance, and optics on the left, then click Generate.
-                </p>
-              </div>
-            </div>
-          }
-
-          <!-- Retrieved Dataset Grounding Context -->
-          @if (ragService.retrievedContext().length > 0) {
-            <div class="rounded-xl border border-border bg-card p-4 shadow-xs space-y-3">
-              <div class="flex items-center justify-between pb-2 border-b border-border/50">
-                <div class="flex items-center gap-1.5">
-                  <ng-icon name="lucideEye" class="size-4 text-primary" />
-                  <h3 class="font-sans font-bold text-xs text-foreground">
-                    Retrieved Dataset Exemplars (RAG Context)
-                  </h3>
-                </div>
-                <span class="text-[10px] text-muted-foreground font-mono">
-                  {{ ragService.retrievedContext().length }} items
+                <span hlmBadge [variant]="result.grounded ? 'success' : 'warning'">
+                  <ng-icon [name]="result.grounded ? 'lucideDatabase' : 'lucideTriangleAlert'" aria-hidden="true" />
+                  {{ result.grounded ? 'Grounded' : 'Not grounded' }}
                 </span>
+                <span class="text-xs text-muted-foreground">{{ result.model }}</span>
               </div>
+            </div>
 
-              <div class="space-y-3">
-                @for (item of ragService.retrievedContext(); track item.id) {
-                  <div class="p-2.5 rounded-lg bg-muted/30 border border-border/60 space-y-2">
-                    <div class="flex items-center gap-3">
-                      <!-- Image Thumbnail Preview -->
-                      <img
-                        [src]="'/api/rag/preview/' + item.id"
-                        [alt]="item.stem"
-                        class="size-16 rounded-md object-cover bg-black/40 border border-border shrink-0 shadow-2xs"
-                        loading="lazy"
-                      />
-                      <div class="min-w-0 flex-1">
-                        <div class="flex items-center justify-between">
-                          <span class="text-[11px] font-bold text-foreground truncate max-w-[180px]">
-                            {{ item.stem }}
-                          </span>
-                          <span class="text-[10px] font-mono text-primary font-bold">
-                            Score: {{ item.score }}
-                          </span>
-                        </div>
-                        <div class="flex flex-wrap gap-1 mt-1">
-                          @for (t of item.matched_tags; track t) {
-                            <span class="text-[9px] px-1.5 py-0.2 rounded-sm bg-muted text-muted-foreground border border-border font-mono">
-                              {{ t }}
-                            </span>
-                          }
-                        </div>
-                      </div>
+            @for (n of result.notices ?? []; track n) {
+              <p class="text-xs text-muted-foreground flex items-start gap-1.5">
+                <ng-icon name="lucideTriangleAlert" class="size-3.5 shrink-0 mt-0.5" aria-hidden="true" />
+                {{ n }}
+              </p>
+            }
+
+            @for (key of archetypeKeys; track key) {
+              @if (archetype(result, key); as arch) {
+                <div class="rounded-xl border bg-card p-4 shadow-xs space-y-2.5" [class]="key === 'b' ? 'border-primary' : 'border-border'">
+                  <div class="flex items-center justify-between gap-2">
+                    <div class="flex flex-wrap items-center gap-1.5">
+                      <h3 class="font-sans text-base font-semibold">{{ arch.name }}</h3>
+                      @if (key === 'b') {
+                        <span hlmBadge>Recommended</span>
+                      }
+                      <span hlmBadge variant="muted" class="tabular-nums">~{{ arch.token_count }} tok</span>
                     </div>
-                    <p class="text-[11px] text-muted-foreground line-clamp-2 italic leading-relaxed select-text">
-                      "{{ item.full_caption }}"
+                    <button
+                      hlmBtn
+                      variant="ghost"
+                      size="sm"
+                      type="button"
+                      (click)="copyToClipboard(key, arch.prompt)"
+                      [attr.aria-label]="'Copy ' + arch.name"
+                    >
+                      <ng-icon [name]="copiedKey() === key ? 'lucideCheck' : 'lucideCopy'" class="size-4" aria-hidden="true" />
+                      {{ copiedKey() === key ? 'Copied' : 'Copy' }}
+                    </button>
+                  </div>
+                  <p class="rounded-lg bg-muted p-3 text-sm leading-relaxed select-text break-words" [class.max-h-56]="key === 'c'" [class.overflow-y-auto]="key === 'c'">
+                    {{ arch.prompt }}
+                  </p>
+                  @if (arch.warnings.length > 0) {
+                    <ul class="list-disc ps-5 text-xs text-muted-foreground space-y-0.5">
+                      @for (w of arch.warnings; track w) {
+                        <li>{{ w }}</li>
+                      }
+                    </ul>
+                  }
+                </div>
+              }
+            }
+          } @else {
+            <div class="flex flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-border bg-card p-8 text-center">
+              <div class="size-12 rounded-full bg-muted flex items-center justify-center text-muted-foreground">
+                <ng-icon name="lucideSparkles" class="size-6" aria-hidden="true" />
+              </div>
+              <h3 class="font-sans text-base font-semibold">No prompts yet</h3>
+              <p class="text-sm text-muted-foreground max-w-xs">
+                Pick a preset or click tags on the left, then generate. You get three Krea formats to copy.
+              </p>
+            </div>
+          }
+
+          @if (rag.retrievedContext().length > 0) {
+            <div class="rounded-xl border border-border bg-card p-4 shadow-xs space-y-3">
+              <div class="flex items-center justify-between">
+                <h3 class="font-sans text-base font-semibold flex items-center gap-2">
+                  <ng-icon name="lucideEye" class="size-4 text-muted-foreground" aria-hidden="true" />
+                  Dataset exemplars used
+                </h3>
+                <span class="text-xs text-muted-foreground tabular-nums">{{ rag.retrievedContext().length }}</span>
+              </div>
+              @for (item of rag.retrievedContext(); track item.id) {
+                <div class="flex gap-3 rounded-lg border border-border p-2.5">
+                  @if (item.img_rel_path && !failedPreviews().has(item.id)) {
+                    <img
+                      [src]="'/api/rag/preview/' + item.id"
+                      [alt]="item.stem"
+                      class="size-16 shrink-0 rounded-md object-cover bg-muted"
+                      loading="lazy"
+                      (error)="markPreviewFailed(item.id)"
+                    />
+                  } @else {
+                    <div class="size-16 shrink-0 rounded-md bg-muted flex items-center justify-center text-muted-foreground">
+                      <ng-icon name="lucideImageOff" class="size-5" aria-label="No preview" />
+                    </div>
+                  }
+                  <div class="min-w-0 flex-1 space-y-1">
+                    <div class="flex items-center justify-between gap-2">
+                      <span class="text-xs font-medium truncate select-text" [title]="item.stem">{{ item.stem }}</span>
+                      <span class="text-xs text-muted-foreground tabular-nums shrink-0">{{ item.score.toFixed(2) }}</span>
+                    </div>
+                    @if (item.matched_tags.length > 0) {
+                      <div class="flex flex-wrap gap-1">
+                        @for (t of item.matched_tags.slice(0, 4); track t) {
+                          <span hlmBadge variant="muted">{{ tagLabel(t) }}</span>
+                        }
+                        @if (item.matched_tags.length > 4) {
+                          <span hlmBadge variant="outline" class="tabular-nums" [title]="tagList(item.matched_tags)">
+                            +{{ item.matched_tags.length - 4 }}
+                          </span>
+                        }
+                      </div>
+                    }
+                    <p class="text-xs text-muted-foreground line-clamp-2 leading-relaxed select-text" [title]="item.full_caption">
+                      {{ item.full_caption }}
                     </p>
                   </div>
-                }
-              </div>
+                </div>
+              }
             </div>
           }
-        </div>
+
+          @if (rag.indexStatus()?.index; as idx) {
+            <p class="text-xs text-muted-foreground tracking-wide">
+              Index built {{ idx.built_at * 1000 | date: 'short' }} ({{ idx.embedding_model }}).
+              <button hlmBtn variant="link" size="sm" type="button" class="h-auto p-0 text-xs" (click)="rag.buildIndex()" [disabled]="rag.isIndexBuilding()">
+                Rebuild
+              </button>
+            </p>
+          }
+        </section>
       </div>
     </div>
   `,
 })
-export class PromptClickerViewComponent implements OnInit {
-  readonly ragService = inject(PromptRagService);
+export class PromptClickerViewComponent implements OnInit, OnDestroy {
+  readonly rag = inject(PromptRagService);
 
-  readonly copiedMap = signal<Record<string, boolean>>({});
+  readonly archetypeKeys = ARCHETYPE_ORDER;
+  readonly copiedKey = signal<ArchetypeKey | null>(null);
+  readonly failedPreviews = signal<ReadonlySet<number>>(new Set());
+  private copyTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Known categories first in a fixed order, then any extra ones the backend adds. */
+  readonly categoryKeys = computed(() => {
+    const keys = Object.keys(this.rag.categories());
+    const ordered = CATEGORY_ORDER.filter((k) => keys.includes(k));
+    return [...ordered, ...keys.filter((k) => !(CATEGORY_ORDER as readonly string[]).includes(k))];
+  });
+
+  readonly characterOptions = computed<{ id: string | null; name: string; summary: string }[]>(() => [
+    { id: null, name: 'Anonymous', summary: 'Generic adult subject' },
+    ...Object.values(this.rag.characters()).map((c: CharacterProfile) => ({ id: c.id, name: c.name, summary: c.summary })),
+  ]);
+
+  private readonly tagLabels = computed(() => {
+    const map = new Map<string, string>();
+    for (const cat of Object.values(this.rag.categories())) {
+      for (const items of Object.values(cat.groups || {})) {
+        for (const opt of items) map.set(opt.id, opt.label);
+      }
+    }
+    return map;
+  });
 
   async ngOnInit(): Promise<void> {
-    await this.ragService.loadMetadata();
+    await Promise.all([this.rag.loadMetadata(), this.rag.loadStatus()]);
   }
 
-  getGroupEntries(groups: Record<string, any[]>): { name: string; items: any[] }[] {
+  ngOnDestroy(): void {
+    this.rag.stopStatusPolling();
+    if (this.copyTimer) clearTimeout(this.copyTimer);
+  }
+
+  onKeydown(event: KeyboardEvent): void {
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !this.rag.isGenerating()) {
+      event.preventDefault();
+      void this.onGenerate();
+    }
+  }
+
+  getGroupEntries(groups: Record<string, TaxonomyOption[]>): { name: string; items: TaxonomyOption[] }[] {
     return Object.entries(groups || {}).map(([name, items]) => ({ name, items }));
   }
 
+  categoryIcon(key: string): string {
+    return CATEGORY_ICONS[key] ?? 'lucideLayers';
+  }
+
+  selectedIn(key: string): number {
+    return this.rag.selectedTags()[key]?.length ?? 0;
+  }
+
+  sourceLabel(source: string | null | undefined): string {
+    return (source && SOURCE_LABELS[source]) || 'dataset';
+  }
+
+  tagLabel(id: string): string {
+    return this.tagLabels().get(id) ?? id;
+  }
+
+  tagList(ids: string[]): string {
+    return ids.map((id) => this.tagLabel(id)).join(', ');
+  }
+
+  isCharacterSelected(id: string | null): boolean {
+    return (this.rag.selectedCharacter() ?? null) === id;
+  }
+
+  characterName(id: string): string {
+    return this.rag.characters()[id]?.name ?? id;
+  }
+
+  archetype(result: RagGenerateResponse, key: ArchetypeKey): PromptArchetype | undefined {
+    return result.archetypes?.[key];
+  }
+
+  markPreviewFailed(id: number): void {
+    this.failedPreviews.update((s) => new Set(s).add(id));
+  }
+
   onSelectPreset(preset: CuratedPreset): void {
-    this.ragService.applyPreset(preset);
+    this.rag.applyPreset(preset);
   }
 
   async onRetrieveOnly(): Promise<void> {
-    await this.ragService.retrieveContext();
+    await this.rag.retrieveContext();
   }
 
   async onGenerate(): Promise<void> {
-    await this.ragService.generatePrompts();
+    await this.rag.generatePrompts();
   }
 
-  copyToClipboard(key: string, text: string): void {
+  async copyToClipboard(key: ArchetypeKey, text: string): Promise<void> {
     if (!text) return;
-    navigator.clipboard.writeText(text);
-    const curr = { ...this.copiedMap() };
-    curr[key] = true;
-    this.copiedMap.set(curr);
-    setTimeout(() => {
-      const reset = { ...this.copiedMap() };
-      reset[key] = false;
-      this.copiedMap.set(reset);
-    }, 2000);
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      this.rag.errorMessage.set('Clipboard not available - select the prompt text and copy it manually.');
+      return;
+    }
+    this.copiedKey.set(key);
+    if (this.copyTimer) clearTimeout(this.copyTimer);
+    this.copyTimer = setTimeout(() => this.copiedKey.set(null), 2000);
   }
 }

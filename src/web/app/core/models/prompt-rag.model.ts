@@ -19,6 +19,7 @@ export interface CuratedPreset {
   suggested_description: string;
 }
 
+/** Exemplar as returned in `rag_context` (generate); `/retrieve` adds split + domain texts. */
 export interface RagItemPreview {
   id: number;
   stem: string;
@@ -26,6 +27,48 @@ export interface RagItemPreview {
   matched_tags: string[];
   img_rel_path: string | null;
   full_caption: string;
+  split?: string;
+  equipment_text?: string;
+  surroundings_text?: string;
+  position_text?: string;
+  lighting_text?: string;
+}
+
+export interface RagRetrieveResponse {
+  results: RagItemPreview[];
+  index_ready: boolean;
+}
+
+export type RagBuildState = 'idle' | 'running' | 'done' | 'error';
+
+/** `GET /api/rag/status` and `POST /api/rag/index`. */
+export interface RagIndexStatus {
+  ready: boolean;
+  indexed: number;
+  index: {
+    count: number;
+    source: 'curated' | 'finished_merged' | null;
+    source_path: string | null;
+    built_at: number;
+    embedding_model: string | null;
+  } | null;
+  /** null while a build is running (folder scan skipped). */
+  sources: {
+    source: 'curated' | 'finished_merged' | null;
+    path: string | null;
+    caption_files: number;
+    searched: string[];
+  } | null;
+  build: {
+    state: RagBuildState;
+    progress: number;
+    step: string;
+    error: string | null;
+    started_at: number | null;
+    finished_at: number | null;
+  };
+  build_command: string;
+  openrouter_key_configured?: boolean;
 }
 
 export interface CharacterProfile {
@@ -54,12 +97,16 @@ export interface RagGenerateRequest {
   trigger: string;
   top_k?: number;
   local_url?: string;
+  api_key?: string;
 }
 
 export interface RagGenerateResponse {
   model: string;
   trigger: string;
   character?: string | null;
+  /** false when no exemplars were retrieved (index missing/empty). */
+  grounded: boolean;
+  notices?: string[];
   archetypes: {
     a: PromptArchetype;
     b: PromptArchetype;

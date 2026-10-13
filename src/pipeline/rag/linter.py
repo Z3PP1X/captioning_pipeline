@@ -115,5 +115,5 @@ def lint_prompt(
         "clean_prompt": cleaned,
         "warnings": warnings,
         "token_count": tok_est,
-        "is_valid": len([w for w in warnings if "Prohibited" in w]) == 0,
+        "is_valid": not any("prohibited" in w.lower() for w in warnings),
     }

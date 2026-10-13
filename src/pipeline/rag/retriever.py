@@ -11,33 +11,54 @@ import numpy as np
 
 from pipeline.classifier import ClipClassifier
 from pipeline.config import Settings, get_settings
+from pipeline.rag.indexer import rag_index_paths
 from pipeline.rag.taxonomy import TAXONOMY_CATEGORIES
 
 logger = logging.getLogger(__name__)
 
 
+class RagIndexNotReady(FileNotFoundError):
+    """Raised when the RAG index has not been built (or is empty)."""
+
+
 class RagRetriever:
     """Retrieves grounded dataset captions and domain excerpts using tag scoring and vector similarity."""
 
-    def __init__(self, settings: Settings | None = None):
+    def __init__(self, settings: Settings | None = None, classifier: ClipClassifier | None = None):
         self.settings = settings or get_settings()
-        self.db_path = self.settings.cache_dir / "rag_index.sqlite"
-        self.npz_path = self.settings.cache_dir / "rag_embeddings.npz"
-        self.classifier = ClipClassifier(self.settings)
+        self.db_path, self.npz_path = rag_index_paths(self.settings)
+        self.classifier = classifier or ClipClassifier(self.settings)
 
         self._captions_cache: list[dict[str, Any]] | None = None
         self._embeddings_cache: np.ndarray | None = None
         self._id_to_idx: dict[int, int] = {}
+        self._loaded_mtime: float | None = None
+
+    def is_ready(self) -> bool:
+        """True when both index files exist (cheap check, does not load anything)."""
+        return self.db_path.exists() and self.npz_path.exists()
+
+    def invalidate(self) -> None:
+        """Drop the in-memory cache so the next query reloads the index from disk."""
+        self._captions_cache = None
+        self._embeddings_cache = None
+        self._id_to_idx = {}
+        self._loaded_mtime = None
 
     def _ensure_loaded(self) -> tuple[list[dict[str, Any]], np.ndarray]:
-        """Loads metadata from SQLite and dense embeddings from NPZ into memory."""
-        if self._captions_cache is not None and self._embeddings_cache is not None:
-            return self._captions_cache, self._embeddings_cache
-
-        if not self.db_path.exists() or not self.npz_path.exists():
-            raise FileNotFoundError(
-                f"RAG index files not found at {self.db_path} or {self.npz_path}. Run scripts/index_rag.py first."
+        """Loads metadata from SQLite and dense embeddings from NPZ into memory (reloads after a rebuild)."""
+        if not self.is_ready():
+            raise RagIndexNotReady(
+                f"RAG index files not found at {self.db_path} or {self.npz_path}. Build the index first."
             )
+
+        npz_mtime = self.npz_path.stat().st_mtime
+        if (
+            self._captions_cache is not None
+            and self._embeddings_cache is not None
+            and self._loaded_mtime == npz_mtime
+        ):
+            return self._captions_cache, self._embeddings_cache
 
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
@@ -72,24 +93,88 @@ class RagRetriever:
                 "word_count": r["word_count"],
             })
 
-        npz_data = np.load(self.npz_path)
-        npz_ids = npz_data["ids"]
-        embeddings = npz_data["embeddings"].astype(np.float32)
+        with np.load(self.npz_path) as npz_data:
+            npz_ids = npz_data["ids"]
+            npz_embeddings = npz_data["embeddings"].astype(np.float32)
 
-        id_to_idx = {int(row_id): i for i, row_id in enumerate(npz_ids)}
+        # Align embedding rows to caption rows by id (drop rows missing on either side)
+        npz_pos = {int(row_id): i for i, row_id in enumerate(npz_ids)}
+        captions = [c for c in captions if c["id"] in npz_pos]
+        if captions:
+            embeddings = npz_embeddings[[npz_pos[c["id"]] for c in captions]]
+        else:
+            embeddings = np.zeros((0, npz_embeddings.shape[1] if npz_embeddings.ndim == 2 else 512), dtype=np.float32)
 
         self._captions_cache = captions
         self._embeddings_cache = embeddings
-        self._id_to_idx = id_to_idx
+        self._id_to_idx = {c["id"]: i for i, c in enumerate(captions)}
+        self._loaded_mtime = npz_mtime
         return captions, embeddings
+
+    def count(self) -> int:
+        """Number of indexed captions (0 when the index is missing)."""
+        if not self.is_ready():
+            return 0
+        try:
+            captions, _ = self._ensure_loaded()
+        except Exception as err:  # corrupt / half-written index
+            logger.warning("Failed to load RAG index: %s", err)
+            return 0
+        return len(captions)
+
+    @staticmethod
+    def _mmr_select(
+        candidate_idx: np.ndarray,
+        relevance: np.ndarray,
+        embeddings: np.ndarray,
+        top_k: int,
+        lambda_: float,
+        dup_threshold: float = 0.98,
+    ) -> list[int]:
+        """Maximal Marginal Relevance: trade relevance against similarity to already chosen exemplars.
+
+        Candidates whose cosine similarity to a chosen exemplar exceeds ``dup_threshold`` are treated as
+        duplicates and only used if nothing else is left (CLIP text similarities are uniformly high, so
+        the MMR penalty alone does not separate identical captions).
+        """
+        selected: list[int] = []
+        remaining = list(candidate_idx)
+        duplicates: list[int] = []
+        while remaining and len(selected) < top_k:
+            if not selected:
+                best = remaining[0]
+            else:
+                sel_emb = embeddings[selected]
+                rem_emb = embeddings[remaining]
+                max_sim = (rem_emb @ sel_emb.T).max(axis=1)
+                is_dup = max_sim > dup_threshold
+                duplicates.extend(i for i, d in zip(remaining, is_dup) if d)
+                remaining = [i for i, d in zip(remaining, is_dup) if not d]
+                if not remaining:
+                    break
+                max_sim = max_sim[~is_dup]
+                mmr = lambda_ * relevance[remaining] - (1.0 - lambda_) * max_sim
+                best = remaining[int(np.argmax(mmr))]
+            selected.append(best)
+            remaining.remove(best)
+        # Back-fill with duplicates (by relevance) only when the pool is exhausted
+        for i in sorted(duplicates, key=lambda j: -relevance[j]):
+            if len(selected) >= top_k:
+                break
+            selected.append(i)
+        return selected
 
     def retrieve(
         self,
         selected_tags: dict[str, list[str]],
         user_description: str = "",
         top_k: int = 4,
+        diversity: float = 0.7,
     ) -> list[dict[str, Any]]:
-        """Executes hybrid retrieval over dataset captions."""
+        """Executes hybrid retrieval over dataset captions.
+
+        ``diversity`` is the MMR lambda (1.0 = pure relevance, lower = more varied exemplars).
+        """
         captions, embeddings = self._ensure_loaded()
         total_items = len(captions)
         if total_items == 0:
@@ -156,8 +241,13 @@ class RagRetriever:
         else:
             hybrid_scores = dense_scores
 
-        # 5. Top-K ranking
-        ranked_indices = np.argsort(-hybrid_scores)[:top_k]
+        # 5. Top-K ranking, re-ranked with MMR over a relevance pool so exemplars are not near-duplicates
+        top_k = max(1, int(top_k))
+        pool = np.argsort(-hybrid_scores)[: max(top_k * 8, 32)]
+        if 0.0 < diversity < 1.0 and len(pool) > top_k:
+            ranked_indices = self._mmr_select(pool, hybrid_scores, embeddings, top_k, diversity)
+        else:
+            ranked_indices = list(pool[:top_k])
 
         results: list[dict[str, Any]] = []
         for idx in ranked_indices:
