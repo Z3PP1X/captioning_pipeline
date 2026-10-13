@@ -1,6 +1,6 @@
 # Colors
 
-All values live in `src/styles.css` and are used via Tailwind token classes only.
+All values live in `src/web/styles.css` and are used via Tailwind token classes only.
 
 ## Brand
 

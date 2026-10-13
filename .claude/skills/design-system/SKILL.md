@@ -5,7 +5,7 @@ description: Master design system for this project (colors, typography, UI token
 
 # Design system (master)
 
-Single source of truth for **what** the UI looks like. The `styling` skill defines **how** it is built (Spartan helm/brain + Tailwind v4, tokens in `src/styles.css`). When both apply, follow both; on conflict, visual rules here win for visuals, `styling` wins for implementation technique.
+Single source of truth for **what** the UI looks like. The `styling` skill defines **how** it is built (Spartan helm/brain + Tailwind v4, tokens in `src/web/styles.css`). When both apply, follow both; on conflict, visual rules here win for visuals, `styling` wins for implementation technique.
 
 ## Details
 
@@ -15,6 +15,7 @@ Single source of truth for **what** the UI looks like. The `styling` skill defin
 | Font stack, signature style, type scale | [references/typography.md](references/typography.md) |
 | Spacing, radius, shadow, icon, component styling | [references/ui-tokens.md](references/ui-tokens.md) |
 | Mobile-first layout, page patterns, touch & accessibility | [references/layout.md](references/layout.md) |
+| Studio specifics (language, desktop-first, status/metric/timeline mapping, compliance gaps) | [references/studio-adaptations.md](references/studio-adaptations.md) |
 
 ## The 12 rules (read these even if you read nothing else)
 
@@ -29,7 +30,7 @@ Single source of truth for **what** the UI looks like. The `styling` skill defin
 9. **Radii from the scale:** inputs/buttons `rounded-md…rounded-lg`, cards `rounded-xl`, max 24px; pills `rounded-full` for chips/badges. No square buttons.
 10. **Lean surfaces:** white cards on `bg-canvas` with `border` or `shadow-xs`/`shadow-sm` — never both heavy. No gradients, no decorative color blocks.
 11. **Mobile first:** design at 360px, enhance with `sm/md/lg`. Touch targets ≥ 44px below `md`, primary actions full width on mobile, bottom sheets over centered modals on phones, safe areas respected.
-12. **Only tokens.** Never hardcode hex/rgb or raw palette classes (`gray-*`, `red-*`, `white`, `black`) in templates — new colors go into `src/styles.css` first and are documented in colors.md.
+12. **Only tokens.** Never hardcode hex/rgb or raw palette classes (`gray-*`, `red-*`, `white`, `black`) in templates — new colors go into `src/web/styles.css` first and are documented in colors.md.
 
 ## Review checklist
 
@@ -43,4 +44,6 @@ Single source of truth for **what** the UI looks like. The `styling` skill defin
 
 ## Known legacy to migrate
 
-Existing templates predate this system (e.g. `header-component.html` uses `bg-[#a6c1ee]`, `text-gray-500`, `hover:bg-red-400`, an external logo URL; components have `.css` files). Migrate them to tokens + Spartan primitives when touching them.
+The `src/web/styles.css` token block already implements this system (light `:root` + a `.dark` variant). Remaining legacy: `src/web/app.js` (dead, hex/emoji era), foreign marketing components in `src/web/shared/components/` (German copy, not part of this app), and Studio templates that still use emoji, raw palette classes and `alert()` - see "Compliance gaps" in [references/studio-adaptations.md](references/studio-adaptations.md). Migrate to tokens + Spartan primitives when touching them.
+
+`.agents/skills/{design-system,styling}` is an upstream copy of these files; edits here are not mirrored there - keep both in sync (or delete one).
