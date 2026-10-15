@@ -17,9 +17,17 @@ import numpy as np
 from pipeline.classifier import ClipClassifier
 from pipeline.config import Settings, get_settings, merged_user_settings
 from pipeline.db import DB
-from pipeline.decode import decode_exact_frame, decode_exact_frames, sample_chunk_frames
-from pipeline.export import existing_caption_kind, link_or_copy, snap_to_multiple_of_16
-from pipeline.metrics import compute_tier1_metrics, filter_and_rank_tier1
+from pipeline.decode import decode_exact_frame, decode_exact_frames, ensure_native_frames, sample_chunk_frames
+from pipeline.export import (
+    append_manifest_record,
+    apply_letterbox_crop,
+    apply_watermark_crop,
+    existing_caption_kind,
+    link_or_copy,
+    render_export_image,
+    snap_to_multiple_of_16,
+)
+from pipeline.metrics import compute_tier1_metrics, filter_and_rank_tier1, hard_filter_check, phash_hamming_distance
 from pipeline.openrouter import (
     DEFAULT_CAPTION_MAX_TOKENS,
     ModelRefusalError,
@@ -57,6 +65,10 @@ class JobCancelled(Exception):
     """Raised at a job checkpoint after the user cancelled it; the job must not mutate the DB further."""
 
 
+class JobConflictError(Exception):
+    """Raised when a job is submitted for a video that already has an active queued or running job."""
+
+
 class JobManager:
     def __init__(self, db: DB, settings: Settings | None = None):
         self.db = db
@@ -65,11 +77,25 @@ class JobManager:
         self.tagger = LocalTagger(self.classifier, self.settings)
         self.scoring_engine = ScoringEngine(self.classifier)
         self.captioner = OpenRouterCaptioner(self.settings)
-        # Support 3-4 concurrent extraction jobs in parallel
-        self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pipeline_worker")
+        # Dedicated decode executor (1-2 workers) and caption executor (4 workers) (C3/H4)
+        self.decode_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="decode_worker")
+        self.caption_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="caption_worker")
+        self.executor = self.decode_executor  # backwards-compatible alias
         self._listeners: list[tuple[asyncio.AbstractEventLoop, asyncio.Queue]] = []
         self._lock = threading.Lock()
         self._cancel_flags: set[int] = set()
+
+    def _assert_no_active_job(self, video_id: str) -> None:
+        """Enforces per-video job lock: raises JobConflictError if an active job already exists (C3/H4)."""
+        existing = self.db.one(
+            "SELECT id, type, status FROM jobs WHERE video_id=? AND status IN ('queued', 'running')",
+            (video_id,),
+        )
+        if existing:
+            raise JobConflictError(
+                f"Video {video_id} already has an active {existing['type']} job "
+                f"(#{existing['id']}, status: {existing['status']})"
+            )
 
     @staticmethod
     def _enqueue(q: asyncio.Queue, payload: str) -> None:
@@ -192,6 +218,7 @@ class JobManager:
         video_name = vid["name"] if vid else "Video"
 
         with self.db.write() as conn:
+            self._assert_no_active_job(video_id)
             cursor = conn.execute(
                 """
                 INSERT INTO jobs (type, video_id, chunk_id, status, progress, created_at)
@@ -208,7 +235,7 @@ class JobManager:
             "video_name": video_name,
             "chunk_id": chunk_id,
         })
-        self.executor.submit(self._run_job, job_id, video_id, chunk_id, video_name)
+        self.decode_executor.submit(self._run_job, job_id, video_id, chunk_id, video_name)
         return job_id
 
     def submit_auto_process_job(self, video_id: str, target_frames: int = 150) -> int:
@@ -217,6 +244,7 @@ class JobManager:
         video_name = vid["name"] if vid else "Video"
 
         with self.db.write() as conn:
+            self._assert_no_active_job(video_id)
             cursor = conn.execute(
                 """
                 INSERT INTO jobs (type, video_id, chunk_id, status, progress, created_at)
@@ -233,7 +261,7 @@ class JobManager:
             "video_name": video_name,
             "chunk_id": None,
         })
-        self.executor.submit(self._run_auto_process_job, job_id, video_id, video_name, target_frames)
+        self.decode_executor.submit(self._run_auto_process_job, job_id, video_id, video_name, target_frames)
         return job_id
 
     def submit_extract_750_job(self, video_id: str) -> int:
@@ -242,6 +270,7 @@ class JobManager:
         video_name = vid["name"] if vid else "Video"
 
         with self.db.write() as conn:
+            self._assert_no_active_job(video_id)
             cursor = conn.execute(
                 """
                 INSERT INTO jobs (type, video_id, chunk_id, status, progress, created_at)
@@ -258,7 +287,7 @@ class JobManager:
             "video_name": video_name,
             "chunk_id": None,
         })
-        self.executor.submit(self._run_extract_750_job, job_id, video_id, video_name)
+        self.decode_executor.submit(self._run_extract_750_job, job_id, video_id, video_name)
         return job_id
 
     def _run_extract_750_job(self, job_id: int, video_id: str, video_name: str) -> None:
@@ -278,7 +307,14 @@ class JobManager:
                 chunks = chunker.generate_balanced_chunks(video_id, target_frames=300)
 
             total_chunks = len(chunks)
-            target_total = 750
+            user_settings = merged_user_settings(self.db.get_setting("user_settings", {}))
+            target_total = int(user_settings.get("target_candidates", 750))
+            target_curated = int(user_settings.get("target_curated", 300))
+            category_quotas = user_settings.get("category_quotas")
+            mmr_lambda = float(user_settings.get("mmr_lambda", 0.65))
+
+            letterbox = video.get("letterbox")
+            watermark_rect = video.get("watermark_rect")
 
             def update_job_progress(p: float, step: str):
                 with self.db.write() as conn:
@@ -292,9 +328,9 @@ class JobManager:
                     "step": step,
                 })
 
-            update_job_progress(0.05, "Sampling 750 candidate frames across chunks...")
+            update_job_progress(0.05, f"Sampling candidate frames across {total_chunks} chunks...")
 
-            # 1. Sample candidate frames per chunk according to budget_pct
+            # 1. Sample candidate frames per chunk (streamed at 512px with pre-crop & gates)
             all_candidates: list[dict[str, Any]] = []
             seen_cand_ts: set[float] = set()
 
@@ -312,35 +348,49 @@ class JobManager:
                     float(ch["end_s"]),
                     sample_fps=needed_fps,
                     max_samples=chunk_n * 2,
-                    max_dim=720,
+                    max_dim=512,  # Stream at 512px to keep RAM minimal (C4/H5)
                 )
 
+                chunk_cands: list[dict[str, Any]] = []
                 for t, img_bgr in raw_samples:
                     t_val = round(float(t), 3)
                     if t_val in seen_cand_ts:
                         continue
-                    seen_cand_ts.add(t_val)
-                    all_candidates.append({
+
+                    # Pre-crop letterbox and watermark before metrics & CLIP (C5/H8/H9)
+                    img_cropped = apply_letterbox_crop(img_bgr, letterbox)
+                    img_cropped = apply_watermark_crop(img_cropped, watermark_rect)
+
+                    metrics = compute_tier1_metrics(img_cropped)
+
+                    # Hard filter check (C5/H8)
+                    ok, _ = hard_filter_check(metrics, sharpness_floor=15.0)
+                    if not ok:
+                        continue
+
+                    # Intra-chunk pHash deduplication <= 4 (C5/H8)
+                    if any(phash_hamming_distance(metrics["phash"], kept["metrics"]["phash"]) <= 4 for kept in chunk_cands):
+                        continue
+
+                    cand_dict = {
                         "chunk_id": ch["id"],
                         "t": t_val,
-                        "img_bgr": img_bgr,
-                    })
+                        "img_bgr": img_cropped,
+                        "metrics": metrics,
+                    }
+                    seen_cand_ts.add(t_val)
+                    chunk_cands.append(cand_dict)
+                    all_candidates.append(cand_dict)
 
                 p = 0.05 + 0.35 * ((idx + 1) / total_chunks)
-                update_job_progress(round(p, 2), f"Sampled Chunk {idx + 1}/{total_chunks} ({len(raw_samples)} frames)")
+                update_job_progress(round(p, 2), f"Sampled Chunk {idx + 1}/{total_chunks} ({len(chunk_cands)} valid frames)")
 
             if not all_candidates:
                 raise RuntimeError("No candidate frames could be sampled from video")
 
-            # 2. Quality Metrics
+            # 2. Batch Embeddings & 7-Dimension Scoring (metrics are already computed during sampling)
             self._check_cancel(job_id)
-            update_job_progress(0.45, f"Computing Tier-1 metrics on {len(all_candidates)} frames...")
-            for c in all_candidates:
-                c["metrics"] = compute_tier1_metrics(c["img_bgr"])
-
-            # 3. Batch Embeddings & 7-Dimension Scoring
-            self._check_cancel(job_id)
-            update_job_progress(0.55, "Computing CLIP embeddings...")
+            update_job_progress(0.50, f"Computing CLIP embeddings on {len(all_candidates)} filtered frames...")
             images_to_embed = [c["img_bgr"] for c in all_candidates]
             embeddings = self.classifier.embed_images(images_to_embed, batch_size=32)
 
@@ -348,18 +398,25 @@ class JobManager:
             update_job_progress(0.68, "Evaluating 7-dimension scoring criteria...")
             self.scoring_engine.score_candidates_batch(all_candidates, embeddings)
 
-            # 4. Multi-objective 750 -> 300 reduction
-            update_job_progress(0.78, "Optimizing 300 best frame subset...")
+            # 3. Multi-objective reduction
+            update_job_progress(0.78, f"Optimizing best {target_curated} frame subset...")
             picks_300, runners_450, stats = self.scoring_engine.reduce_750_to_300(
-                all_candidates, chunks, target_total=300
+                all_candidates, chunks, target_total=target_curated, category_quotas=category_quotas, mmr_lambda=mmr_lambda
             )
 
-            # 5. Save previews and decode exact full-resolution frames for 300 picks
+            # 4. Save previews and decode exact full-resolution frames for picks
             update_job_progress(0.82, "Saving thumbnails and native frames...")
             preview_dir = self.settings.cache_dir / "previews" / video_id
             preview_dir.mkdir(parents=True, exist_ok=True)
             cand_dir = self.settings.cache_dir / "candidates" / video_id
             cand_dir.mkdir(parents=True, exist_ok=True)
+
+            # Prune stale candidate and preview files for this video (M9)
+            for old_f in list(preview_dir.glob("*.webp")) + list(cand_dir.glob("*.png")):
+                try:
+                    old_f.unlink()
+                except OSError:
+                    pass
 
             all_to_store = picks_300 + runners_450
 
@@ -368,15 +425,16 @@ class JobManager:
                 cid = p["chunk_id"]
                 picks_by_chunk.setdefault(cid, []).append(p)
 
-            exact_frames_map: dict[float, np.ndarray] = {}
+            # Stream native frames directly to disk chunk by chunk without accumulating in RAM (C4/H5)
             for cid, ch_picks in picks_by_chunk.items():
                 self._check_cancel(job_id)
                 ts = [p["t"] for p in ch_picks]
-                decoded = decode_exact_frames(vpath, ts)
-                exact_frames_map.update(decoded)
+                def write_pick(target_t: float, native_img: np.ndarray):
+                    pick_path = cand_dir / f"full_c{cid}_{int(target_t * 1000)}.png"
+                    cv2.imwrite(str(pick_path), native_img)
+                decode_exact_frames(vpath, ts, on_frame=write_pick)
 
-            # Last cancel point: the files below can overwrite the current frames' images on disk,
-            # and the commit replaces the current frames, picks and exports.
+            # Last cancel point: commit replaces the current frames, picks and exports.
             self._check_cancel(job_id)
             saved_records = []
             seen_store_ts: set[float] = set()
@@ -396,9 +454,8 @@ class JobManager:
                 cv2.imwrite(str(prev_path), small, [cv2.IMWRITE_WEBP_QUALITY, 85])
 
                 full_path = cand_dir / f"full_c{cid}_{int(t * 1000)}.png"
-                if is_pick and t in exact_frames_map:
-                    cv2.imwrite(str(full_path), exact_frames_map[t])
-                else:
+                if not is_pick:
+                    # Runners are saved at 512px; re-decoded to native resolution on demand (C1/H1)
                     cv2.imwrite(str(full_path), item["img_bgr"])
 
                 saved_records.append({
@@ -406,20 +463,22 @@ class JobManager:
                     "t": t,
                     "prev_path": str(prev_path),
                     "full_path": str(full_path),
+                    "is_pick": is_pick,
                 })
 
-            # 6. Database Commit
+            # 5. Database Commit
             update_job_progress(0.95, "Committing records to database...")
             with self.db.write() as conn:
                 conn.execute("DELETE FROM frames WHERE video_id=?", (video_id,))
                 for rec in saved_records:
                     item = rec["item"]
+                    is_pick = rec["is_pick"]
                     cursor = conn.execute(
                         """
                         INSERT OR REPLACE INTO frames (
                             video_id, chunk_id, t, metrics, phash, embedding,
-                            zs_scores, preview_path, full_path
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            zs_scores, preview_path, full_path, native
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             video_id,
@@ -431,6 +490,7 @@ class JobManager:
                             json.dumps(item["scores"]),
                             rec["prev_path"],
                             rec["full_path"],
+                            1 if is_pick else 0,
                         ),
                     )
                     frame_id = cursor.lastrowid
@@ -459,7 +519,7 @@ class JobManager:
                 "stats": stats,
             })
 
-            del all_candidates, images_to_embed, embeddings, picks_300, runners_450, exact_frames_map, saved_records
+            del all_candidates, images_to_embed, embeddings, picks_300, runners_450, saved_records
             import gc
             gc.collect()
 
@@ -485,6 +545,7 @@ class JobManager:
         video_name = vid["name"] if vid else "Video"
 
         with self.db.write() as conn:
+            self._assert_no_active_job(video_id)
             cursor = conn.execute(
                 """
                 INSERT INTO jobs (type, video_id, chunk_id, status, progress, created_at)
@@ -501,7 +562,7 @@ class JobManager:
             "video_name": video_name,
             "chunk_id": None,
         })
-        self.executor.submit(self._run_openrouter_caption_job, job_id, video_id, options, video_name)
+        self.caption_executor.submit(self._run_openrouter_caption_job, job_id, video_id, options, video_name)
         return job_id
 
     def _run_openrouter_caption_job(self, job_id: int, video_id: str, options: dict[str, Any], video_name: str) -> None:
@@ -569,6 +630,9 @@ class JobManager:
             if not kept_frames:
                 raise RuntimeError("No approved frames found to caption.")
 
+            # Ensure all approved frames are decoded at native resolution before captioning (C1/H1)
+            ensure_native_frames(self.db, [item["id"] for item in kept_frames])
+
             total_frames = len(kept_frames)
             vslug = video["slug"]
             per_video_dir = self.settings.finished_dir / "per_video" / vslug
@@ -592,9 +656,13 @@ class JobManager:
 
             update_prog(0, f"Starting 3-Layer Cascade ({primary_model} ➜ {layer2_model} ➜ {layer3_model}) for {total_frames} frames...")
 
+            user_settings = merged_user_settings(self.db.get_setting("user_settings", {}))
+            concurrency = int(options.get("concurrency") or user_settings.get("openrouter_concurrency", 4))
+            openrouter_max_dim = int(options.get("max_dim") or user_settings.get("openrouter_max_dim", 512))
+
             async def process_all_async():
                 nonlocal l1_success_count, l2_success_count, l3_success_count, l1_refusals, l2_refusals, completed_count
-                sem = asyncio.Semaphore(4)
+                sem = asyncio.Semaphore(concurrency)
                 file_lock = asyncio.Lock()
 
                 async with httpx.AsyncClient() as client:
@@ -664,12 +732,20 @@ class JobManager:
                             if job_id in self._cancel_flags:
                                 return None
 
-                            img = cv2.imread(str(full_path))
-                            if img is None:
+                            raw_img = cv2.imread(str(full_path))
+                            if raw_img is None:
                                 return None
 
-                            # Snap to multiple of 16 for highest native quality
-                            img_snapped = snap_to_multiple_of_16(img)
+                            # Render export image with crop, letterbox, watermark, max_edge, and multiples of 16
+                            img_snapped = render_export_image(
+                                raw_img,
+                                crop=item.get("crop"),
+                                letterbox=video.get("letterbox"),
+                                watermark_rect=video.get("watermark_rect"),
+                                max_edge=int(user_settings.get("max_edge", 2048)),
+                            )
+                            if img_snapped is None:
+                                return None
                             h, w = img_snapped.shape[:2]
                             cv2.imwrite(str(out_png), img_snapped)
 
@@ -695,6 +771,7 @@ class JobManager:
                                     temperature=gemma_temp,
                                     top_p=top_p,
                                     reasoning_effort=l1_reasoning,
+                                    max_dim=openrouter_max_dim,
                                 )
                                 l1_success_count += 1
                             except ModelRefusalError:
@@ -713,6 +790,7 @@ class JobManager:
                                         temperature=deepseek_temp,
                                         top_p=top_p,
                                         reasoning_effort=None,
+                                        max_dim=openrouter_max_dim,
                                     )
                                     l2_success_count += 1
                                     caption_model_used = f"{layer2_model} (fallback from {primary_model})"
@@ -733,6 +811,7 @@ class JobManager:
                                         temperature=grok_temp,
                                         top_p=top_p,
                                         reasoning_effort=None,
+                                        max_dim=openrouter_max_dim,
                                     )
                                     l3_success_count += 1
                                     caption_model_used = f"{layer3_model} (fallback from {layer2_model} & {primary_model})"
@@ -772,8 +851,7 @@ class JobManager:
                                 "exported_at": time.time(),
                             }
                             async with file_lock:
-                                with open(manifest_path, "a", encoding="utf-8") as mf:
-                                    mf.write(json.dumps(manifest_entry) + "\n")
+                                append_manifest_record(manifest_path, manifest_entry)
                                 with self.db.write() as conn:
                                     conn.execute(
                                         """

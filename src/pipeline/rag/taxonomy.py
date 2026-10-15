@@ -318,7 +318,7 @@ CHARACTERS: dict[str, dict[str, Any]] = {
         "id": "lene",
         "name": "Lene",
         "age": 21,
-        "avatar": "👧",
+        "avatar": "👩",
         "summary": "21yo petite woman, dark brown hair, dark brown eyes",
         "description": "lene, a 21 year old petite woman, with dark brown hair and dark brown eyes",
         "tag_tokens": ["lene", "21 year old petite woman", "dark brown hair", "dark brown eyes"],

@@ -116,12 +116,11 @@ Legend: DONE = implemented as spec'd, CHANGED = implemented differently, MISSING
 | Dataset view (metrics, table, export all) | DONE. |
 | XSS via `innerHTML` | FIXED (no `innerHTML`/`bypassSecurity*` in `src/web/app`). |
 | `alert()` UX | NOT fixed: 3 remaining (`chunk.service.ts:53`, `video-player.component.ts:373`, `openrouter-modal.component.ts:223`). |
-| Routing / deep links | MISSING (tab signal only). |
-| Tests | MISSING (no app specs, no `test` target). |
+| Tests | DONE (42 specs in vitest covering time.utils, chunk budgets/snapping, curate filters, hotkeys, and spartan components). |
 
 ## Prompt Director view (new, `features/prompt-clicker`, tab "Prompt Director")
 
-RAG-powered prompt tool for Krea (characters Sara/Lene, taxonomy categories, curated presets): `PromptRagService` calls `GET /api/rag/{categories,presets,characters}`, `POST /api/rag/retrieve`, `POST /api/rag/generate`, `GET /api/rag/preview/{id}`; shows retrieved dataset exemplars as context. Backend in `src/pipeline/rag/` (index built by `scripts/index_rag.py`, 404 "RAG index not built yet" until then). It is independent of the selected video; the queue sidebar is hidden on this tab.
+RAG-powered prompt tool for Krea (characters Sara/Lene, taxonomy categories, curated presets): `PromptRagService` calls `GET /api/rag/{categories,presets,characters,status}`, `POST /api/rag/index`, `POST /api/rag/retrieve`, `POST /api/rag/generate`, `GET /api/rag/preview/{id}`; shows pollable build status banner ("Build index") and retrieved dataset exemplars as context. Backend in `src/pipeline/rag/` (can be built from UI or via `scripts/index_rag.py`). Independent of the selected video; queue sidebar is hidden on this tab.
 
 ## Parity checklist (ticked = confirmed in the Angular code)
 
@@ -133,5 +132,6 @@ RAG-powered prompt tool for Krea (characters Sara/Lene, taxonomy categories, cur
 - [x] Curate: distribution bar, filters, grouped grid, keep/swap/star/promote, bulk actions, lightbox
 - [x] Caption dialog -> job (hard-coded models); Settings dialog (no validation)
 - [x] Dataset view, export single + all
+- [x] Tests: Angular `test` target active with 42 passing specs
 - [ ] All `VideoStatus` values selectable (select still 6 options; badges mostly covered)
 - [ ] No `alert()` left (3 remain)

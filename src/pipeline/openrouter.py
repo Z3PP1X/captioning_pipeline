@@ -312,10 +312,11 @@ class OpenRouterCaptioner:
         temperature: float = 0.80,
         top_p: float = 0.90,
         reasoning_effort: str | None = None,
+        max_dim: int = 512,
     ) -> tuple[str, list[str]]:
 
-        """Sends single 512px frame to OpenRouter and returns sanitized caption + validation warnings."""
-        base64_img = self.prepare_512px_payload(img_bgr, max_dim=512)
+        """Sends single frame to OpenRouter and returns sanitized caption + validation warnings."""
+        base64_img = self.prepare_512px_payload(img_bgr, max_dim=max_dim)
         sys_prompt = self.load_system_prompt(mode, trigger, class_noun)
         payload = self.build_request_payload(
             base64_img,
@@ -334,20 +335,28 @@ class OpenRouterCaptioner:
             "X-Title": "Captioning Pipeline Local Extractor",
         }
 
-        # Send with retries on HTTP 429 and separate retries for cut-off captions
+        # Send with retries on HTTP 429/5xx/timeouts and separate retries for cut-off captions
         max_retries = 3
         backoff = 2.0
-        rate_limit_attempts = 0
+        retry_attempts = 0
         truncation_retries = 0
         min_words = MODE_WORD_RANGES.get(mode, MODE_WORD_RANGES["concept"])[0]
 
         while True:
-            resp = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                json=payload,
-                headers=headers,
-                timeout=60.0,
-            )
+            try:
+                resp = await client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    json=payload,
+                    headers=headers,
+                    timeout=60.0,
+                )
+            except (httpx.TimeoutException, httpx.NetworkError) as ex:
+                retry_attempts += 1
+                if retry_attempts >= max_retries:
+                    raise RuntimeError(f"OpenRouter network/timeout error after {max_retries} attempts: {ex}") from ex
+                await asyncio.sleep(backoff)
+                backoff *= 2.0
+                continue
 
             if resp.status_code == 200:
                 data = resp.json()
@@ -391,10 +400,10 @@ class OpenRouterCaptioner:
                         model=model,
                     )
                 raise RuntimeError(f"OpenRouter API Error {resp.status_code}: {err_text}")
-            elif resp.status_code == 429:
-                rate_limit_attempts += 1
-                if rate_limit_attempts >= max_retries:
-                    raise RuntimeError(f"OpenRouter Rate Limited (429): {resp.text}")
+            elif resp.status_code in (429, 500, 502, 503, 504):
+                retry_attempts += 1
+                if retry_attempts >= max_retries:
+                    raise RuntimeError(f"OpenRouter Transient Error ({resp.status_code}) after {max_retries} attempts: {resp.text}")
                 await asyncio.sleep(backoff)
                 backoff *= 2.0
             else:

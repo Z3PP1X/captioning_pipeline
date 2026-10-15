@@ -1,7 +1,23 @@
 import { ChangeDetectionStrategy, Component, computed, inject } from '@angular/core';
-import { FormsModule } from '@angular/forms';
 import { NgIcon, provideIcons } from '@ng-icons/core';
-import { lucideRefreshCw, lucideSearch } from '@ng-icons/lucide';
+import {
+  lucideRefreshCw,
+  lucideSearch,
+  lucideDownload,
+  lucideClock,
+  lucideMaximize2,
+  lucideFilm,
+  lucidePackage,
+  lucideAlertTriangle,
+  lucideLoader2,
+  lucideScissors,
+  lucideCircleDashed,
+  lucideListChecks,
+  lucideCaptions,
+  lucideCheck,
+  lucideSkipForward,
+  lucideBan,
+} from '@ng-icons/lucide';
 import { HlmButtonImports } from '@spartan-ng/helm/button';
 import { HlmBadgeImports } from '@spartan-ng/helm/badge';
 import { VideoService } from '../../core/services/video.service';
@@ -9,11 +25,31 @@ import { JobEventService } from '../../core/services/job-event.service';
 import { formatShortTime } from '../../core/utils/time.utils';
 import { Video } from '../../core/models/video.model';
 import { ActiveJob } from '../../core/models/job.model';
+import { videoStatusMeta, ALL_VIDEO_STATUSES, StatusMeta } from '../../core/ui/status';
 
 @Component({
   selector: 'app-video-queue',
-  imports: [FormsModule, NgIcon, HlmButtonImports, HlmBadgeImports],
-  providers: [provideIcons({ lucideRefreshCw, lucideSearch })],
+  imports: [NgIcon, HlmButtonImports, HlmBadgeImports],
+  providers: [
+    provideIcons({
+      lucideRefreshCw,
+      lucideSearch,
+      lucideDownload,
+      lucideClock,
+      lucideMaximize2,
+      lucideFilm,
+      lucidePackage,
+      lucideAlertTriangle,
+      lucideLoader2,
+      lucideScissors,
+      lucideCircleDashed,
+      lucideListChecks,
+      lucideCaptions,
+      lucideCheck,
+      lucideSkipForward,
+      lucideBan,
+    }),
+  ],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <aside class="flex w-72 md:w-80 flex-col border-r border-border bg-card shrink-0 h-full overflow-hidden select-none">
@@ -33,7 +69,7 @@ import { ActiveJob } from '../../core/models/job.model';
               title="Sync captions with finished folder"
               class="cursor-pointer"
             >
-              <span class="text-xs" title="Sync captions from final folder">📥</span>
+              <ng-icon name="lucideDownload" class="size-3.5" />
               <span class="sr-only">Sync Captions</span>
             </button>
             <button
@@ -60,8 +96,8 @@ import { ActiveJob } from '../../core/models/job.model';
           <ng-icon name="lucideSearch" class="absolute left-2.5 size-3.5 text-muted-foreground pointer-events-none" />
           <input
             type="text"
-            [ngModel]="videoService.searchQuery()"
-            (ngModelChange)="onSearchChange($event)"
+            [value]="videoService.searchQuery()"
+            (input)="onSearchChange($any($event.target).value)"
             placeholder="Search videos..."
             autocomplete="off"
             class="h-8 w-full rounded-md border border-input bg-background pl-8 pr-2.5 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
@@ -71,21 +107,17 @@ import { ActiveJob } from '../../core/models/job.model';
         <!-- Status Filter & Counter -->
         <div class="flex items-center justify-between gap-2">
           <select
-            [ngModel]="videoService.statusFilter()"
-            (ngModelChange)="onStatusChange($event)"
+            [value]="videoService.statusFilter()"
+            (change)="onStatusChange($any($event.target).value)"
             class="h-7 rounded-md border border-input bg-background px-2 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
           >
             <option value="">All Statuses</option>
-            <option value="new">New</option>
-            <option value="chunked">Chunked</option>
-            <option value="extracting">Extracting</option>
-            <option value="curating">Curating</option>
-            <option value="captioning">Captioning</option>
-            <option value="exported">Exported</option>
-            <option value="skipped">Skipped</option>
+            @for (s of statuses; track s.value) {
+              <option [value]="s.value">{{ s.label }}</option>
+            }
           </select>
 
-          <span class="text-[11px] font-medium text-muted-foreground">
+          <span class="text-xs font-medium text-muted-foreground">
             {{ videoService.filteredVideos().length }} videos
           </span>
         </div>
@@ -96,10 +128,16 @@ import { ActiveJob } from '../../core/models/job.model';
         @for (video of videoService.filteredVideos(); track video.id) {
           @let activeJob = getActiveJob(video.id);
           @let isSelected = videoService.currentVideo()?.id === video.id;
+          @let meta = getStatusMeta(video, activeJob);
 
           <div
             (click)="selectVideo(video.id)"
-            class="group relative flex flex-col gap-1 rounded-lg border p-2.5 transition-all cursor-pointer text-xs"
+            (keydown.enter)="selectVideo(video.id)"
+            (keydown.space)="selectVideo(video.id); $event.preventDefault()"
+            role="button"
+            tabindex="0"
+            [attr.aria-selected]="isSelected"
+            class="group relative flex flex-col gap-1 rounded-lg border p-2.5 transition-all cursor-pointer text-xs focus:outline-none focus:ring-2 focus:ring-ring"
             [class.border-primary]="isSelected"
             [class.bg-muted]="isSelected"
             [class.hover:bg-muted/60]="!isSelected"
@@ -115,19 +153,43 @@ import { ActiveJob } from '../../core/models/job.model';
                 {{ video.name }}
               </span>
               <span
-                class="shrink-0 px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wider"
-                [class]="getStatusBadgeClass(video, activeJob)"
+                hlmBadge
+                [variant]="meta.variant"
+                class="shrink-0 text-[11px] gap-1 font-medium"
               >
-                {{ getStatusText(video, activeJob) }}
+                <ng-icon
+                  [name]="meta.icon"
+                  class="size-3"
+                  [class.motion-safe:animate-spin]="meta.spin"
+                />
+                {{ meta.label }}
               </span>
             </div>
 
-            <!-- Card Meta: Duration, Dimensions, Chunks, Exports -->
-            <div class="flex items-center gap-2.5 text-[11px] text-muted-foreground">
-              <span>⏱️ {{ formatShortTime(video.duration) }}</span>
-              <span>📐 {{ video.width }}x{{ video.height }}</span>
-              <span>🎞️ {{ video.chunk_count || 0 }}c</span>
-              <span>📦 {{ video.export_count || 0 }}e</span>
+            <!-- Card Meta: Duration, Dimensions, Chunks, Exports, Kept -->
+            <div class="flex items-center flex-wrap gap-x-2.5 gap-y-1 text-xs text-muted-foreground">
+              <span class="inline-flex items-center gap-1">
+                <ng-icon name="lucideClock" class="size-3 text-muted-foreground" />
+                {{ formatShortTime(video.duration) }}
+              </span>
+              <span class="inline-flex items-center gap-1">
+                <ng-icon name="lucideMaximize2" class="size-3 text-muted-foreground" />
+                {{ video.width }}x{{ video.height }}
+              </span>
+              <span class="inline-flex items-center gap-1">
+                <ng-icon name="lucideFilm" class="size-3 text-muted-foreground" />
+                {{ video.chunk_count || 0 }}c
+              </span>
+              @if ((video.kept_count || 0) > 0) {
+                <span class="inline-flex items-center gap-1 text-foreground font-medium">
+                  <ng-icon name="lucideListChecks" class="size-3 text-success" />
+                  {{ video.kept_count }}/300
+                </span>
+              }
+              <span class="inline-flex items-center gap-1">
+                <ng-icon name="lucidePackage" class="size-3 text-muted-foreground" />
+                {{ video.export_count || 0 }}e
+              </span>
             </div>
 
             <!-- Extraction Progress Bar (if active job running) -->
@@ -139,9 +201,9 @@ import { ActiveJob } from '../../core/models/job.model';
                     [style.width.%]="activeJob.progress * 100"
                   ></div>
                 </div>
-                <div class="flex justify-between text-[10px] text-primary">
+                <div class="flex justify-between text-xs text-primary">
                   <span>{{ activeJob.step }}</span>
-                  <span>{{ Math.round(activeJob.progress * 100) }}%</span>
+                  <span class="tabular-nums">{{ Math.round(activeJob.progress * 100) }}%</span>
                 </div>
               </div>
             }
@@ -161,6 +223,7 @@ export class VideoQueueComponent {
 
   readonly formatShortTime = formatShortTime;
   readonly Math = Math;
+  readonly statuses = ALL_VIDEO_STATUSES;
 
   getActiveJob(videoId: string | number) {
     for (const job of this.jobEvents.activeJobs().values()) {
@@ -189,38 +252,7 @@ export class VideoQueueComponent {
     this.videoService.selectVideo(id);
   }
 
-  getStatusBadgeClass(video: Video, activeJob: ActiveJob | null): string {
-    if (video.broken) return 'bg-destructive/10 text-destructive border border-destructive/20';
-    if (activeJob) {
-      if (activeJob.type === 'openrouter_caption' || video.status === 'captioning') {
-        return 'bg-primary/20 text-primary border border-primary/30 animate-pulse';
-      }
-      return 'bg-amber-500/20 text-amber-500 border border-amber-500/30';
-    }
-    switch (video.status) {
-      case 'chunked':
-        return 'bg-warning/15 text-warning border border-warning/20';
-      case 'curating':
-      case 'curating_300':
-        return 'bg-info/15 text-info border border-info/20';
-      case 'captioning':
-        return 'bg-primary/15 text-primary border border-primary/20 animate-pulse';
-      case 'exported':
-        return 'bg-success/15 text-success border border-success/20';
-      default:
-        return 'bg-muted text-muted-foreground border border-border';
-    }
-  }
-
-  getStatusText(video: Video, activeJob: ActiveJob | null): string {
-    if (video.broken) return video.broken_reason || 'BROKEN';
-    if (activeJob) {
-      if (activeJob.type === 'openrouter_caption' || video.status === 'captioning') {
-        return 'CAPTIONING';
-      }
-      return 'EXTRACTING';
-    }
-    if (video.status === 'curating_300') return 'CURATING';
-    return (video.status || 'NEW').toUpperCase();
+  getStatusMeta(video: Video, activeJob: ActiveJob | null): StatusMeta {
+    return videoStatusMeta(video, activeJob);
   }
 }

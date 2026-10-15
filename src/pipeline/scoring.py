@@ -186,6 +186,8 @@ class ScoringEngine:
         candidates: list[dict[str, Any]],
         chunks: list[dict[str, Any]],
         target_total: int = 300,
+        category_quotas: dict[str, float] | None = None,
+        mmr_lambda: float = 0.65,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, float]]:
         """Reduces candidate pool (up to 750) down to the best target_total (300) frames.
         
@@ -198,6 +200,8 @@ class ScoringEngine:
             - Face >= 50% prioritized
         - High sharpness & quality
         - MMR visual and temporal diversity
+        - Redistributes budget shortfall when chunks have fewer frames than quota
+        - Ranks runners by quality score
         """
         if not candidates:
             return [], [], {}
@@ -229,13 +233,42 @@ class ScoringEngine:
             if cid in cands_by_chunk:
                 cands_by_chunk[cid].append(c)
 
+        # Redistribute budget shortfall (M5): if a chunk pool is smaller than its target,
+        # redistribute the deficit to chunks that have surplus candidates.
+        shortfall = 0
+        for ch in chunks:
+            cid = ch["id"]
+            pool_len = len(cands_by_chunk[cid])
+            if pool_len < chunk_targets[cid]:
+                shortfall += chunk_targets[cid] - pool_len
+                chunk_targets[cid] = pool_len
+
+        while shortfall > 0:
+            surplus_cids = [
+                ch["id"] for ch in chunks
+                if len(cands_by_chunk[ch["id"]]) > chunk_targets[ch["id"]]
+            ]
+            if not surplus_cids:
+                break
+            surplus_cids.sort(
+                key=lambda cid: len(cands_by_chunk[cid]) - chunk_targets[cid],
+                reverse=True,
+            )
+            chunk_targets[surplus_cids[0]] += 1
+            shortfall -= 1
+
         all_picks: list[dict[str, Any]] = []
         all_runners: list[dict[str, Any]] = []
 
-        # Target quota counts for global tracking
-        target_multiple = round(target_total * 0.50)
-        target_solo = round(target_total * 0.28)
-        target_tools_equip = round(target_total * 0.22)
+        # Target quota counts for global tracking (configurable via category_quotas)
+        quotas = category_quotas or {}
+        mult_quota = float(quotas.get("multiple_persons", 0.50))
+        solo_quota = float(quotas.get("one_person_min", 0.28))
+        tools_quota = float(quotas.get("tools_equipment_min", 0.22))
+
+        target_multiple = round(target_total * mult_quota)
+        target_solo = round(target_total * solo_quota)
+        target_tools_equip = round(target_total * tools_quota)
 
         curr_multiple = 0
         curr_solo = 0
@@ -305,7 +338,7 @@ class ScoringEngine:
                         if combined_sim > max_sim:
                             max_sim = combined_sim
 
-                    lam = 0.65
+                    lam = mmr_lambda
                     mmr_score = lam * cand_q - (1.0 - lam) * max_sim
 
                     if mmr_score > best_score:
@@ -335,11 +368,17 @@ class ScoringEngine:
                 p["state"] = "keep"
                 all_picks.append(p)
 
-            for i, cand in enumerate(c_pool):
-                if i not in selected_indices:
-                    cand["role"] = "runner_up"
-                    cand["state"] = "candidate"
-                    all_runners.append(cand)
+            # Rank runners by composite quality score descending so p.rank is meaningful (C2/H2)
+            unselected_cands = [cand for i, cand in enumerate(c_pool) if i not in selected_indices]
+            unselected_cands.sort(
+                key=lambda c: (c.get("scores") or {}).get("composite", c.get("composite", 0.0)),
+                reverse=True,
+            )
+            for runner_rank, cand in enumerate(unselected_cands):
+                cand["role"] = "runner_up"
+                cand["rank"] = runner_rank
+                cand["state"] = "candidate"
+                all_runners.append(cand)
 
         # 4. Cross-chunk near-duplicate deduplication pass
         from pipeline.metrics import phash_hamming_distance
@@ -366,6 +405,7 @@ class ScoringEngine:
                     cid = p2.get("chunk_id")
                     c_runners = runners_by_chunk.get(cid, [])
                     if c_runners:
+                        # Pick best ranked runner (C2)
                         replacement = c_runners.pop(0)
                         replacement["role"] = "pick"
                         replacement["rank"] = p2["rank"]
@@ -373,6 +413,8 @@ class ScoringEngine:
 
                         p2["role"] = "runner_up"
                         p2["state"] = "candidate"
+                        p2["rank"] = len(c_runners)
+                        c_runners.append(p2)
 
                         all_picks[j] = replacement
                         all_runners.append(p2)

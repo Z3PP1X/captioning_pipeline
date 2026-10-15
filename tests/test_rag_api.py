@@ -228,3 +228,14 @@ def test_unknown_api_route_is_json_404(rag_api: TestClient):
 def test_linter_flags_prohibited_terms_as_invalid():
     assert lint_prompt("photograph of a teen in rope", archetype="short")["is_valid"] is False
     assert lint_prompt("photograph of an adult woman in rope", archetype="short")["is_valid"] is True
+
+
+def test_max_per_source_capping(curated: Settings):
+    clf = FakeClassifier()
+    RagCaptionIndexer(curated, classifier=clf).build_index()
+    retriever = RagRetriever(curated, classifier=clf)
+    query = {"equipment": ["hemp_rope"]}
+    # With max_per_source=1, even if vid_a has multiple matching frames, only 1 should be picked
+    hits = retriever.retrieve(query, "", top_k=2, diversity=0.5, max_per_source=1)
+    vid_a_hits = [h for h in hits if "vid_a" in h["stem"]]
+    assert len(vid_a_hits) <= 1

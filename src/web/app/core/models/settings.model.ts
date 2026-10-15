@@ -5,4 +5,7 @@ export interface PipelineSettings {
   survivor_frac: number;
   trigger_word: string;
   max_edge: number;
+  snap_to_cuts?: boolean;
+  snap_window_s?: number;
+  suggest_min_len_s?: number;
 }

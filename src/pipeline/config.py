@@ -9,8 +9,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 VIDEO_EXT = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
 VIDEO_STATUSES = (
-    "new", "chunking", "extracting_750", "curating_300", "captioning",
-    "exported", "skipped", "ignored", "extracting", "curating"
+    "new", "chunked", "extracting_750", "curating_300", "captioning",
+    "exported", "skipped", "ignored", "extracting", "curating", "broken"
 )
 CHUNK_RULES = ("person", "equipment", "both", "either", "none")
 

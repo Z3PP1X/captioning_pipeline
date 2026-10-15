@@ -223,7 +223,10 @@ def test_suggest_on_curated_video_requires_confirmation(env, client, monkeypatch
 def _held_manager(db: DB, settings: Settings) -> tuple[JobManager, list]:
     jm = JobManager(db, settings)
     held: list = []
-    jm.executor.submit = lambda fn, *args: held.append((fn, args))
+    intercept = lambda fn, *args: held.append((fn, args))
+    jm.executor.submit = intercept
+    jm.decode_executor.submit = intercept
+    jm.caption_executor.submit = intercept
     return jm, held
 
 

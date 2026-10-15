@@ -3,6 +3,8 @@ import {
   ChangeDetectionStrategy,
   Component,
   ElementRef,
+  OnDestroy,
+  OnInit,
   ViewChild,
   computed,
   effect,
@@ -10,7 +12,6 @@ import {
   output,
   signal,
 } from '@angular/core';
-import { FormsModule } from '@angular/forms';
 import { NgIcon, provideIcons } from '@ng-icons/core';
 import {
   lucidePlay,
@@ -18,16 +19,19 @@ import {
   lucideChevronLeft,
   lucideChevronRight,
   lucideSparkles,
+  lucideTag,
 } from '@ng-icons/lucide';
 import { HlmButtonImports } from '@spartan-ng/helm/button';
 import { VideoService } from '../../core/services/video.service';
 import { ChunkService } from '../../core/services/chunk.service';
+import { HotkeyService } from '../../core/services/hotkey.service';
+import { JobEventService } from '../../core/services/job-event.service';
 import { formatTime, formatShortTime, parseTimestamp } from '../../core/utils/time.utils';
 import { WatermarkRect } from '../../core/models/video.model';
 
 @Component({
   selector: 'app-video-player',
-  imports: [FormsModule, NgIcon, HlmButtonImports],
+  imports: [NgIcon, HlmButtonImports],
   providers: [
     provideIcons({
       lucidePlay,
@@ -35,6 +39,7 @@ import { WatermarkRect } from '../../core/models/video.model';
       lucideChevronLeft,
       lucideChevronRight,
       lucideSparkles,
+      lucideTag,
     }),
   ],
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -44,7 +49,7 @@ import { WatermarkRect } from '../../core/models/video.model';
   template: `
     <div class="flex flex-col w-full bg-card rounded-xl border border-border overflow-hidden shadow-xs">
       <!-- Player Video & Watermark Canvas Stage -->
-      <div class="relative w-full aspect-video max-h-[500px] bg-black flex items-center justify-center overflow-hidden">
+      <div class="relative w-full aspect-video max-h-[500px] bg-secondary flex items-center justify-center overflow-hidden">
         <video
           #videoEl
           class="max-w-full max-h-full object-contain cursor-pointer"
@@ -69,20 +74,28 @@ import { WatermarkRect } from '../../core/models/video.model';
         ></canvas>
 
         @if (isDrawingWatermark()) {
-          <div class="absolute top-3 left-3 bg-destructive/90 text-destructive-foreground px-3 py-1.5 rounded-md text-xs font-semibold shadow-md flex items-center gap-2">
-            <span>Draw exclusion rectangle on video</span>
-            <button
-              (click)="clearWatermark()"
-              class="underline hover:text-white ml-2 text-[11px]"
-            >
-              Clear
-            </button>
-            <button
-              (click)="toggleWatermarkMode()"
-              class="underline hover:text-white text-[11px]"
-            >
-              Done
-            </button>
+          <div class="absolute top-3 left-3 right-3 z-20 flex items-center justify-between rounded-lg border border-info/40 bg-card/95 text-foreground px-3 py-1.5 text-xs shadow-lg animate-in fade-in">
+            <div class="flex items-center gap-1.5 font-medium text-info">
+              <ng-icon name="lucideSparkles" class="size-3.5" />
+              <span>Draw Watermark Exclusion Box (Click & Drag on video)</span>
+            </div>
+            <div class="flex items-center gap-2">
+              <button
+                (click)="clearWatermark()"
+                class="hover:underline text-xs text-muted-foreground hover:text-foreground cursor-pointer"
+              >
+                Clear
+              </button>
+              <button
+                hlmBtn
+                variant="outline"
+                size="xs"
+                (click)="toggleWatermarkMode()"
+                class="h-6 cursor-pointer"
+              >
+                Done
+              </button>
+            </div>
           </div>
         }
       </div>
@@ -93,11 +106,11 @@ import { WatermarkRect } from '../../core/models/video.model';
         <div class="flex flex-wrap items-center gap-2">
           <button
             hlmBtn
-            variant="default"
+            variant="ghost"
             size="icon"
             (click)="togglePlayPause()"
             title="Play/Pause (Space)"
-            class="size-8 cursor-pointer"
+            class="size-8 cursor-pointer border border-border hover:bg-muted"
           >
             @if (isPlaying()) {
               <ng-icon name="lucidePause" class="size-4" />
@@ -107,19 +120,21 @@ import { WatermarkRect } from '../../core/models/video.model';
           </button>
 
           <!-- Timecode Display -->
-          <div class="font-mono text-xs font-medium px-2 py-1 rounded bg-muted text-foreground tabular-nums">
+          <div class="text-xs font-medium px-2 py-1 rounded-md bg-muted text-foreground tabular-nums">
             <span>{{ formatTime(currentTime()) }}</span> / <span>{{ formatTime(duration()) }}</span>
           </div>
 
           <!-- Jump Input -->
           <div class="flex items-center gap-1">
             <input
+              #jumpInput
               type="text"
-              [(ngModel)]="jumpInputStr"
+              [value]="jumpInputStr()"
+              (input)="jumpInputStr.set($any($event.target).value)"
               (keydown.enter)="executeJump()"
               placeholder="Jump (e.g. 14:30)"
               title="Timestamp (MM:SS or seconds) Hotkey: G"
-              class="h-7 w-24 rounded border border-input bg-background px-2 text-xs text-foreground focus:ring-1 focus:ring-ring"
+              class="h-7 w-24 rounded-md border border-input bg-background px-2 text-xs text-foreground focus:ring-1 focus:ring-ring tabular-nums"
             />
             <button
               hlmBtn
@@ -136,28 +151,28 @@ import { WatermarkRect } from '../../core/models/video.model';
           <div class="flex items-center rounded-md border border-border overflow-hidden">
             <button
               (click)="jumpDelta(-60)"
-              class="px-1.5 py-1 hover:bg-muted text-[11px] font-mono text-muted-foreground border-r border-border"
+              class="px-1.5 py-1 hover:bg-muted text-xs text-muted-foreground border-r border-border tabular-nums"
               title="-60s (Ctrl+Left)"
             >
               -60s
             </button>
             <button
               (click)="jumpDelta(-10)"
-              class="px-1.5 py-1 hover:bg-muted text-[11px] font-mono text-muted-foreground border-r border-border"
+              class="px-1.5 py-1 hover:bg-muted text-xs text-muted-foreground border-r border-border tabular-nums"
               title="-10s (Shift+Left)"
             >
               -10s
             </button>
             <button
               (click)="jumpDelta(10)"
-              class="px-1.5 py-1 hover:bg-muted text-[11px] font-mono text-muted-foreground border-r border-border"
+              class="px-1.5 py-1 hover:bg-muted text-xs text-muted-foreground border-r border-border tabular-nums"
               title="+10s (Shift+Right)"
             >
               +10s
             </button>
             <button
               (click)="jumpDelta(60)"
-              class="px-1.5 py-1 hover:bg-muted text-[11px] font-mono text-muted-foreground"
+              class="px-1.5 py-1 hover:bg-muted text-xs text-muted-foreground tabular-nums"
               title="+60s (Ctrl+Right)"
             >
               +60s
@@ -199,7 +214,7 @@ import { WatermarkRect } from '../../core/models/video.model';
             title="Set In-Point ([ or I)"
             class="cursor-pointer"
           >
-            [ In <span class="font-mono ml-1 text-primary">{{ formatShortTime(chunkService.inPoint()) }}</span>
+            [ In <span class="ml-1 font-semibold text-foreground tabular-nums">{{ formatShortTime(chunkService.inPoint()) }}</span>
           </button>
           <button
             hlmBtn
@@ -209,17 +224,17 @@ import { WatermarkRect } from '../../core/models/video.model';
             title="Set Out-Point (] or O)"
             class="cursor-pointer"
           >
-            ] Out <span class="font-mono ml-1 text-primary">{{ formatShortTime(chunkService.outPoint()) }}</span>
+            ] Out <span class="ml-1 font-semibold text-foreground tabular-nums">{{ formatShortTime(chunkService.outPoint()) }}</span>
           </button>
           <button
             hlmBtn
-            variant="default"
+            variant="secondary"
             size="sm"
             (click)="addChunk()"
             title="Add Scene Chunk (Enter)"
             class="cursor-pointer font-semibold"
           >
-            + Add Chunk <kbd class="ml-1 text-[10px] opacity-75">↵</kbd>
+            + Add Chunk <kbd class="ml-1 text-xs opacity-75">↵</kbd>
           </button>
         </div>
 
@@ -228,16 +243,16 @@ import { WatermarkRect } from '../../core/models/video.model';
           <label class="flex items-center gap-1.5 cursor-pointer text-xs text-foreground">
             <input
               type="checkbox"
-              [ngModel]="chunkService.snapCuts()"
-              (ngModelChange)="chunkService.snapCuts.set($event)"
+              [checked]="chunkService.snapCuts()"
+              (change)="chunkService.snapCuts.set($any($event.target).checked)"
               class="rounded border-input text-primary focus:ring-ring"
             />
-            <span>Snap Cuts <kbd class="font-mono text-[10px] text-muted-foreground">C</kbd></span>
+            <span>Snap Cuts <kbd class="text-xs text-muted-foreground">C</kbd></span>
           </label>
 
           <select
-            [(ngModel)]="playbackSpeed"
-            (ngModelChange)="onSpeedChange($event)"
+            [value]="playbackSpeed()"
+            (change)="onSpeedChange(+$any($event.target).value)"
             class="h-7 rounded border border-input bg-background px-1.5 text-xs text-foreground focus:ring-1 focus:ring-ring"
           >
             <option [value]="0.25">0.25×</option>
@@ -252,25 +267,29 @@ import { WatermarkRect } from '../../core/models/video.model';
 
           <button
             hlmBtn
-            [variant]="isDrawingWatermark() ? 'destructive' : 'outline'"
+            [variant]="isDrawingWatermark() ? 'secondary' : 'outline'"
             size="sm"
             (click)="toggleWatermarkMode()"
             title="Draw exclusion rectangle for watermarks"
-            class="cursor-pointer"
+            class="cursor-pointer gap-1.5"
           >
-            🏷️ Watermark Rect
+            <ng-icon name="lucideTag" class="size-3.5" />
+            <span>Watermark Rect</span>
           </button>
         </div>
       </div>
     </div>
   `,
 })
-export class VideoPlayerComponent implements AfterViewInit {
+export class VideoPlayerComponent implements OnInit, AfterViewInit, OnDestroy {
   readonly videoService = inject(VideoService);
   readonly chunkService = inject(ChunkService);
+  private readonly hotkeys = inject(HotkeyService);
+  private readonly jobEvents = inject(JobEventService);
 
   @ViewChild('videoEl') videoElRef!: ElementRef<HTMLVideoElement>;
   @ViewChild('watermarkCanvas') canvasRef!: ElementRef<HTMLCanvasElement>;
+  @ViewChild('jumpInput') jumpInputRef?: ElementRef<HTMLInputElement>;
 
   readonly timeChange = output<number>();
 
@@ -279,13 +298,14 @@ export class VideoPlayerComponent implements AfterViewInit {
   readonly duration = signal<number>(0);
   readonly isDrawingWatermark = signal<boolean>(false);
 
-  jumpInputStr = '';
-  playbackSpeed = 1.0;
+  readonly jumpInputStr = signal<string>('');
+  readonly playbackSpeed = signal<number>(1.0);
 
   private isDragging = false;
   private dragStartX = 0;
   private dragStartY = 0;
   private currentRect: WatermarkRect | null = null;
+  private unregisterHotkeys: (() => void)[] = [];
 
   readonly formatTime = formatTime;
   readonly formatShortTime = formatShortTime;
@@ -302,6 +322,37 @@ export class VideoPlayerComponent implements AfterViewInit {
         this.drawWatermarkCanvas();
       }
     });
+  }
+
+  ngOnInit(): void {
+    this.unregisterHotkeys.push(
+      this.hotkeys.register('play_pause', () => this.togglePlayPause()),
+      this.hotkeys.register('frame_back', () => this.stepFrame(-1)),
+      this.hotkeys.register('frame_fwd', () => this.stepFrame(1)),
+      this.hotkeys.register('seek_back_1', () => this.jumpDelta(-1)),
+      this.hotkeys.register('seek_fwd_1', () => this.jumpDelta(1)),
+      this.hotkeys.register('seek_back_10', () => this.jumpDelta(-10)),
+      this.hotkeys.register('seek_fwd_10', () => this.jumpDelta(10)),
+      this.hotkeys.register('seek_back_60', () => this.jumpDelta(-60)),
+      this.hotkeys.register('seek_fwd_60', () => this.jumpDelta(60)),
+      this.hotkeys.register('mark_in', () => this.markIn()),
+      this.hotkeys.register('mark_out', () => this.markOut()),
+      this.hotkeys.register('add_chunk', () => this.addChunk()),
+      this.hotkeys.register('toggle_snap_cuts', () =>
+        this.chunkService.snapCuts.set(!this.chunkService.snapCuts())
+      ),
+      this.hotkeys.register('jump_focus', () => {
+        this.jumpInputRef?.nativeElement?.focus();
+        this.jumpInputRef?.nativeElement?.select();
+      })
+    );
+  }
+
+  ngOnDestroy(): void {
+    for (const unreg of this.unregisterHotkeys) {
+      unreg();
+    }
+    this.unregisterHotkeys = [];
   }
 
   ngAfterViewInit(): void {
@@ -345,10 +396,10 @@ export class VideoPlayerComponent implements AfterViewInit {
   }
 
   executeJump(): void {
-    const parsed = parseTimestamp(this.jumpInputStr);
+    const parsed = parseTimestamp(this.jumpInputStr());
     if (parsed !== null) {
       this.seek(parsed);
-      this.jumpInputStr = '';
+      this.jumpInputStr.set('');
     }
   }
 
@@ -370,7 +421,12 @@ export class VideoPlayerComponent implements AfterViewInit {
     if (inP !== null && outP !== null && outP > inP) {
       this.chunkService.addChunk(inP, outP);
     } else {
-      alert('Please set both valid In and Out points first (Out > In).');
+      this.jobEvents.showToast(
+        'Invalid In/Out Points',
+        'Please set both valid In and Out points first (Out > In).',
+        null,
+        true
+      );
     }
   }
 
@@ -387,7 +443,7 @@ export class VideoPlayerComponent implements AfterViewInit {
   }
 
   onSpeedChange(speed: number): void {
-    this.playbackSpeed = speed;
+    this.playbackSpeed.set(speed);
     this.videoElRef.nativeElement.playbackRate = speed;
   }
 
@@ -462,7 +518,7 @@ export class VideoPlayerComponent implements AfterViewInit {
     const pw = r.width * canvas.width;
     const ph = r.height * canvas.height;
 
-    ctx.strokeStyle = '#D73816'; // primary brand accent
+    ctx.strokeStyle = '#D73816';
     ctx.lineWidth = 2;
     ctx.setLineDash([4, 4]);
     ctx.strokeRect(px, py, pw, ph);

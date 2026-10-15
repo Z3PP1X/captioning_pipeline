@@ -1,7 +1,6 @@
-import { ChangeDetectionStrategy, Component, inject, output } from '@angular/core';
-import { FormsModule } from '@angular/forms';
+import { ChangeDetectionStrategy, Component, inject, output, signal } from '@angular/core';
 import { NgIcon, provideIcons } from '@ng-icons/core';
-import { lucideZap, lucideCheck, lucideX, lucideEye, lucideRefreshCw } from '@ng-icons/lucide';
+import { lucideZap, lucideCheck, lucideX, lucideEye, lucideRefreshCw, lucideAlertTriangle } from '@ng-icons/lucide';
 import { HlmButtonImports } from '@spartan-ng/helm/button';
 import { CurateService } from '../../core/services/curate.service';
 import { VideoService } from '../../core/services/video.service';
@@ -9,8 +8,8 @@ import { ChunkService } from '../../core/services/chunk.service';
 
 @Component({
   selector: 'app-curate-toolbar',
-  imports: [FormsModule, NgIcon, HlmButtonImports],
-  providers: [provideIcons({ lucideZap, lucideCheck, lucideX, lucideEye, lucideRefreshCw })],
+  imports: [NgIcon, HlmButtonImports],
+  providers: [provideIcons({ lucideZap, lucideCheck, lucideX, lucideEye, lucideRefreshCw, lucideAlertTriangle })],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div class="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-card p-3 shadow-xs select-none">
@@ -28,8 +27,8 @@ import { ChunkService } from '../../core/services/chunk.service';
       <div class="flex flex-wrap items-center gap-2 text-xs">
         <!-- Chunk Filter -->
         <select
-          [ngModel]="curateService.curateChunkFilter()"
-          (ngModelChange)="curateService.curateChunkFilter.set($event)"
+          [value]="curateService.curateChunkFilter()"
+          (change)="curateService.curateChunkFilter.set($any($event.target).value)"
           class="h-8 rounded-md border border-input bg-background px-2 text-xs text-foreground focus:ring-1 focus:ring-ring"
         >
           <option value="all">All Chunks</option>
@@ -40,8 +39,8 @@ import { ChunkService } from '../../core/services/chunk.service';
 
         <!-- Role Filter -->
         <select
-          [ngModel]="curateService.curateRoleFilter()"
-          (ngModelChange)="curateService.curateRoleFilter.set($event)"
+          [value]="curateService.curateRoleFilter()"
+          (change)="curateService.curateRoleFilter.set($any($event.target).value)"
           class="h-8 rounded-md border border-input bg-background px-2 text-xs text-foreground focus:ring-1 focus:ring-ring"
         >
           <option value="all">All Roles</option>
@@ -51,8 +50,8 @@ import { ChunkService } from '../../core/services/chunk.service';
 
         <!-- State Filter -->
         <select
-          [ngModel]="curateService.curateStateFilter()"
-          (ngModelChange)="curateService.curateStateFilter.set($event)"
+          [value]="curateService.curateStateFilter()"
+          (change)="curateService.curateStateFilter.set($any($event.target).value)"
           class="h-8 rounded-md border border-input bg-background px-2 text-xs text-foreground focus:ring-1 focus:ring-ring"
         >
           <option value="all">All States</option>
@@ -64,7 +63,7 @@ import { ChunkService } from '../../core/services/chunk.service';
         <!-- Toggle Candidate Pool -->
         <button
           hlmBtn
-          [variant]="curateService.showRunnerUps() ? 'default' : 'outline'"
+          [variant]="curateService.showRunnerUps() ? 'secondary' : 'outline'"
           size="xs"
           (click)="toggleCandidatePool()"
           title="Toggle viewing all 450 candidate pool frames"
@@ -79,11 +78,25 @@ import { ChunkService } from '../../core/services/chunk.service';
           hlmBtn
           variant="outline"
           size="xs"
-          (click)="onKeepAll()"
+          (click)="confirmAction.set('keep_all')"
+          [disabled]="!videoService.currentVideo() || curateService.candidates().length === 0"
           class="h-8 cursor-pointer gap-1"
         >
-          <ng-icon name="lucideCheck" class="size-3.5 text-success" />
+          <ng-icon name="lucideCheck" class="size-3.5" />
           <span>Keep All Picks</span>
+        </button>
+
+        <!-- Bulk Reject All -->
+        <button
+          hlmBtn
+          variant="outline"
+          size="xs"
+          (click)="confirmAction.set('reject_all')"
+          [disabled]="!videoService.currentVideo() || curateService.candidates().length === 0"
+          class="h-8 cursor-pointer gap-1 text-muted-foreground hover:text-destructive"
+        >
+          <ng-icon name="lucideX" class="size-3.5" />
+          <span>Reject All</span>
         </button>
 
         <!-- Sync Captions with Final Folder -->
@@ -102,21 +115,73 @@ import { ChunkService } from '../../core/services/chunk.service';
       </div>
 
       <!-- Right: Open VLM Captioning Modal -->
-      <div>
+      <div class="flex flex-col items-end">
         <button
           hlmBtn
           variant="default"
           size="sm"
           (click)="openVlmModal.emit()"
           [disabled]="!videoService.currentVideo() || curateService.candidates().length === 0"
+          aria-describedby="vlm-disabled-reason"
           title="Launch OpenRouter 3-layer VLM cascade captioning"
           class="cursor-pointer gap-1.5 font-bold"
         >
           <ng-icon name="lucideZap" class="size-3.5" />
           <span>VLM Captioning (Cascade)</span>
         </button>
+        @if (!videoService.currentVideo()) {
+          <span id="vlm-disabled-reason" class="text-xs text-muted-foreground mt-0.5">Select a video first</span>
+        } @else if (curateService.candidates().length === 0) {
+          <span id="vlm-disabled-reason" class="text-xs text-muted-foreground mt-0.5">Extract candidates before captioning</span>
+        }
       </div>
     </div>
+
+    <!-- Bulk confirmation dialog -->
+    @if (confirmAction()) {
+      <div class="fixed inset-0 z-50 flex items-center justify-center bg-secondary/80 backdrop-blur-xs p-4 animate-in fade-in select-none">
+        <div class="relative w-full max-w-md rounded-xl border border-border bg-card p-6 shadow-2xl flex flex-col gap-4">
+          <div class="flex items-center gap-2">
+            <ng-icon
+              [name]="confirmAction() === 'reject_all' ? 'lucideAlertTriangle' : 'lucideCheck'"
+              [class]="confirmAction() === 'reject_all' ? 'size-5 text-destructive' : 'size-5 text-primary'"
+            />
+            <h3 class="font-sans font-bold text-base text-foreground">
+              {{ confirmAction() === 'reject_all' ? 'Reject All Candidates?' : 'Keep All Picks?' }}
+            </h3>
+          </div>
+
+          <p class="text-xs text-muted-foreground leading-relaxed">
+            @if (confirmAction() === 'reject_all') {
+              Are you sure you want to mark all candidates for this video as rejected? You will need to manually re-select or re-extract candidates.
+            } @else {
+              Set all curated picks in this video to "Keep"? This accepts all 300 target frames into the dataset.
+            }
+          </p>
+
+          <div class="flex items-center justify-end gap-2 pt-2 border-t border-border">
+            <button
+              hlmBtn
+              variant="outline"
+              size="sm"
+              (click)="confirmAction.set(null)"
+              class="cursor-pointer"
+            >
+              Cancel
+            </button>
+            <button
+              hlmBtn
+              [variant]="confirmAction() === 'reject_all' ? 'destructive' : 'default'"
+              size="sm"
+              (click)="executeConfirmAction()"
+              class="cursor-pointer font-bold"
+            >
+              {{ confirmAction() === 'reject_all' ? 'Reject All' : 'Confirm Keep All' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    }
   `,
 })
 export class CurateToolbarComponent {
@@ -125,6 +190,7 @@ export class CurateToolbarComponent {
   readonly chunkService = inject(ChunkService);
 
   readonly openVlmModal = output<void>();
+  readonly confirmAction = signal<'keep_all' | 'reject_all' | null>(null);
 
   toggleCandidatePool(): void {
     this.curateService.showRunnerUps.update((v) => !v);
@@ -138,16 +204,15 @@ export class CurateToolbarComponent {
     }
   }
 
-  async onKeepAll(): Promise<void> {
+  async executeConfirmAction(): Promise<void> {
+    const action = this.confirmAction();
     const video = this.videoService.currentVideo();
-    if (video) {
-      await this.curateService.bulkKeepAll(video.id);
-    }
-  }
+    this.confirmAction.set(null);
+    if (!video) return;
 
-  async onRejectAll(): Promise<void> {
-    const video = this.videoService.currentVideo();
-    if (video) {
+    if (action === 'keep_all') {
+      await this.curateService.bulkKeepAll(video.id);
+    } else if (action === 'reject_all') {
       await this.curateService.bulkRejectAll(video.id);
     }
   }

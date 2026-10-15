@@ -56,7 +56,6 @@ def sample_chunk_frames(
 
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
-        stream.thread_type = "AUTO"
         tb = stream.time_base
 
         # Seek to keyframe just before start_s
@@ -95,8 +94,13 @@ def sample_chunk_frames(
 def decode_exact_frames(
     path: Path,
     timestamps: list[float],
+    on_frame: Any = None,
 ) -> dict[float, np.ndarray]:
-    """Fast cluster-seek and exact decode for multiple target timestamps at full native resolution."""
+    """Fast cluster-seek and exact decode for multiple target timestamps at full native resolution.
+    
+    If on_frame callback is provided, on_frame(target_t, img_bgr) is called for each decoded frame,
+    and the frame is not accumulated in the return dictionary (keeping memory minimal).
+    """
     if not timestamps:
         return {}
 
@@ -114,7 +118,6 @@ def decode_exact_frames(
 
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
-        stream.thread_type = "AUTO"
         tb = stream.time_base
 
         for cluster in clusters:
@@ -147,14 +150,94 @@ def decode_exact_frames(
 
     results: dict[float, np.ndarray] = {}
     for tgt, (diff, img) in best_matches.items():
+        if img is None:
+            img = decode_exact_frame(path, tgt)
         if img is not None:
-            results[tgt] = img
-        else:
-            fallback = decode_exact_frame(path, tgt)
-            if fallback is not None:
-                results[tgt] = fallback
+            if on_frame is not None and callable(on_frame):
+                on_frame(tgt, img)
+            else:
+                results[tgt] = img
 
     return results
+
+
+def ensure_native_frame(db: Any, frame_id: int) -> bool:
+    """Ensure a frame has been decoded at full native resolution and saved to full_path.
+    If frame.native == 1, already native.
+    If frame.native == 0, re-decodes from the source video, writes full_path, and updates native=1."""
+    row = db.one(
+        """
+        SELECT f.id, f.t, f.full_path, f.native, v.path as video_path
+        FROM frames f
+        JOIN videos v ON f.video_id = v.id
+        WHERE f.id = ?
+        """,
+        (frame_id,),
+    )
+    if not row:
+        return False
+    if row.get("native") == 1:
+        return True
+
+    vpath = Path(row["video_path"])
+    if not vpath.is_file():
+        return False
+
+    img = decode_exact_frame(vpath, float(row["t"]))
+    if img is None:
+        return False
+
+    out_path = Path(row["full_path"])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out_path), img)
+    with db.write() as conn:
+        conn.execute("UPDATE frames SET native=1 WHERE id=?", (frame_id,))
+    return True
+
+
+def ensure_native_frames(db: Any, frame_ids: list[int]) -> int:
+    """Batch re-decodes native frames for any frames in frame_ids that currently have native=0."""
+    if not frame_ids:
+        return 0
+    placeholders = ",".join("?" for _ in frame_ids)
+    rows = db.all(
+        f"""
+        SELECT f.id, f.t, f.full_path, f.native, f.video_id, v.path as video_path
+        FROM frames f
+        JOIN videos v ON f.video_id = v.id
+        WHERE f.id IN ({placeholders}) AND f.native = 0
+        """,
+        tuple(frame_ids),
+    )
+    if not rows:
+        return 0
+
+    by_video: dict[str, list[dict]] = {}
+    for r in rows:
+        by_video.setdefault(r["video_path"], []).append(r)
+
+    updated_ids: list[int] = []
+    for vpath_str, vrows in by_video.items():
+        vpath = Path(vpath_str)
+        if not vpath.is_file():
+            continue
+        ts_map = {float(r["t"]): r for r in vrows}
+
+        def write_frame(t: float, img: np.ndarray):
+            r = ts_map.get(t)
+            if r:
+                out_p = Path(r["full_path"])
+                out_p.parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(out_p), img)
+                updated_ids.append(r["id"])
+
+        decode_exact_frames(vpath, list(ts_map.keys()), on_frame=write_frame)
+
+    if updated_ids:
+        with db.write() as conn:
+            up_ph = ",".join("?" for _ in updated_ids)
+            conn.execute(f"UPDATE frames SET native=1 WHERE id IN ({up_ph})", tuple(updated_ids))
+    return len(updated_ids)
 
 
 def decode_exact_frame(path: Path, target_t: float) -> np.ndarray | None:
@@ -162,7 +245,6 @@ def decode_exact_frame(path: Path, target_t: float) -> np.ndarray | None:
     try:
         with av.open(str(path)) as container:
             stream = container.streams.video[0]
-            stream.thread_type = "AUTO"
             tb = stream.time_base
 
             seek_pts = int(max(0.0, target_t - 0.5) / tb)

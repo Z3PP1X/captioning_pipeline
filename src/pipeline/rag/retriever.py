@@ -17,6 +17,16 @@ from pipeline.rag.taxonomy import TAXONOMY_CATEGORIES
 logger = logging.getLogger(__name__)
 
 
+def extract_source_id(stem: str) -> str:
+    """Extracts source video name from candidate stem (e.g. 'vid_a_0001' -> 'vid_a')."""
+    if "_frame_" in stem:
+        return stem.split("_frame_")[0]
+    parts = stem.rsplit("_", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return parts[0]
+    return stem
+
+
 class RagIndexNotReady(FileNotFoundError):
     """Raised when the RAG index has not been built (or is empty)."""
 
@@ -130,16 +140,20 @@ class RagRetriever:
         top_k: int,
         lambda_: float,
         dup_threshold: float = 0.98,
+        sources: list[str] | None = None,
+        max_per_source: int | None = None,
     ) -> list[int]:
         """Maximal Marginal Relevance: trade relevance against similarity to already chosen exemplars.
 
         Candidates whose cosine similarity to a chosen exemplar exceeds ``dup_threshold`` are treated as
-        duplicates and only used if nothing else is left (CLIP text similarities are uniformly high, so
-        the MMR penalty alone does not separate identical captions).
+        duplicates and only used if nothing else is left. If ``max_per_source`` is set, candidates from
+        the same source video are capped to promote diversity across different videos.
         """
         selected: list[int] = []
         remaining = list(candidate_idx)
         duplicates: list[int] = []
+        source_counts: dict[str, int] = {}
+
         while remaining and len(selected) < top_k:
             if not selected:
                 best = remaining[0]
@@ -154,9 +168,24 @@ class RagRetriever:
                     break
                 max_sim = max_sim[~is_dup]
                 mmr = lambda_ * relevance[remaining] - (1.0 - lambda_) * max_sim
-                best = remaining[int(np.argmax(mmr))]
+
+                # If source capping is active, filter candidates under cap
+                if sources is not None and max_per_source is not None and max_per_source > 0:
+                    avail_mask = np.array([source_counts.get(sources[i], 0) < max_per_source for i in remaining])
+                    if np.any(avail_mask):
+                        masked_mmr = np.where(avail_mask, mmr, -np.inf)
+                        best = remaining[int(np.argmax(masked_mmr))]
+                    else:
+                        best = remaining[int(np.argmax(mmr))]
+                else:
+                    best = remaining[int(np.argmax(mmr))]
+
             selected.append(best)
+            if sources is not None:
+                src = sources[best]
+                source_counts[src] = source_counts.get(src, 0) + 1
             remaining.remove(best)
+
         # Back-fill with duplicates (by relevance) only when the pool is exhausted
         for i in sorted(duplicates, key=lambda j: -relevance[j]):
             if len(selected) >= top_k:
@@ -170,10 +199,12 @@ class RagRetriever:
         user_description: str = "",
         top_k: int = 4,
         diversity: float = 0.7,
+        max_per_source: int | None = None,
     ) -> list[dict[str, Any]]:
         """Executes hybrid retrieval over dataset captions.
 
         ``diversity`` is the MMR lambda (1.0 = pure relevance, lower = more varied exemplars).
+        ``max_per_source`` caps exemplars from the same source video/directory.
         """
         captions, embeddings = self._ensure_loaded()
         total_items = len(captions)
@@ -244,8 +275,11 @@ class RagRetriever:
         # 5. Top-K ranking, re-ranked with MMR over a relevance pool so exemplars are not near-duplicates
         top_k = max(1, int(top_k))
         pool = np.argsort(-hybrid_scores)[: max(top_k * 8, 32)]
+        sources = [extract_source_id(c.get("stem", "")) for c in captions]
         if 0.0 < diversity < 1.0 and len(pool) > top_k:
-            ranked_indices = self._mmr_select(pool, hybrid_scores, embeddings, top_k, diversity)
+            ranked_indices = self._mmr_select(
+                pool, hybrid_scores, embeddings, top_k, diversity, sources=sources, max_per_source=max_per_source
+            )
         else:
             ranked_indices = list(pool[:top_k])
 

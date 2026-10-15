@@ -1,4 +1,5 @@
 import { Injectable, inject } from '@angular/core';
+import { CurateService } from './curate.service';
 
 export type HotkeyAction =
   | 'play_pause'
@@ -19,12 +20,15 @@ export type HotkeyAction =
   | 'keep'
   | 'reject'
   | 'star'
-  | 'escape';
+  | 'escape'
+  | 'lightbox_prev'
+  | 'lightbox_next';
 
 @Injectable({
   providedIn: 'root',
 })
 export class HotkeyService {
+  private readonly curateService = inject(CurateService);
   private handlers = new Map<HotkeyAction, () => void>();
 
   register(action: HotkeyAction, handler: () => void): () => void {
@@ -36,14 +40,44 @@ export class HotkeyService {
     };
   }
 
+  private isInteractiveTarget(el: Element | null): boolean {
+    if (!el) return false;
+    const tag = el.tagName;
+    if (['INPUT', 'SELECT', 'TEXTAREA'].includes(tag)) return true;
+    if ((el as HTMLElement).isContentEditable) return true;
+    if (tag === 'BUTTON' || el.closest('button')) return true;
+    if (tag === 'A' || el.closest('a')) return true;
+    const role = el.getAttribute('role');
+    if (role && ['button', 'checkbox', 'radio', 'menuitem', 'option', 'tab', 'switch'].includes(role)) return true;
+    return false;
+  }
+
   handleKeyDown(e: KeyboardEvent): void {
     const activeEl = document.activeElement;
-    if (activeEl && ['INPUT', 'SELECT', 'TEXTAREA'].includes(activeEl.tagName)) {
+    if (
+      activeEl &&
+      (['INPUT', 'SELECT', 'TEXTAREA'].includes(activeEl.tagName) || (activeEl as HTMLElement).isContentEditable)
+    ) {
       if (e.key === 'Escape') {
         (activeEl as HTMLElement).blur();
+        this.trigger('escape');
       }
       return;
     }
+
+    // Do not steal Space or Enter from buttons, links, or custom controls
+    if (this.isInteractiveTarget(activeEl)) {
+      if (e.key === ' ' || e.key === 'Enter') {
+        return;
+      }
+      if (e.key === 'Escape') {
+        (activeEl as HTMLElement).blur();
+        this.trigger('escape');
+        return;
+      }
+    }
+
+    const isLightbox = this.curateService.lightboxIndex() !== null;
 
     switch (e.key) {
       case ' ':
@@ -80,15 +114,23 @@ export class HotkeyService {
         break;
       case 'ArrowLeft':
         e.preventDefault();
-        if (e.ctrlKey) this.trigger('seek_back_60');
-        else if (e.shiftKey) this.trigger('seek_back_10');
-        else this.trigger('seek_back_1');
+        if (isLightbox) {
+          this.trigger('lightbox_prev');
+        } else {
+          if (e.ctrlKey) this.trigger('seek_back_60');
+          else if (e.shiftKey) this.trigger('seek_back_10');
+          else this.trigger('seek_back_1');
+        }
         break;
       case 'ArrowRight':
         e.preventDefault();
-        if (e.ctrlKey) this.trigger('seek_fwd_60');
-        else if (e.shiftKey) this.trigger('seek_fwd_10');
-        else this.trigger('seek_fwd_1');
+        if (isLightbox) {
+          this.trigger('lightbox_next');
+        } else {
+          if (e.ctrlKey) this.trigger('seek_fwd_60');
+          else if (e.shiftKey) this.trigger('seek_fwd_10');
+          else this.trigger('seek_fwd_1');
+        }
         break;
       case ',':
         e.preventDefault();

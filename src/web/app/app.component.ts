@@ -17,10 +17,12 @@ import { SettingsModalComponent } from './features/modals/settings-modal.compone
 import { OpenRouterModalComponent } from './features/modals/openrouter-modal.component';
 import { ToastContainerComponent } from './features/shell/toast-container.component';
 import { PromptClickerViewComponent } from './features/prompt-clicker/prompt-clicker-view.component';
+import { PipelineBoardComponent, BoardNavigateEvent } from './features/pipeline-board/pipeline-board.component';
+import { WorkflowBarComponent } from './features/shell/workflow-bar.component';
 import { VideoService } from './core/services/video.service';
 import { ChunkService } from './core/services/chunk.service';
 import { CurateService } from './core/services/curate.service';
-import { JobEventService } from './core/services/job-event.service';
+import { JobEventService, ToastAction } from './core/services/job-event.service';
 import { SettingsService } from './core/services/settings.service';
 import { DatasetService } from './core/services/dataset.service';
 import { HotkeyService } from './core/services/hotkey.service';
@@ -30,6 +32,8 @@ import { HotkeyService } from './core/services/hotkey.service';
   imports: [
     HeaderComponent,
     VideoQueueComponent,
+    PipelineBoardComponent,
+    WorkflowBarComponent,
     StudioViewComponent,
     CurateViewComponent,
     DatasetViewComponent,
@@ -42,6 +46,13 @@ import { HotkeyService } from './core/services/hotkey.service';
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div class="flex flex-col h-screen w-screen overflow-hidden bg-canvas text-foreground">
+      <a
+        href="#main-content"
+        class="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50 focus:px-3 focus:py-1.5 focus:rounded-md focus:bg-primary focus:text-primary-foreground focus:shadow-lg focus:outline-none focus:ring-2 focus:ring-ring text-xs font-semibold"
+      >
+        Skip to main content
+      </a>
+
       <!-- Top Header Navigation Bar -->
       <app-header
         [currentTab]="currentTab()"
@@ -53,13 +64,26 @@ import { HotkeyService } from './core/services/hotkey.service';
       <!-- Main Workspace Container -->
       <div class="flex flex-1 overflow-hidden">
         <!-- Left Sidebar: Video Queue -->
-        @if (currentTab() !== 'prompt-clicker') {
+        @if (currentTab() !== 'prompt-clicker' && currentTab() !== 'board') {
           <app-video-queue />
         }
 
         <!-- Center Stage: Active Tab View -->
-        <main class="flex-1 min-h-0 overflow-hidden relative flex flex-col">
+        <main id="main-content" tabindex="-1" class="flex-1 min-h-0 overflow-hidden relative flex flex-col outline-none">
+          @if (currentTab() === 'studio' || currentTab() === 'curate') {
+            <app-workflow-bar
+              (tabChange)="onTabChange($event)"
+              (openCaptionModal)="isOpenRouterModalOpen.set(true)"
+            />
+          }
+
           @switch (currentTab()) {
+            @case ('board') {
+              <app-pipeline-board
+                class="flex-1 min-h-0 flex flex-col overflow-hidden w-full h-full"
+                (navigate)="onBoardNavigate($event)"
+              />
+            }
             @case ('studio') {
               <app-studio-view class="flex-1 min-h-0 flex flex-col overflow-hidden w-full h-full" />
             }
@@ -93,7 +117,7 @@ import { HotkeyService } from './core/services/hotkey.service';
         (close)="isOpenRouterModalOpen.set(false)"
       />
 
-      <app-toast-container (curateRequest)="onCurateRequest($event)" />
+      <app-toast-container (actionRequest)="onToastAction($event)" />
     </div>
   `,
 })
@@ -106,7 +130,7 @@ export class AppComponent implements OnInit {
   readonly datasetService = inject(DatasetService);
   private readonly hotkeys = inject(HotkeyService);
 
-  readonly currentTab = signal<'studio' | 'curate' | 'dataset' | 'prompt-clicker'>('studio');
+  readonly currentTab = signal<'board' | 'studio' | 'curate' | 'dataset' | 'prompt-clicker'>('board');
   readonly isSettingsModalOpen = signal<boolean>(false);
   readonly isOpenRouterModalOpen = signal<boolean>(false);
 
@@ -162,6 +186,7 @@ export class AppComponent implements OnInit {
       const c = this.curateService.currentLightboxCandidate();
       if (c) {
         this.curateService.setCandidateState(c.video_id, c.id, 'keep');
+        this.curateService.nextLightbox();
       }
     });
 
@@ -169,6 +194,7 @@ export class AppComponent implements OnInit {
       const c = this.curateService.currentLightboxCandidate();
       if (c) {
         this.curateService.setCandidateState(c.video_id, c.id, 'reject');
+        this.curateService.nextLightbox();
       }
     });
 
@@ -176,11 +202,20 @@ export class AppComponent implements OnInit {
       const c = this.curateService.currentLightboxCandidate();
       if (c) {
         this.curateService.setCandidateState(c.video_id, c.id, 'star');
+        this.curateService.nextLightbox();
       }
+    });
+
+    this.hotkeys.register('lightbox_prev', () => {
+      this.curateService.prevLightbox();
+    });
+
+    this.hotkeys.register('lightbox_next', () => {
+      this.curateService.nextLightbox();
     });
   }
 
-  onTabChange(tab: 'studio' | 'curate' | 'dataset' | 'prompt-clicker'): void {
+  onTabChange(tab: 'board' | 'studio' | 'curate' | 'dataset' | 'prompt-clicker'): void {
     this.currentTab.set(tab);
     const video = this.videoService.currentVideo();
     if (tab === 'curate' && video) {
@@ -190,6 +225,11 @@ export class AppComponent implements OnInit {
     }
   }
 
+  onBoardNavigate(ev: BoardNavigateEvent): void {
+    this.videoService.selectVideo(ev.videoId);
+    this.onTabChange(ev.tab);
+  }
+
   onNextVideo(): void {
     this.videoService.selectNextVideo();
   }
@@ -197,6 +237,13 @@ export class AppComponent implements OnInit {
   onCurateRequest(videoId: string): void {
     this.videoService.selectVideo(videoId);
     this.onTabChange('curate');
+  }
+
+  onToastAction(action: ToastAction): void {
+    if (action.videoId) {
+      this.videoService.selectVideo(String(action.videoId));
+    }
+    this.onTabChange(action.tab);
   }
 
   onSeekChunk(time: number): void {

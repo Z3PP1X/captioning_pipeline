@@ -7,7 +7,7 @@
 | `font-sans` | Helvetica → Arial → Noto Sans → sans-serif | All UI and running text |
 | `font-display` | same stack (swap for a licensed display face later) | Signature style only |
 
-Noto Sans covers non-Latin scripts. Do not introduce other fonts without updating this file and `src/styles.css`.
+Noto Sans covers non-Latin scripts. Do not introduce other fonts without updating this file and `src/web/styles.css`.
 
 ## Signature style
 

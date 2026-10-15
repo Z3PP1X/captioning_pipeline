@@ -1,7 +1,7 @@
 import { ChangeDetectionStrategy, Component, inject, output } from '@angular/core';
 import { NgIcon, provideIcons } from '@ng-icons/core';
 import { lucideCheck, lucideX, lucideAlertTriangle } from '@ng-icons/lucide';
-import { JobEventService } from '../../core/services/job-event.service';
+import { JobEventService, ToastAction } from '../../core/services/job-event.service';
 import { VideoService } from '../../core/services/video.service';
 
 @Component({
@@ -30,14 +30,14 @@ import { VideoService } from '../../core/services/video.service';
 
           <div class="flex-1 flex flex-col gap-0.5">
             <span class="font-bold text-foreground">{{ toast.title }}</span>
-            <span class="text-muted-foreground text-[11px] leading-tight">{{ toast.message }}</span>
+            <span class="text-muted-foreground text-xs leading-tight">{{ toast.message }}</span>
 
-            @if (toast.videoId) {
+            @if (toast.action) {
               <button
-                (click)="onCurateNow(toast.videoId)"
-                class="mt-1 text-[11px] font-bold text-primary hover:underline text-left cursor-pointer"
+                (click)="onAction(toast.action)"
+                class="mt-1 text-xs font-bold text-primary hover:underline text-left cursor-pointer"
               >
-                Curate Now →
+                {{ toast.action.label }}
               </button>
             }
           </div>
@@ -45,6 +45,7 @@ import { VideoService } from '../../core/services/video.service';
           <button
             (click)="jobEvents.dismissToast(toast.id)"
             class="text-muted-foreground hover:text-foreground cursor-pointer p-0.5"
+            title="Dismiss notification"
           >
             <ng-icon name="lucideX" class="size-3" />
           </button>
@@ -57,10 +58,12 @@ export class ToastContainerComponent {
   readonly jobEvents = inject(JobEventService);
   private readonly videoService = inject(VideoService);
 
-  readonly curateRequest = output<string>();
+  readonly actionRequest = output<ToastAction>();
 
-  onCurateNow(videoId: string | number): void {
-    this.videoService.selectVideo(String(videoId));
-    this.curateRequest.emit(String(videoId));
+  onAction(action: ToastAction): void {
+    if (action.videoId) {
+      this.videoService.selectVideo(String(action.videoId));
+    }
+    this.actionRequest.emit(action);
   }
 }

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://spartan.ng/schema.json",
+  "style": "vega",
+  "tailwind": {
+    "css": "src/web/styles.css",
+    "baseColor": "slate"
+  },
+  "aliases": {
+    "components": "src/web/shared/ui",
+    "ui": "src/web/shared/ui"
+  },
+  "importAlias": "@spartan-ng/helm"
+}

@@ -139,10 +139,15 @@ def test_openrouter_caption_endpoints():
     """Verify both /api/videos/{video_id}/caption-openrouter and /api/openrouter/batch_caption endpoints."""
     with TestClient(app) as client:
         test_vid_id = "test_vid_openrouter_caption"
+        test_vid_id_2 = "test_vid_openrouter_caption_2"
         with db.write() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO videos (id, path, name, slug, status, duration) VALUES (?, ?, ?, ?, 'curating_300', 120.0)",
                 (test_vid_id, "/tmp/dummy_cap.mp4", "Dummy Cap.mp4", "dummy_cap"),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO videos (id, path, name, slug, status, duration) VALUES (?, ?, ?, ?, 'curating_300', 120.0)",
+                (test_vid_id_2, "/tmp/dummy_cap_2.mp4", "Dummy Cap 2.mp4", "dummy_cap_2"),
             )
 
         try:
@@ -160,11 +165,11 @@ def test_openrouter_caption_endpoints():
             assert "job_id" in res1.json()
             assert res1.json()["status"] == "queued"
 
-            # 2. Batch caption alias endpoint
+            # 2. Batch caption alias endpoint on second video
             res2 = client.post(
                 "/api/openrouter/batch_caption",
                 json={
-                    "video_id": test_vid_id,
+                    "video_id": test_vid_id_2,
                     "model": "google/gemma-4-31b-it",
                     "mode": "concept",
                     "trigger_word": "restrained_elegance",
@@ -176,6 +181,6 @@ def test_openrouter_caption_endpoints():
             assert res2.json()["status"] == "queued"
         finally:
             with db.write() as conn:
-                conn.execute("DELETE FROM jobs WHERE video_id=?", (test_vid_id,))
-                conn.execute("DELETE FROM videos WHERE id=?", (test_vid_id,))
+                conn.execute("DELETE FROM jobs WHERE video_id IN (?, ?)", (test_vid_id, test_vid_id_2))
+                conn.execute("DELETE FROM videos WHERE id IN (?, ?)", (test_vid_id, test_vid_id_2))
 

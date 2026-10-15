@@ -1,19 +1,29 @@
 import { ChangeDetectionStrategy, Component, ViewChild, effect, inject } from '@angular/core';
-import { FormsModule } from '@angular/forms';
+import { NgIcon, provideIcons } from '@ng-icons/core';
+import { lucideClock, lucideMaximize2, lucideZap, lucideFilm } from '@ng-icons/lucide';
 import { VideoService } from '../../core/services/video.service';
 import { ChunkService } from '../../core/services/chunk.service';
 import { VideoPlayerComponent } from './video-player.component';
 import { TimelineComponent } from './timeline.component';
 import { ChunksPanelComponent } from './chunks-panel.component';
 import { formatShortTime } from '../../core/utils/time.utils';
+import { ALL_VIDEO_STATUSES } from '../../core/ui/status';
 
 @Component({
   selector: 'app-studio-view',
   imports: [
-    FormsModule,
+    NgIcon,
     VideoPlayerComponent,
     TimelineComponent,
     ChunksPanelComponent,
+  ],
+  providers: [
+    provideIcons({
+      lucideClock,
+      lucideMaximize2,
+      lucideZap,
+      lucideFilm,
+    }),
   ],
   changeDetection: ChangeDetectionStrategy.OnPush,
   host: {
@@ -32,10 +42,22 @@ import { formatShortTime } from '../../core/utils/time.utils';
 
           @if (video) {
             <div class="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-              <span class="rounded bg-muted px-2 py-0.5">⏱️ {{ formatShortTime(video.duration) }}</span>
-              <span class="rounded bg-muted px-2 py-0.5">📐 {{ video.width }}x{{ video.height }}</span>
-              <span class="rounded bg-muted px-2 py-0.5">⚡ {{ video.fps.toFixed(1) }} fps</span>
-              <span class="rounded bg-muted px-2 py-0.5">🎞️ {{ video.frame_count }} frames</span>
+              <span class="inline-flex items-center gap-1 rounded bg-muted px-2 py-0.5">
+                <ng-icon name="lucideClock" class="size-3 text-muted-foreground" />
+                {{ formatShortTime(video.duration) }}
+              </span>
+              <span class="inline-flex items-center gap-1 rounded bg-muted px-2 py-0.5">
+                <ng-icon name="lucideMaximize2" class="size-3 text-muted-foreground" />
+                {{ video.width }}x{{ video.height }}
+              </span>
+              <span class="inline-flex items-center gap-1 rounded bg-muted px-2 py-0.5">
+                <ng-icon name="lucideZap" class="size-3 text-muted-foreground" />
+                <span class="tabular-nums">{{ video.fps.toFixed(1) }}</span> fps
+              </span>
+              <span class="inline-flex items-center gap-1 rounded bg-muted px-2 py-0.5">
+                <ng-icon name="lucideFilm" class="size-3 text-muted-foreground" />
+                <span class="tabular-nums">{{ video.frame_count }}</span> frames
+              </span>
             </div>
           }
         </div>
@@ -44,16 +66,13 @@ import { formatShortTime } from '../../core/utils/time.utils';
           <div class="flex items-center gap-2 text-xs">
             <label class="font-medium text-muted-foreground">Status:</label>
             <select
-              [ngModel]="video.status"
-              (ngModelChange)="onStatusChange(video.id, $event)"
+              [value]="video.status"
+              (change)="onStatusChange(video.id, $any($event.target).value)"
               class="h-8 rounded-md border border-input bg-background px-2.5 text-xs font-semibold text-foreground focus:ring-1 focus:ring-ring"
             >
-              <option value="new">New</option>
-              <option value="chunked">Chunked</option>
-              <option value="extracting">Extracting</option>
-              <option value="curating">Curating</option>
-              <option value="exported">Exported</option>
-              <option value="skipped">Skipped</option>
+              @for (s of statuses; track s.value) {
+                <option [value]="s.value">{{ s.label }}</option>
+              }
             </select>
           </div>
         }
@@ -87,6 +106,7 @@ export class StudioViewComponent {
 
   currentTime = 0;
   readonly formatShortTime = formatShortTime;
+  readonly statuses = ALL_VIDEO_STATUSES;
 
   constructor() {
     effect(() => {

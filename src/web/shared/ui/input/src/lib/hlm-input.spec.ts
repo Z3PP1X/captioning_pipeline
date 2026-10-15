@@ -48,11 +48,13 @@ class SignalFormHost {
 describe('HlmInput with Signal Forms ([formField])', () => {
   it('only sets aria-invalid after submit/touch', async () => {
     const fixture = TestBed.createComponent(SignalFormHost);
+    fixture.detectChanges();
     await fixture.whenStable();
     const input = (fixture.nativeElement as HTMLElement).querySelector('[data-testid="signal"]')!;
     expect(input.getAttribute('aria-invalid')).toBeNull();
 
     await submit(fixture.componentInstance.form, async () => undefined);
+    fixture.detectChanges();
     await fixture.whenStable();
     expect(input.getAttribute('aria-invalid')).toBe('true');
   });
@@ -66,8 +68,10 @@ describe('HlmInput / HlmTextarea aria-invalid', () => {
 
   /** Lets BrnFieldControl resolve formControlName (microtask) and re-render. */
   async function settle(): Promise<void> {
+    fixture.detectChanges();
     await fixture.whenStable();
     await Promise.resolve();
+    fixture.detectChanges();
     await fixture.whenStable();
   }
 

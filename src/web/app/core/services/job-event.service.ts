@@ -2,12 +2,20 @@ import { Injectable, inject, signal } from '@angular/core';
 import { ApiService } from './api.service';
 import { ActiveJob, JobSSEMessage } from '../models/job.model';
 
+export interface ToastAction {
+  label: string;
+  tab: 'board' | 'studio' | 'curate' | 'dataset' | 'prompt-clicker';
+  videoId?: string | number | null;
+}
+
 export interface ToastNotification {
   id: string;
   title: string;
   message: string;
   videoId?: string | number | null;
   isError?: boolean;
+  action?: ToastAction | null;
+  persistent?: boolean;
 }
 
 @Injectable({
@@ -18,6 +26,7 @@ export class JobEventService {
 
   readonly activeJobs = signal<Map<number, ActiveJob>>(new Map());
   readonly toasts = signal<ToastNotification[]>([]);
+  readonly connectionState = signal<'connecting' | 'connected' | 'disconnected'>('connecting');
   private eventSource: EventSource | null = null;
 
   initSSE(onJobFinished?: (videoId: string, videoName: string) => void): void {
@@ -25,12 +34,22 @@ export class JobEventService {
       this.eventSource.close();
     }
 
+    this.connectionState.set('connecting');
     this.eventSource = new EventSource('/api/events');
+
+    this.eventSource.onopen = () => {
+      this.connectionState.set('connected');
+    };
 
     this.eventSource.onmessage = (event) => {
       try {
         const msg: JobSSEMessage = JSON.parse(event.data);
+        if (msg.type === 'connected') {
+          this.connectionState.set('connected');
+          return;
+        }
         const d = msg.data;
+        if (!d) return;
 
         if (
           msg.type === 'job_queued' ||
@@ -64,13 +83,17 @@ export class JobEventService {
             this.showToast(
               'Captioning Complete',
               `${d.video_name || 'Video'} has finished batch captioning!`,
-              d.video_id
+              d.video_id,
+              false,
+              { label: 'View Dataset →', tab: 'dataset', videoId: d.video_id }
             );
           } else {
             this.showToast(
               'Extraction Complete',
               `${d.video_name || 'Video'} has finished extracting candidates! Ready for curation.`,
-              d.video_id
+              d.video_id,
+              false,
+              { label: 'Start Curating →', tab: 'curate', videoId: d.video_id }
             );
           }
 
@@ -85,7 +108,7 @@ export class JobEventService {
           });
 
           if (msg.type === 'job_error') {
-            this.showToast('Job Error', d.error || 'Extraction failed', null, true);
+            this.showToast('Job Error', d.error || 'Extraction failed', null, true, null, true);
           } else {
             this.showToast('Job Cancelled', `Extraction cancelled for job #${d.job_id}`);
           }
@@ -96,6 +119,7 @@ export class JobEventService {
     };
 
     this.eventSource.onerror = (err) => {
+      this.connectionState.set('disconnected');
       console.warn('SSE connection error:', err);
     };
   }
@@ -113,14 +137,24 @@ export class JobEventService {
     }
   }
 
-  showToast(title: string, message: string, videoId: string | number | null = null, isError = false): void {
+  showToast(
+    title: string,
+    message: string,
+    videoId: string | number | null = null,
+    isError = false,
+    action: ToastAction | null = null,
+    persistent = false
+  ): void {
     const id = `${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-    const toast: ToastNotification = { id, title, message, videoId, isError };
+    const shouldPersist = isError || persistent;
+    const toast: ToastNotification = { id, title, message, videoId, isError, action, persistent: shouldPersist };
     this.toasts.update((list) => [...list, toast]);
 
-    setTimeout(() => {
-      this.dismissToast(id);
-    }, 9000);
+    if (!shouldPersist) {
+      setTimeout(() => {
+        this.dismissToast(id);
+      }, 9000);
+    }
   }
 
   dismissToast(id: string): void {

@@ -49,10 +49,16 @@ class Indexer:
                 continue
 
             stat = p.stat()
-            vid_id = compute_video_id(p, stat.st_size)
+            resolved_path = str(p.resolve())
+            existing = self.db.one("SELECT * FROM videos WHERE path=?", (resolved_path,))
+            if not existing:
+                vid_id = compute_video_id(p, stat.st_size)
+                existing = self.db.one("SELECT * FROM videos WHERE id=?", (vid_id,))
+            else:
+                vid_id = existing["id"]
+
             found_ids.add(vid_id)
 
-            existing = self.db.one("SELECT * FROM videos WHERE id=?", (vid_id,))
             if existing and existing.get("size") == stat.st_size and existing.get("missing") == 0:
                 scanned_videos.append(existing)
                 continue

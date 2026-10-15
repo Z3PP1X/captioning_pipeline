@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS frames (
     metrics TEXT, rejected_reason TEXT, phash TEXT,
     embedding BLOB, zs_scores TEXT,
     preview_path TEXT, full_path TEXT,
+    native INTEGER NOT NULL DEFAULT 0,
     UNIQUE(video_id, t)
 );
 CREATE INDEX IF NOT EXISTS ix_frames_chunk ON frames(chunk_id);
@@ -78,12 +79,15 @@ class DB:
         with self.conn() as c:
             c.execute("PRAGMA journal_mode=WAL")
             c.executescript(SCHEMA)
-            # Safe migrations: ensure required columns exist in chunks
+            # Safe migrations: ensure required columns exist in chunks and frames
             cols = [r["name"] for r in c.execute("PRAGMA table_info(chunks)").fetchall()]
             if "budget_pct" not in cols:
                 c.execute("ALTER TABLE chunks ADD COLUMN budget_pct REAL NOT NULL DEFAULT 0.0")
             if "caption_model" not in cols:
                 c.execute("ALTER TABLE chunks ADD COLUMN caption_model TEXT NOT NULL DEFAULT 'google/gemma-4-31b-it'")
+            frame_cols = [r["name"] for r in c.execute("PRAGMA table_info(frames)").fetchall()]
+            if "native" not in frame_cols:
+                c.execute("ALTER TABLE frames ADD COLUMN native INTEGER NOT NULL DEFAULT 0")
 
     @contextmanager
     def conn(self) -> Iterator[sqlite3.Connection]:

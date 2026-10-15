@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,11 +19,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from pipeline.autochunk import AutoChunker, DestructiveRechunkError
-from pipeline.config import DEFAULT_USER_SETTINGS, Settings, get_settings, merged_user_settings
+from pipeline.config import DEFAULT_USER_SETTINGS, Settings, VIDEO_STATUSES, get_settings, merged_user_settings
 from pipeline.db import DB
+from pipeline.decode import ensure_native_frame
 from pipeline.export import Exporter
 from pipeline.indexer import Indexer
-from pipeline.jobs import JobManager
+from pipeline.jobs import JobConflictError, JobManager
 from pipeline.openrouter import DEFAULT_CAPTION_MAX_TOKENS
 from pipeline.rag import (
     CHARACTERS,
@@ -75,6 +79,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(JobConflictError)
+def job_conflict_handler(request: Request, exc: JobConflictError):
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
 # ----------------------------------------------------------------------------- Models
@@ -169,7 +178,9 @@ def list_videos(status: str | None = None, search: str | None = None):
     query = """
         SELECT v.*,
             (SELECT COUNT(*) FROM chunks c WHERE c.video_id = v.id) as chunk_count,
-            (SELECT COUNT(*) FROM exports e JOIN frames f ON e.frame_id = f.id WHERE f.video_id = v.id) as export_count
+            (SELECT COUNT(*) FROM exports e JOIN frames f ON e.frame_id = f.id WHERE f.video_id = v.id) as export_count,
+            (SELECT COUNT(*) FROM frames f JOIN picks p ON p.frame_id = f.id WHERE f.video_id = v.id AND (p.state IN ('keep', 'star') OR (p.role = 'pick' AND (p.state IS NULL OR p.state != 'reject')))) as kept_count,
+            (SELECT COUNT(*) FROM exports e JOIN frames f ON e.frame_id = f.id WHERE f.video_id = v.id) as captioned_count
         FROM videos v
         WHERE v.missing = 0
     """
@@ -247,6 +258,11 @@ def patch_video(video_id: str, patch: VideoPatch):
     updates = []
     params = []
     if patch.status is not None:
+        if patch.status not in VIDEO_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid status '{patch.status}'. Allowed statuses: {list(VIDEO_STATUSES)}"
+            )
         updates.append("status = ?")
         params.append(patch.status)
     if patch.watermark_rect is not None:
@@ -311,7 +327,10 @@ def save_chunks(video_id: str, update: ChunksUpdate):
             [c.model_dump() for c in update.chunks],
             confirm_destructive=update.confirm_destructive,
         )
-        return {"chunks": saved}
+        return {
+            "chunks": saved,
+            "scene_stats": get_video_scenes_caption_stats(db, video_id),
+        }
     except DestructiveRechunkError as e:
         raise _rechunk_conflict(e) from e
     except Exception as e:
@@ -383,6 +402,38 @@ def trigger_extract_750(video_id: str):
     return {"job_id": job_id, "status": "queued"}
 
 
+def _enrich_frame_dict(f: dict[str, Any], exported_ids: set[int] | None = None) -> dict[str, Any]:
+    f["preview_url"] = f"/api/frames/{f['id']}/preview"
+    f["full_url"] = f"/api/frames/{f['id']}/full"
+    f["thumb_url"] = f"/api/frames/{f['id']}/preview"
+    f["time_s"] = f["t"]
+    f["is_pick"] = (f.get("role") == "pick")
+    f["is_captioned"] = (f["id"] in exported_ids) if exported_ids is not None else False
+    f["chunk_pos"] = f.get("chunk_pos", f.get("chunk_position", 0))
+    f["chunk_position"] = f.get("chunk_position", f.get("chunk_pos", 0))
+    f["chunk_start"] = f.get("chunk_start", 0.0)
+    f["chunk_end"] = f.get("chunk_end", 0.0)
+    f["native"] = f.get("native", 0)
+    return f
+
+
+def _fetch_curation_frames(video_id: str, role: str) -> list[dict[str, Any]]:
+    return db.all(
+        """
+        SELECT f.id, f.video_id, f.chunk_id, f.t, f.metrics, f.zs_scores, f.preview_path, f.full_path, f.native,
+               p.role, p.rank, p.state, p.crop, c.position as chunk_pos, c.position as chunk_position,
+               c.start_s as chunk_start, c.end_s as chunk_end, c.rule as chunk_rule, c.tags as chunk_tags,
+               c.notes as chunk_notes, c.caption_model as chunk_caption_model, c.budget_pct, c.caption_model
+        FROM frames f
+        JOIN picks p ON f.id = p.frame_id
+        JOIN chunks c ON f.chunk_id = c.id
+        WHERE f.video_id = ? AND p.role = ?
+        ORDER BY c.position ASC, p.rank ASC, f.t ASC
+        """,
+        (video_id, role),
+    )
+
+
 @app.get("/api/videos/{video_id}/curation-300")
 def get_curation_300(video_id: str):
     video = db.one("SELECT * FROM videos WHERE id=?", (video_id,))
@@ -390,40 +441,13 @@ def get_curation_300(video_id: str):
         raise HTTPException(status_code=404, detail="Video not found")
 
     chunks = get_video_scenes_caption_stats(db, video_id)
-    picks = db.all(
-        """
-        SELECT f.id, f.video_id, f.chunk_id, f.t, f.metrics, f.zs_scores, f.preview_path, f.full_path,
-               p.role, p.rank, p.state, p.crop, c.position as chunk_pos, c.budget_pct, c.caption_model
-        FROM frames f
-        JOIN picks p ON f.id = p.frame_id
-        JOIN chunks c ON f.chunk_id = c.id
-        WHERE f.video_id = ? AND p.role = 'pick'
-        ORDER BY c.position ASC, p.rank ASC, f.t ASC
-        """,
-        (video_id,),
-    )
-    runners = db.all(
-        """
-        SELECT f.id, f.video_id, f.chunk_id, f.t, f.metrics, f.zs_scores, f.preview_path, f.full_path,
-               p.role, p.rank, p.state, p.crop, c.position as chunk_pos, c.budget_pct, c.caption_model
-        FROM frames f
-        JOIN picks p ON f.id = p.frame_id
-        JOIN chunks c ON f.chunk_id = c.id
-        WHERE f.video_id = ? AND p.role = 'runner_up'
-        ORDER BY c.position ASC, p.rank ASC, f.t ASC
-        """,
-        (video_id,),
-    )
+    picks = _fetch_curation_frames(video_id, "pick")
+    runners = _fetch_curation_frames(video_id, "runner_up")
 
     stats = jobs.scoring_engine.compute_distribution_stats(picks)
     exported_ids = {r["frame_id"] for r in db.all("SELECT e.frame_id FROM exports e JOIN frames f ON e.frame_id=f.id WHERE f.video_id=?", (video_id,))}
     for f in picks + runners:
-        f["preview_url"] = f"/api/frames/{f['id']}/preview"
-        f["full_url"] = f"/api/frames/{f['id']}/full"
-        f["thumb_url"] = f"/api/frames/{f['id']}/preview"
-        f["time_s"] = f["t"]
-        f["is_pick"] = (f.get("role") == "pick")
-        f["is_captioned"] = (f["id"] in exported_ids)
+        _enrich_frame_dict(f, exported_ids)
 
     return {
         "video": video,
@@ -440,62 +464,114 @@ def get_curation_300(video_id: str):
 @app.post("/api/videos/{video_id}/swap-frame")
 def swap_frame(video_id: str, req: SwapFrameRequest):
     drop_id = req.target_drop_id
-    drop_pick = db.one("SELECT * FROM picks WHERE frame_id=?", (drop_id,))
-    if not drop_pick:
+    drop_frame = db.one(
+        """
+        SELECT f.id, f.video_id, f.chunk_id, f.t, f.embedding, f.zs_scores, p.role
+        FROM frames f
+        JOIN picks p ON f.id = p.frame_id
+        WHERE f.id = ?
+        """,
+        (drop_id,),
+    )
+    if not drop_frame:
         raise HTTPException(status_code=404, detail="Frame not found in picks")
+    if drop_frame["video_id"] != video_id:
+        raise HTTPException(status_code=400, detail="Drop frame does not belong to this video")
 
-    chunk_id = drop_pick["chunk_id"]
+    chunk_id = drop_frame["chunk_id"]
     pick_id = req.pick_frame_id
-    if not pick_id:
-        best_cand = db.one(
+
+    if pick_id:
+        pick_frame = db.one(
             """
-            SELECT p.frame_id FROM picks p
-            JOIN frames f ON p.frame_id = f.id
-            WHERE p.chunk_id=? AND p.role='runner_up'
-            ORDER BY p.rank ASC LIMIT 1
+            SELECT f.id, f.video_id, f.chunk_id, p.role
+            FROM frames f
+            JOIN picks p ON f.id = p.frame_id
+            WHERE f.id = ?
+            """,
+            (pick_id,),
+        )
+        if not pick_frame:
+            raise HTTPException(status_code=404, detail="Pick candidate frame not found in picks")
+        if pick_frame["video_id"] != video_id:
+            raise HTTPException(status_code=400, detail="Pick candidate does not belong to this video")
+        if pick_frame["chunk_id"] != chunk_id:
+            raise HTTPException(status_code=400, detail="Pick frame does not belong to the same chunk as drop frame")
+    else:
+        # Choose best replacement runner via argmax_j (sim(drop, j) * q_j) within chunk
+        runners = db.all(
+            """
+            SELECT f.id, f.t, f.embedding, f.zs_scores, p.rank
+            FROM frames f
+            JOIN picks p ON f.id = p.frame_id
+            WHERE p.chunk_id = ? AND p.role = 'runner_up'
+            ORDER BY p.rank ASC
             """,
             (chunk_id,),
         )
-        if not best_cand:
+        if not runners:
             raise HTTPException(status_code=400, detail="No replacement candidates available in this chunk")
-        pick_id = best_cand["frame_id"]
 
+        drop_emb: np.ndarray | None = None
+        if drop_frame.get("embedding"):
+            try:
+                drop_emb = np.frombuffer(drop_frame["embedding"], dtype=np.float32)
+            except Exception:
+                drop_emb = None
+
+        drop_t = float(drop_frame.get("t", 0.0))
+        best_score = -1e9
+        best_cand_id = runners[0]["id"]
+
+        for r in runners:
+            q_j = 0.5
+            if r.get("zs_scores"):
+                try:
+                    sc = json.loads(r["zs_scores"]) if isinstance(r["zs_scores"], str) else r["zs_scores"]
+                    q_j = float(sc.get("composite", sc.get("quality", 0.5)))
+                except Exception:
+                    q_j = 0.5
+
+            sim_val = 1.0
+            r_emb: np.ndarray | None = None
+            if r.get("embedding"):
+                try:
+                    r_emb = np.frombuffer(r["embedding"], dtype=np.float32)
+                except Exception:
+                    r_emb = None
+
+            if drop_emb is not None and r_emb is not None and drop_emb.size == r_emb.size:
+                dot = float(np.dot(drop_emb, r_emb))
+                norm_drop = max(1e-6, float(np.linalg.norm(drop_emb)))
+                norm_r = max(1e-6, float(np.linalg.norm(r_emb)))
+                cos_sim = max(0.0, dot / (norm_drop * norm_r))
+                t_dist = abs(drop_t - float(r.get("t", 0.0)))
+                t_sim = math.exp(-t_dist / 5.0)
+                sim_val = 0.75 * cos_sim + 0.25 * t_sim
+            else:
+                t_dist = abs(drop_t - float(r.get("t", 0.0)))
+                sim_val = math.exp(-t_dist / 5.0)
+
+            score = sim_val * max(0.01, q_j)
+            if score > best_score:
+                best_score = score
+                best_cand_id = r["id"]
+
+        pick_id = best_cand_id
+
+    # Execute swap in database
     with db.write() as conn:
         conn.execute("UPDATE picks SET role='runner_up', state='candidate' WHERE frame_id=?", (drop_id,))
         conn.execute("UPDATE picks SET role='pick', state='keep' WHERE frame_id=?", (pick_id,))
 
-    picks = db.all(
-        """
-        SELECT f.id, f.video_id, f.chunk_id, f.t, f.metrics, f.zs_scores, f.preview_path, f.full_path,
-               p.role, p.rank, p.state, p.crop, c.position as chunk_pos, c.budget_pct, c.caption_model
-        FROM frames f
-        JOIN picks p ON f.id = p.frame_id
-        JOIN chunks c ON f.chunk_id = c.id
-        WHERE f.video_id = ? AND p.role = 'pick'
-        ORDER BY c.position ASC, p.rank ASC, f.t ASC
-        """,
-        (video_id,),
-    )
-    runners = db.all(
-        """
-        SELECT f.id, f.video_id, f.chunk_id, f.t, f.metrics, f.zs_scores, f.preview_path, f.full_path,
-               p.role, p.rank, p.state, p.crop, c.position as chunk_pos, c.budget_pct, c.caption_model
-        FROM frames f
-        JOIN picks p ON f.id = p.frame_id
-        JOIN chunks c ON f.chunk_id = c.id
-        WHERE f.video_id = ? AND p.role = 'runner_up'
-        ORDER BY c.position ASC, p.rank ASC, f.t ASC
-        """,
-        (video_id,),
-    )
+    # Ensure swapped-in pick has native full-resolution decode (C1/H1)
+    ensure_native_frame(db, pick_id)
+
+    picks = _fetch_curation_frames(video_id, "pick")
+    runners = _fetch_curation_frames(video_id, "runner_up")
     exported_ids = {r["frame_id"] for r in db.all("SELECT e.frame_id FROM exports e JOIN frames f ON e.frame_id=f.id WHERE f.video_id=?", (video_id,))}
     for f in picks + runners:
-        f["preview_url"] = f"/api/frames/{f['id']}/preview"
-        f["full_url"] = f"/api/frames/{f['id']}/full"
-        f["thumb_url"] = f"/api/frames/{f['id']}/preview"
-        f["time_s"] = f["t"]
-        f["is_pick"] = (f.get("role") == "pick")
-        f["is_captioned"] = (f["id"] in exported_ids)
+        _enrich_frame_dict(f, exported_ids)
 
     stats = jobs.scoring_engine.compute_distribution_stats(picks)
     return {
@@ -617,10 +693,10 @@ def get_video_candidates(video_id: str):
     """Retrieve all extracted candidates and picks grouped by chunk for a video."""
     query = """
         SELECT f.id, f.video_id, f.chunk_id, f.t, f.metrics, f.zs_scores,
-               f.preview_path, p.role, p.rank, p.state, p.crop,
-               c.position AS chunk_position, c.start_s AS chunk_start,
+               f.preview_path, f.full_path, f.native, p.role, p.rank, p.state, p.crop,
+               c.position AS chunk_position, c.position AS chunk_pos, c.start_s AS chunk_start,
                c.end_s AS chunk_end, c.rule AS chunk_rule, c.tags AS chunk_tags,
-               c.notes AS chunk_notes, c.caption_model AS chunk_caption_model
+               c.notes AS chunk_notes, c.caption_model AS chunk_caption_model, c.budget_pct
         FROM frames f
         JOIN picks p ON f.id = p.frame_id
         LEFT JOIN chunks c ON f.chunk_id = c.id
@@ -630,12 +706,7 @@ def get_video_candidates(video_id: str):
     frames = db.all(query, (video_id,))
     exported_ids = {r["frame_id"] for r in db.all("SELECT e.frame_id FROM exports e JOIN frames f ON e.frame_id=f.id WHERE f.video_id=?", (video_id,))}
     for f in frames:
-        f["preview_url"] = f"/api/frames/{f['id']}/preview"
-        f["full_url"] = f"/api/frames/{f['id']}/full"
-        f["thumb_url"] = f"/api/frames/{f['id']}/preview"
-        f["time_s"] = f["t"]
-        f["is_pick"] = (f.get("role") == "pick")
-        f["is_captioned"] = (f["id"] in exported_ids)
+        _enrich_frame_dict(f, exported_ids)
 
     picks = [f for f in frames if f["is_pick"]]
     runners = [f for f in frames if not f["is_pick"]]
@@ -654,15 +725,30 @@ def get_video_candidates(video_id: str):
 
 @app.post("/api/videos/{video_id}/candidates/{frame_id}/state")
 def set_candidate_state_endpoint(video_id: str, frame_id: int, req: CandidateStateRequest):
+    allowed_states = ("keep", "reject", "star", "candidate", None)
+    if req.state not in allowed_states:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid candidate state '{req.state}'. Allowed states: ['keep', 'reject', 'star', 'candidate', null]",
+        )
+
+    frame = db.one("SELECT id, video_id, chunk_id FROM frames WHERE id=?", (frame_id,))
+    if not frame:
+        raise HTTPException(status_code=404, detail="Frame not found")
+    if frame["video_id"] != video_id:
+        raise HTTPException(status_code=400, detail="Frame does not belong to this video")
+
     with db.write() as conn:
         cur = conn.execute("UPDATE picks SET state=? WHERE frame_id=?", (req.state, frame_id))
         if cur.rowcount == 0:
-            frame = db.one("SELECT chunk_id FROM frames WHERE id=?", (frame_id,))
-            if frame:
-                conn.execute(
-                    "INSERT INTO picks (frame_id, chunk_id, role, rank, state) VALUES (?, ?, 'candidate', 999, ?)",
-                    (frame_id, frame["chunk_id"], req.state),
-                )
+            conn.execute(
+                "INSERT INTO picks (frame_id, chunk_id, role, rank, state) VALUES (?, ?, 'runner_up', 999, ?)",
+                (frame_id, frame["chunk_id"], req.state),
+            )
+
+    if req.state in ("keep", "star"):
+        ensure_native_frame(db, frame_id)
+
     return {"status": "ok", "frame_id": frame_id, "state": req.state}
 
 
@@ -701,10 +787,10 @@ def get_video_frame_thumb(video_id: str, frame_id: int):
 def get_chunk_candidates(chunk_id: int):
     query = """
         SELECT f.id, f.video_id, f.chunk_id, f.t, f.metrics, f.zs_scores,
-               f.preview_path, p.role, p.rank, p.state, p.crop,
-               c.position AS chunk_position, c.start_s AS chunk_start,
+               f.preview_path, f.full_path, f.native, p.role, p.rank, p.state, p.crop,
+               c.position AS chunk_position, c.position AS chunk_pos, c.start_s AS chunk_start,
                c.end_s AS chunk_end, c.rule AS chunk_rule, c.tags AS chunk_tags,
-               c.notes AS chunk_notes, c.caption_model AS chunk_caption_model
+               c.notes AS chunk_notes, c.caption_model AS chunk_caption_model, c.budget_pct
         FROM frames f
         JOIN picks p ON f.id = p.frame_id
         LEFT JOIN chunks c ON f.chunk_id = c.id
@@ -712,9 +798,9 @@ def get_chunk_candidates(chunk_id: int):
         ORDER BY p.role DESC, p.rank ASC
     """
     frames = db.all(query, (chunk_id,))
+    exported_ids = {r["frame_id"] for r in db.all("SELECT e.frame_id FROM exports e JOIN frames f ON e.frame_id=f.id WHERE f.chunk_id=?", (chunk_id,))}
     for f in frames:
-        f["preview_url"] = f"/api/frames/{f['id']}/preview"
-        f["full_url"] = f"/api/frames/{f['id']}/full"
+        _enrich_frame_dict(f, exported_ids)
     return {"frames": frames}
 
 

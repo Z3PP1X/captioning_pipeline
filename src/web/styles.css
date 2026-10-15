@@ -75,32 +75,6 @@
   --font-display: Helvetica, Arial, "Noto Sans", sans-serif;
 }
 
-.dark {
-  --background: #14171F;
-  --foreground: #F4F5F6;
-  --canvas: #0D0F14;
-  --card: #1B1F2A;
-  --card-foreground: #F4F5F6;
-  --popover: #1B1F2A;
-  --popover-foreground: #F4F5F6;
-  --primary: #D73816;
-  --primary-foreground: #FFFFFF;
-  --brand: #E33B17;
-  --secondary: #262B38;
-  --secondary-foreground: #F4F5F6;
-  --muted: #222734;
-  --muted-foreground: #9EA3AB;
-  --accent: #222734;
-  --accent-foreground: #F4F5F6;
-  --destructive: #E03545;
-  --destructive-foreground: #FFFFFF;
-  --border: #2C3345;
-  --input: #454F65;
-  --ring: #D73816;
-  --sidebar: #14171F;
-  --sidebar-foreground: #F4F5F6;
-}
-
 body {
   background-color: var(--canvas);
   color: var(--foreground);
@@ -109,7 +83,6 @@ body {
   padding: 0;
   overflow: hidden;
   height: 100vh;
-  user-select: none;
   -webkit-font-smoothing: antialiased;
 }
 

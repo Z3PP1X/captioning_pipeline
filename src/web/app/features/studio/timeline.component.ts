@@ -23,7 +23,7 @@ import { ChunkItem } from '../../core/models/chunk.model';
       <!-- Filmstrip Track Container -->
       <div
         #trackContainer
-        class="group relative h-22 md:h-24 w-full rounded-lg border border-border bg-black/60 overflow-hidden cursor-pointer"
+        class="group relative h-22 md:h-24 w-full rounded-lg border border-border bg-secondary overflow-hidden cursor-pointer"
         (mousedown)="onMouseDown($event)"
         (mousemove)="onMouseMove($event)"
         (mouseleave)="onMouseLeave()"
@@ -45,7 +45,7 @@ import { ChunkItem } from '../../core/models/chunk.model';
           @for (cut of chunkService.cuts(); track cut) {
             @let cutPct = getPercent(cut);
             <div
-              class="absolute top-0 bottom-0 w-[1.5px] bg-yellow-400/80 z-10"
+              class="absolute top-0 bottom-0 w-[2px] bg-background/80 z-10"
               [style.left.%]="cutPct"
               title="Scene cut at {{ cut.toFixed(2) }}s"
             ></div>
@@ -58,7 +58,7 @@ import { ChunkItem } from '../../core/models/chunk.model';
             @let startPct = getPercent(chunk.start_s);
             @let widthPct = getPercent(chunk.end_s) - startPct;
             <div
-              class="absolute top-1.5 bottom-1.5 rounded border border-primary/70 bg-primary/25 z-10 flex items-center justify-center text-[11px] font-bold text-primary-foreground overflow-hidden cursor-pointer pointer-events-auto hover:bg-primary/40 transition-colors shadow-xs"
+              class="absolute top-1.5 bottom-1.5 rounded-md border border-primary/70 bg-primary/25 z-10 flex items-center justify-center text-xs font-bold text-primary-foreground overflow-hidden cursor-pointer pointer-events-auto hover:bg-primary/40 transition-colors shadow-xs"
               [style.left.%]="startPct"
               [style.width.%]="widthPct"
               (click)="onChunkClick(chunk, $event)"
@@ -74,7 +74,7 @@ import { ChunkItem } from '../../core/models/chunk.model';
           @let inPct = getPercent(chunkService.inPoint()!);
           @let outPct = getPercent(chunkService.outPoint()!);
           <div
-            class="absolute top-0 bottom-0 bg-accent/30 border-x-2 border-accent z-20 pointer-events-none"
+            class="absolute top-0 bottom-0 bg-warning/30 border-x-2 border-warning z-20 pointer-events-none"
             [style.left.%]="inPct"
             [style.width.%]="outPct - inPct"
           ></div>
@@ -91,14 +91,14 @@ import { ChunkItem } from '../../core/models/chunk.model';
           class="absolute top-0 flex flex-col pointer-events-none z-40"
           [class]="playheadLabelClass()"
         >
-          <span class="rounded bg-primary px-1.5 py-0.5 font-mono text-[10px] font-bold text-primary-foreground shadow-md whitespace-nowrap">
+          <span class="rounded-md bg-primary px-1.5 py-0.5 tabular-nums text-xs font-bold text-primary-foreground shadow-md whitespace-nowrap">
             {{ formatHms(currentTime()) }}
           </span>
           <div class="size-0 border-x-3 border-x-transparent border-t-3 border-t-primary self-center"></div>
         </div>
 
         <!-- Marker Circle Head -->
-        <div class="absolute top-[22px] -left-1.5 size-3.5 rounded-full bg-primary ring-2 ring-white shadow-md"></div>
+        <div class="absolute top-[22px] -left-1.5 size-3.5 rounded-full bg-primary ring-2 ring-background shadow-md"></div>
 
         <!-- Playhead Vertical Line Across Track -->
         <div class="absolute top-[28px] bottom-0 left-0 w-[2px] bg-primary shadow-md"></div>

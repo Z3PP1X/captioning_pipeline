@@ -17,6 +17,7 @@ export class ChunkService {
   readonly snapCuts = signal<boolean>(true);
   readonly isExtracting = signal<boolean>(false);
   readonly requestedSeekTime = signal<number | null>(null);
+  readonly isDirty = signal<boolean>(false);
 
   readonly budgetSum = computed(() => {
     return Math.round(
@@ -24,13 +25,47 @@ export class ChunkService {
     );
   });
 
+  normalizeBudgets(): void {
+    const list = this.chunks();
+    if (list.length === 0) return;
+    const count = list.length;
+    const currentSum = this.budgetSum();
+    if (currentSum === 100) return;
+
+    if (currentSum === 0) {
+      const equalShare = Math.floor(100 / count);
+      const remainder = 100 % count;
+      const updated = list.map((c, idx) => ({
+        ...c,
+        budget_pct: idx === 0 ? equalShare + remainder : equalShare,
+      }));
+      this.chunks.set(updated);
+      this.isDirty.set(true);
+      return;
+    }
+
+    let allocated = 0;
+    const updated = list.map((c, idx) => {
+      if (idx === count - 1) {
+        return { ...c, budget_pct: Math.max(0, 100 - allocated) };
+      }
+      const pct = Math.max(0, Math.round(((c.budget_pct || 0) / currentSum) * 100));
+      allocated += pct;
+      return { ...c, budget_pct: pct };
+    });
+    this.chunks.set(updated);
+    this.isDirty.set(true);
+  }
+
   async loadChunks(videoId: string | number): Promise<void> {
     try {
       const data = await this.api.get<{ chunks?: ChunkItem[] }>(`/api/videos/${videoId}/chunks`);
       this.chunks.set(data.chunks || []);
+      this.isDirty.set(false);
     } catch (err) {
       console.error('Failed to load chunks:', err);
       this.chunks.set([]);
+      this.isDirty.set(false);
     }
   }
 
@@ -50,7 +85,6 @@ export class ChunkService {
     if (start >= end) return false;
     const current = this.chunks();
     if (current.length >= 15) {
-      alert('Maximum 15 chunks allowed.');
       return false;
     }
 
@@ -78,6 +112,7 @@ export class ChunkService {
     this.chunks.set(updated);
     this.inPoint.set(null);
     this.outPoint.set(null);
+    this.isDirty.set(true);
     return true;
   }
 
@@ -85,6 +120,7 @@ export class ChunkService {
     const list = this.chunks().filter((_, i) => i !== index);
     list.forEach((c, i) => (c.position = i));
     this.chunks.set(list);
+    this.isDirty.set(true);
   }
 
   setAllModels(model: string): void {
@@ -111,6 +147,7 @@ export class ChunkService {
       }
       return updated;
     });
+    this.isDirty.set(true);
   }
 
   /** `confirmDestructive` allows replacing chunks that hold picks (the backend answers 409 otherwise). */
@@ -121,6 +158,7 @@ export class ChunkService {
         { confirm_destructive: confirmDestructive }
       );
       this.chunks.set(data.suggested || data.chunks || []);
+      this.isDirty.set(true);
     } catch (err) {
       console.error('Failed to auto-suggest chunks:', err);
       throw err;
@@ -133,6 +171,7 @@ export class ChunkService {
       const payload = { chunks: this.chunks(), confirm_destructive: confirmDestructive };
       await this.api.put(`/api/videos/${videoId}/chunks`, payload);
       await this.loadChunks(videoId);
+      this.isDirty.set(false);
     } catch (err) {
       console.error('Failed to save chunks:', err);
       throw err;
@@ -142,6 +181,10 @@ export class ChunkService {
   async extract750(videoId: string | number): Promise<void> {
     try {
       this.isExtracting.set(true);
+      if (this.isDirty() || this.budgetSum() !== 100) {
+        this.normalizeBudgets();
+        await this.saveChunks(videoId, false);
+      }
       await this.api.post(`/api/videos/${videoId}/extract-750`);
     } catch (err) {
       console.error('Failed to start 750 extraction:', err);

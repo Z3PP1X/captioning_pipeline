@@ -47,14 +47,14 @@ Chunk = { id, video_id, position, start_s, end_s, k, budget_pct, caption_model: 
 | `POST /api/videos/{id}/extract-750` (alias `extract_750`) | `{}` | `{job_id, status:"queued"}` |
 | `GET /api/videos/{id}/curation-300` | - | `{video, chunks, scene_stats (=chunks), picks, runners, candidates (=picks+runners), stats, distribution}` |
 | `GET /api/videos/{id}/candidates` | - | `{frames, candidates (=frames), picks, runners, stats, distribution, scene_stats}` |
-| `GET /api/chunks/{chunk_id}/candidates` | - | `{frames}` (only `preview_url`/`full_url` added) |
-| `POST /api/videos/{id}/swap-frame` | `{deselected_frame_id}` or `{drop_frame_id, pick_frame_id?}` | `{status, swapped_in:{id}, swapped_out:{id}, dropped, picks, runners, stats, distribution}` (picks/runners rows here lack `is_pick/is_captioned/time_s/thumb_url`) |
+| `GET /api/chunks/{chunk_id}/candidates` | - | `{frames}` with all unified frame fields |
+| `POST /api/videos/{id}/swap-frame` | `{deselected_frame_id}` or `{drop_frame_id, pick_frame_id?}` | `{status, swapped_in:{id}, swapped_out:{id}, dropped, picks, runners, candidates, stats, distribution}`. Validates chunk containment (400) and video ID (400/404); auto-replacement picks best runner via $\operatorname{argmax}_j (\operatorname{sim}(\text{drop}, j) \cdot q_j)$. Promoted runner is re-decoded at full native resolution (`native=1`). All rows include `is_pick`, `is_captioned`, `time_s`, `thumb_url`, `native`, and unified chunk fields |
 | `PATCH /api/picks/{frame_id}` | `{state?, role?, crop?}` | `{pick}` |
-| `POST /api/videos/{id}/candidates/{frame_id}/state` | `{state}` | `{status, frame_id, state}`; inserts a pick row with `role='candidate'`, `rank=999` if none exists |
+| `POST /api/videos/{id}/candidates/{frame_id}/state` | `{state}` | `{status, frame_id, state}`; validates state in `('keep', 'reject', 'star', 'candidate', null)` (400 if invalid); inserts fallback pick row with `role='runner_up'`, `rank=999`; re-decodes native full-res image when state in `('keep', 'star')` |
 | `POST /api/videos/{id}/curate/keep_all` / `reject_all` | - | `{status, video_id}` sets state of all `role='pick'` rows (server-side bulk; no chunk filter) |
 | `GET /api/frames/{id}/preview` (webp) / `/full` (png) / `GET /api/videos/{id}/frames/{fid}/thumb` | - | images |
 
-Frame row (candidates / curation-300): `{id, video_id, chunk_id, t, time_s, metrics, zs_scores, role, rank, state, crop, preview_url, thumb_url, full_url, is_pick, is_captioned}` plus per endpoint: curation-300 -> `chunk_pos, budget_pct, caption_model, preview_path, full_path`; candidates -> `chunk_position, chunk_start, chunk_end, chunk_rule, chunk_tags, chunk_notes, chunk_caption_model`. `is_captioned` = frame has an `exports` row. `state`: `keep|reject|star|candidate`; `role`: `pick|runner_up`.
+Frame row (candidates / curation-300 / swap / chunk candidates): unified across all endpoints: `{id, video_id, chunk_id, t, time_s, metrics, zs_scores, role, rank, state, crop, preview_url, thumb_url, full_url, is_pick, is_captioned, native, chunk_pos, chunk_position, chunk_start, chunk_end, budget_pct, caption_model}`. `is_captioned` = frame has an `exports` row. `native` = 1 if decoded at native camera resolution, 0 if downsampled runner. `state`: `keep|reject|star|candidate`; `role`: `pick|runner_up`.
 
 `distribution`/`stats` = `{multiple_pct, one_person_pct, tools_equipment_pct, face_visible_pct, total_frames}` (computed from `zs_scores`).
 
@@ -62,10 +62,10 @@ Frame row (candidates / curation-300): `{id, video_id, chunk_id, t, time_s, metr
 
 | Method + path | Body | Response |
 | --- | --- | --- |
-| `POST /api/videos/{id}/caption-openrouter` | `OpenRouterCaptionRequest` | `{job_id, status}` |
-| `POST /api/openrouter/batch_caption` | same fields + required `video_id`; `trigger_word` maps to `trigger` | same (400 if no `video_id`) |
+| `POST /api/videos/{id}/caption-openrouter` | `OpenRouterCaptionRequest` | `{job_id, status}`; **409 Conflict** if an active job already exists for this video. Captions run on dedicated 4-worker network executor |
+| `POST /api/openrouter/batch_caption` | same fields + required `video_id`; `trigger_word` maps to `trigger` | same (400 if no `video_id`, 409 if video is busy) |
 | `GET /api/openrouter/models` | - | `{models:[{id,name,recommended}]}` |
-| `POST /api/export` | `{video_id?, trigger_word?}` | with id: `{exported, stubs_written, captions_kept, per_video_dir, merged_dir}`; without: `{exported, videos_processed}` over statuses `curating, curating_300, chunked` with no queued/running job (`exported` videos are skipped). The exporter never overwrites a VLM caption; it writes tag stubs only for uncaptioned frames, marked by a `.json` sidecar with `caption_source:"stub"` (legacy sidecars without the field are stubs too), which the caption job replaces |
+| `POST /api/export` | `{video_id?, trigger_word?}` | with id: `{exported, stubs_written, captions_kept, per_video_dir, merged_dir}`; without: `{exported, videos_processed}` over statuses `curating, curating_300, chunked` with no queued/running job (`exported` videos are skipped). The exporter never overwrites a VLM caption; it writes tag stubs only for uncaptioned frames, marked by a `.json` sidecar with `caption_source:"stub"` (legacy sidecars without the field are stubs too), which the caption job replaces. Standardized `render_export_image` shared with captioner; `manifest.jsonl` deduped |
 | `GET /api/dataset` | - | `{total_exports, per_video:[{id,name,slug,count}], finished_dir}` |
 | `GET/PUT /api/settings` | partial object | `{settings}` (defaults deep-merged). `openrouter_api_key` is never returned; the response has `openrouter_api_key_set: bool`. A `PUT` with an empty key keeps the stored one |
 | `GET /api/jobs?video_id=` / `DELETE /api/jobs/{id}` | - | `{jobs}` (last 20) / `{cancelled}`: `false` for finished/unknown jobs. A queued job is cancelled at once; a running job emits `job_progress` step `Cancelling...` and ends as `cancelled` at its next checkpoint without touching frames/picks |
@@ -78,7 +78,7 @@ OpenRouterCaptionRequest { api_key?, model='google/gemma-4-31b-it', fallback_lay
   mode='concept'|'character'|'style', trigger='restrained_elegance', class_noun='woman',
   max_tokens=600 /* no 300 cap; cut-off replies (finish_reason length / no closing sentence) are retried, then the frame fails */,
   temperature=0.80, top_p=0.90 }
-VideoStatus = 'new'|'chunking'|'chunked'|'extracting'|'extracting_750'|'curating'|'curating_300'|'captioning'|'exported'|'skipped'|'ignored'
+VideoStatus = 'new'|'chunking'|'chunked'|'extracting'|'extracting_750'|'curating'|'curating_300'|'captioning'|'exported'|'skipped'|'ignored'|'broken'
 ```
 Not used by the UI: `POST /api/jobs`, `/auto-process`, `/batch-auto-process`.
 
@@ -93,19 +93,21 @@ Not used by the UI: `POST /api/jobs`, `/auto-process`, `/batch-auto-process`.
 | `GET /api/rag/categories` | - | `{categories}` taxonomy: `{equipment\|surroundings\|position\|camera_lighting: {title, icon, description, groups:{name:[{id,label,keywords}]}}}` |
 | `GET /api/rag/presets` | - | `{presets:[{id,title,description,tags:{category:[tagId]}}]}` |
 | `GET /api/rag/characters` | - | `{characters:{sara\|lene...: {id,name,age,avatar,summary,description,tag_tokens}}}` |
-| `POST /api/rag/retrieve` | `{selected_tags:{cat:[id]}, user_description, top_k=4}` | `{results:[...]}` hybrid tag + dense retrieval over indexed captions (`[]` if index empty) |
-| `POST /api/rag/generate` | `{selected_tags, user_description, character?, top_k=4, model, trigger, local_url?}` | `{..., archetypes:{a,b,c:{name,prompt,token_count,warnings,is_valid}}, rag_context:[{id,stem,score,matched_tags,img_rel_path,full_caption}]}` (top-level keys before `archetypes` not verified); `local_url` switches to an Ollama-style endpoint, else OpenRouter |
-| `GET /api/rag/preview/{caption_id}` | - | PNG; 404 if the RAG index (`~/.cache/captioning_pipeline/rag_index.sqlite`) isn't built (`scripts/index_rag.py`) |
+| `GET /api/rag/status` | - | `{running: bool, ready: bool, total_captions: int, indexed_captions: int, progress: float, error: str \| null, openrouter_key_configured: bool}` |
+| `POST /api/rag/index` | `{limit?: int}` | `{running, ready, total_captions, indexed_captions, progress}` starts background build; **409** if build already running |
+| `POST /api/rag/retrieve` | `{selected_tags:{cat:[id]}, user_description, top_k=4}` | `{results:[...], index_ready: bool}` hybrid tag + dense retrieval over indexed captions (`results: []` if index empty/not ready) |
+| `POST /api/rag/generate` | `{selected_tags, user_description, character?, top_k=4, model, trigger, local_url?, api_key?}` | `{archetypes:{a,b,c:{name,prompt,token_count,warnings,is_valid}}, rag_context:[...], grounded: bool, notices: string[]}`; **400** if OpenRouter key missing and not local; **502** (`RagUpstreamError`) if upstream API call fails |
+| `GET /api/rag/preview/{caption_id}` | - | PNG; 404 if the RAG index (`~/.cache/captioning_pipeline/rag_index.sqlite`) isn't built |
 
 ## Static serving (changed)
 
-`api.py` serves the Angular build: `src/web/dist/browser` (or `src/web/dist`) if it contains `index.html`, else falls back to `src/web`. It is mounted at `/static` **and** a catch-all `GET /{full_path:path}` returns real files (contained in the web root; `..` cannot escape) or `index.html` (SPA fallback). Unknown `GET /api/...` returns a JSON 404. Build with `<base href="/">`.
+`api.py` serves the Angular build: `src/web/dist/browser` (or `src/web/dist`) if it contains `index.html`, else falls back to `src/web`. It is mounted at `/static` **and** a catch-all `GET /{full_path:path}` returns real files (contained in the web root; `..` cannot escape) or `index.html` (SPA fallback). Unknown `GET /api/*` routes return a JSON 404 (`{"detail": "Unknown API route: /api/..."}`) rather than falling through to `index.html`. Build with `<base href="/">`.
 
 ## Remaining quirks (verified in current code)
 
-1. (fixed) Export-all now includes `curating_300`; see the export row above.
-2. **Mixed row shapes**: `swap-frame` rows and `chunks` from `PUT` lack the extra fields (`is_pick`, `is_captioned`, caption stats). After swap/save, merge or refetch rather than replacing state wholesale.
-3. **Chunk naming differs per endpoint** (`chunk_pos` in curation-300 vs `chunk_position`/`chunk_start/...` in candidates): prefer curation-300 + its `chunks` joined by `chunk_id`, normalise in one mapper.
+1. (fixed in Phase A) Export-all now includes `curating_300`; see the export row above.
+2. (fixed in Phase C) Row shapes unified: `swap-frame`, `curation-300`, `candidates`, and `chunks/{id}/candidates` now all include `is_pick`, `is_captioned`, `time_s`, `thumb_url`, `native`, and unified `chunk_pos`/`chunk_position`/`chunk_start`/`chunk_end`. `PUT /chunks` returns `scene_stats`.
+3. (fixed in Phase C) Per-video mutex active: concurrent extraction or caption jobs on the same video return HTTP 409 Conflict (`JobConflictError`). Executors segregated: decode executor (max 2 workers) vs caption executor (max 4 workers).
 4. **`PATCH /api/picks` doesn't rebalance**; use `swap-frame` for atomic swaps.
 5. **Settings**: `PUT /api/settings` accepts any keys unvalidated; validate ranges client-side (no `NaN`).
 6. **API key**: `api_key` in the caption body is optional; the job falls back to the key stored in user settings, then `OPENROUTER_API_KEY`. Never log or URL-embed it, and never return it from an endpoint.

@@ -41,6 +41,128 @@ def clamp_max_edge(img: np.ndarray, max_edge: int = 2048) -> np.ndarray:
     return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
 
 
+def apply_letterbox_crop(img: np.ndarray, letterbox: dict | None) -> np.ndarray:
+    if not letterbox or not isinstance(letterbox, dict):
+        return img
+    h, w = img.shape[:2]
+    top = int(letterbox.get("top", 0) * h)
+    bottom = int(letterbox.get("bottom", 0) * h)
+    left = int(letterbox.get("left", 0) * w)
+    right = int(letterbox.get("right", 0) * w)
+    if (top + bottom < h - 32) and (left + right < w - 32):
+        return img[top:h - bottom, left:w - right]
+    return img
+
+
+def apply_watermark_crop(img: np.ndarray, watermark_rect: dict | None) -> np.ndarray:
+    if not watermark_rect or not isinstance(watermark_rect, dict):
+        return img
+    h, w = img.shape[:2]
+    x = max(0, int(watermark_rect.get("x", 0) * w))
+    y = max(0, int(watermark_rect.get("y", 0) * h))
+    rw = min(w - x, int(watermark_rect.get("width", 0) * w))
+    rh = min(h - y, int(watermark_rect.get("height", 0) * h))
+    if rw <= 0 or rh <= 0:
+        return img
+    # If the watermark is along the bottom edge, crop off the bottom strip
+    if (y + rh >= int(h * 0.90)) and (rh < int(h * 0.35)):
+        new_h = max(32, y)
+        return img[:new_h, :]
+    # If the watermark is along the top edge, crop off the top strip
+    if (y <= int(h * 0.10)) and (rh < int(h * 0.35)):
+        new_y = min(h - 32, y + rh)
+        return img[new_y:, :]
+    return img
+
+
+def render_export_image(
+    img: np.ndarray,
+    crop: dict | None = None,
+    letterbox: dict | None = None,
+    watermark_rect: dict | None = None,
+    min_edge: int = 0,
+    max_edge: int = 2048,
+) -> np.ndarray | None:
+    """Standardized image processing pipeline for captioning and dataset export.
+    
+    1. Apply manual crop if present
+    2. Apply letterbox removal if present
+    3. Apply watermark crop if present
+    4. Check min_edge constraint
+    5. Clamp max_edge with Lanczos downscale
+    6. Snap to multiple of 16 for DiT/MMDiT latent compatibility
+    """
+    if img is None or img.size == 0:
+        return None
+
+    # 1. Manual crop
+    if crop and isinstance(crop, dict):
+        h, w = img.shape[:2]
+        cx0 = max(0, int(crop.get("x", 0) * w))
+        cy0 = max(0, int(crop.get("y", 0) * h))
+        cw = min(w - cx0, int(crop.get("width", 1) * w))
+        ch = min(h - cy0, int(crop.get("height", 1) * h))
+        if cw > 32 and ch > 32:
+            img = img[cy0:cy0 + ch, cx0:cx0 + cw]
+
+    # 2. Letterbox crop
+    img = apply_letterbox_crop(img, letterbox)
+
+    # 3. Watermark crop
+    img = apply_watermark_crop(img, watermark_rect)
+
+    # 4. Check min_edge
+    h, w = img.shape[:2]
+    if min_edge > 0 and min(h, w) < min_edge:
+        return None
+
+    # 5. Clamp max edge
+    if max_edge > 0:
+        img = clamp_max_edge(img, max_edge=max_edge)
+
+    # 6. Snap to multiple of 16
+    return snap_to_multiple_of_16(img)
+
+
+def append_manifest_record(manifest_path: Path, meta_payload: dict[str, Any]) -> None:
+    """Append a metadata record to manifest.jsonl without creating duplicate entries for the same file."""
+    stem = meta_payload.get("file_stem") or (Path(meta_payload["image"]).stem if meta_payload.get("image") else "")
+    vid_id = meta_payload.get("video_id")
+    ts = meta_payload.get("timestamp_s")
+
+    if manifest_path.is_file():
+        try:
+            lines = manifest_path.read_text(encoding="utf-8").splitlines(keepends=True)
+            found = False
+            new_lines = []
+            for line in lines:
+                is_match = False
+                if stem and f'"{stem}' in line:
+                    is_match = True
+                elif vid_id is not None and ts is not None and f'"{vid_id}"' in line:
+                    try:
+                        parsed = json.loads(line)
+                        if parsed.get("video_id") == vid_id and abs(float(parsed.get("timestamp_s", -999)) - float(ts)) < 0.001:
+                            is_match = True
+                    except Exception:
+                        pass
+
+                if is_match:
+                    new_lines.append(json.dumps(meta_payload) + "\n")
+                    found = True
+                else:
+                    new_lines.append(line)
+
+            if found:
+                manifest_path.write_text("".join(new_lines), encoding="utf-8")
+                return
+        except Exception:
+            pass
+
+    with open(manifest_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(meta_payload) + "\n")
+
+
 def existing_caption_kind(txt_path: Path) -> str | None:
     """Classify a caption file on disk: None (absent/empty), 'stub' (exporter-generated) or 'caption' (VLM).
 
@@ -111,6 +233,10 @@ class Exporter:
         if not kept_frames:
             return {"exported": 0, "msg": "No frames marked for keep"}
 
+        # Ensure any promoted runners have their native high-res frames decoded on disk (C1/H1)
+        from pipeline.decode import ensure_native_frames
+        ensure_native_frames(self.db, [item["id"] for item in kept_frames])
+
         exported_count = 0
         kept_captions = 0
         now = time.time()
@@ -143,31 +269,20 @@ class Exporter:
             if not full_path.is_file():
                 continue
 
-            img = cv2.imread(str(full_path))
+            raw_img = cv2.imread(str(full_path))
+            if raw_img is None:
+                continue
+
+            img = render_export_image(
+                raw_img,
+                crop=item.get("crop"),
+                letterbox=video.get("letterbox"),
+                watermark_rect=video.get("watermark_rect"),
+                min_edge=min_edge,
+                max_edge=max_edge,
+            )
             if img is None:
                 continue
-
-            # 1. Apply manual crop if present
-            crop_meta = item.get("crop")
-            if crop_meta and isinstance(crop_meta, dict):
-                h, w = img.shape[:2]
-                cx0 = max(0, int(crop_meta.get("x", 0) * w))
-                cy0 = max(0, int(crop_meta.get("y", 0) * h))
-                cw = min(w - cx0, int(crop_meta.get("width", 1) * w))
-                ch = min(h - cy0, int(crop_meta.get("height", 1) * h))
-                if cw > 32 and ch > 32:
-                    img = img[cy0:cy0 + ch, cx0:cx0 + cw]
-
-            # 2. Check minimum resolution
-            h, w = img.shape[:2]
-            if min_edge > 0 and min(h, w) < min_edge:
-                continue
-
-            # 3. Downscale with Lanczos if > max_edge
-            img = clamp_max_edge(img, max_edge=max_edge)
-
-            # 4. Snap to multiples of 16 (for MMDiT/DiT latents)
-            img = snap_to_multiple_of_16(img)
 
             # Save PNG (sRGB, EXIF-free)
             cv2.imwrite(str(per_img_path), img)
@@ -233,9 +348,8 @@ class Exporter:
             ]:
                 link_or_copy(src_p, dst_p)
 
-            # Append to JSONL manifest
-            with open(manifest_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(meta_payload) + "\n")
+            # Append to JSONL manifest without duplicate entries
+            append_manifest_record(manifest_path, meta_payload)
 
             self._record_export(item["id"], per_img_path, merged_img_path, now)
             exported_count += 1

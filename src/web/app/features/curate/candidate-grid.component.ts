@@ -5,7 +5,6 @@ import {
   inject,
   output,
 } from '@angular/core';
-import { FormsModule } from '@angular/forms';
 import { NgIcon, provideIcons } from '@ng-icons/core';
 import {
   lucideCheck,
@@ -14,11 +13,18 @@ import {
   lucideArrowLeftRight,
   lucideArrowUp,
   lucidePlay,
+  lucideClock,
+  lucideFilm,
+  lucideSearch,
+  lucideTag,
 } from '@ng-icons/lucide';
 import { HlmButtonImports } from '@spartan-ng/helm/button';
+import { HlmBadgeImports } from '@spartan-ng/helm/badge';
+import { HlmSkeletonImports } from '@spartan-ng/helm/skeleton';
 import { CurateService } from '../../core/services/curate.service';
 import { ChunkService } from '../../core/services/chunk.service';
 import { VideoService } from '../../core/services/video.service';
+import { SettingsService } from '../../core/services/settings.service';
 import { formatShortTime } from '../../core/utils/time.utils';
 import { CandidateFrame, CandidateState } from '../../core/models/candidate.model';
 import { ChunkItem } from '../../core/models/chunk.model';
@@ -40,7 +46,7 @@ export interface ChunkCandidateGroup {
 
 @Component({
   selector: 'app-candidate-grid',
-  imports: [FormsModule, NgIcon, HlmButtonImports],
+  imports: [NgIcon, HlmButtonImports, HlmBadgeImports, HlmSkeletonImports],
   providers: [
     provideIcons({
       lucideCheck,
@@ -49,6 +55,10 @@ export interface ChunkCandidateGroup {
       lucideArrowLeftRight,
       lucideArrowUp,
       lucidePlay,
+      lucideClock,
+      lucideFilm,
+      lucideSearch,
+      lucideTag,
     }),
   ],
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -57,38 +67,69 @@ export interface ChunkCandidateGroup {
   },
   template: `
     <div class="flex-1 min-h-0 overflow-y-auto pr-1 pb-16 space-y-4">
-      @for (group of chunkGroups(); track group.chunkId) {
+      @if (curateService.isLoading()) {
+        <!-- Skeleton loading state (B11) -->
+        <div class="space-y-6 animate-in fade-in p-2">
+          <div class="flex items-center gap-3">
+            <span hlmSkeleton class="h-6 w-32 rounded-md"></span>
+            <span hlmSkeleton class="h-6 w-48 rounded-md"></span>
+          </div>
+          <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3">
+            @for (i of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]; track i) {
+              <div class="flex flex-col gap-2 rounded-xl border border-border p-2 bg-card">
+                <span hlmSkeleton class="aspect-video w-full rounded-lg"></span>
+                <div class="flex justify-between items-center px-1">
+                  <span hlmSkeleton class="h-4 w-12 rounded"></span>
+                  <span hlmSkeleton class="h-4 w-16 rounded"></span>
+                </div>
+              </div>
+            }
+          </div>
+        </div>
+      } @else {
+        @for (group of chunkGroups(); track group.chunkId) {
         <!-- Chunk Container Section -->
         <section class="flex flex-col gap-3 rounded-xl border border-border bg-card p-3 md:p-4 shadow-xs">
           <!-- Chunk Section Header -->
           <div class="flex flex-wrap items-center justify-between gap-2.5 border-b border-border pb-2.5">
             <!-- Left: Chunk Badge, Time Range, Tags, Picks Count, Caption Status -->
             <div class="flex items-center gap-2 flex-wrap">
-              <span class="rounded px-2 py-0.5 text-xs font-bold bg-primary/10 text-primary border border-primary/20 uppercase tracking-wider">
+              <span class="rounded-md px-2 py-0.5 text-xs font-bold bg-primary/10 text-primary border border-primary/20 uppercase tracking-wider">
                 Chunk #{{ group.chunkNumber }}
               </span>
 
-              <span class="font-mono text-xs text-muted-foreground">
+              <span class="tabular-nums text-xs text-muted-foreground">
                 {{ formatShortTime(group.start_s) }} → {{ formatShortTime(group.end_s) }} ({{ group.duration_s }}s)
               </span>
 
               @if (group.tags) {
-                <span class="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground font-medium">
-                  🏷️ {{ group.tags }}
+                <span class="rounded-md bg-muted px-2 py-0.5 text-xs text-muted-foreground font-medium flex items-center gap-1">
+                  <ng-icon name="lucideTag" class="size-3" />
+                  <span>{{ group.tags }}</span>
                 </span>
               }
 
-              <span class="rounded-full bg-muted/80 px-2 py-0.5 text-[11px] font-semibold text-foreground">
+              <span class="rounded-full bg-muted/80 px-2 py-0.5 text-xs font-semibold text-foreground tabular-nums">
                 {{ group.picksCount }} picks / {{ group.totalCount }} candidates
               </span>
 
               @if (group.isFullyCaptioned) {
-                <span class="rounded px-1.5 py-0.5 text-[10px] font-bold bg-success/15 text-success border border-success/30">
-                  ✓ Captioned ({{ group.captionedCount }}/{{ group.picksCount }})
+                <span
+                  hlmBadge
+                  variant="success"
+                  class="gap-1 text-xs"
+                >
+                  <ng-icon name="lucideCheck" class="size-3" />
+                  Captioned ({{ group.captionedCount }}/{{ group.picksCount }})
                 </span>
               } @else if (group.captionedCount > 0) {
-                <span class="rounded px-1.5 py-0.5 text-[10px] font-medium bg-primary/10 text-primary border border-primary/20">
-                  ⏳ {{ group.captionedCount }}/{{ group.picksCount }}
+                <span
+                  hlmBadge
+                  variant="outline"
+                  class="gap-1 text-xs"
+                >
+                  <ng-icon name="lucideClock" class="size-3" />
+                  {{ group.captionedCount }}/{{ group.picksCount }}
                 </span>
               }
             </div>
@@ -96,17 +137,14 @@ export interface ChunkCandidateGroup {
             <!-- Right: Actions (Caption Model Selector, Keep All in Chunk, Deselect All in Chunk, Seek) -->
             <div class="flex items-center gap-2">
               <select
-                [ngModel]="group.captionModel"
-                (ngModelChange)="onModelChange(group.chunkId, $event)"
+                [value]="group.captionModel"
+                (change)="onModelChange(group.chunkId, $any($event.target).value)"
                 class="h-7 rounded border border-input bg-card px-2 text-xs text-foreground focus:ring-1 focus:ring-ring cursor-pointer"
                 title="Captioning Model for Chunk #{{ group.chunkNumber }}"
               >
-                <option value="google/gemma-4-31b-it">Gemma 4 (Default)</option>
-                <option value="deepseek/deepseek-v4.1-flash">DeepSeek V4.1 Flash</option>
-                <option value="google/gemini-2.0-flash-exp:free">Gemini 2.0 Free</option>
-                <option value="qwen/qwen-2.5-vl-72b-instruct">Qwen 2.5 VL 72B</option>
-                <option value="x-ai/grok-4.7">Grok 4.7</option>
-                <option value="mistralai/pixtral-12b">Pixtral 12B</option>
+                @for (m of settingsService.openRouterModels(); track m.id) {
+                  <option [value]="m.id">{{ m.name }}</option>
+                }
               </select>
 
               <button
@@ -168,34 +206,59 @@ export interface ChunkCandidateGroup {
                 <!-- Card Thumbnail (click to open Lightbox) -->
                 <div
                   (click)="curateService.openLightbox(c.id)"
-                  class="relative aspect-video w-full bg-black cursor-pointer overflow-hidden"
+                  (keydown.enter)="curateService.openLightbox(c.id)"
+                  (keydown.space)="curateService.openLightbox(c.id); $event.preventDefault()"
+                  role="button"
+                  tabindex="0"
+                  [attr.aria-label]="'Frame at ' + formatShortTime(c.t !== undefined ? c.t : c.time_s) + '. Open in lightbox'"
+                  class="relative aspect-video w-full bg-secondary cursor-pointer overflow-hidden focus:outline-none focus:ring-2 focus:ring-ring"
                 >
                   <img
                     [src]="getThumbUrl(c)"
                     [alt]="'Frame at ' + (c.t !== undefined ? c.t : c.time_s)"
-                    class="w-full h-full object-cover transition-transform group-hover:scale-105"
+                    class="w-full h-full object-cover transition-transform motion-safe:group-hover:scale-105"
                     loading="lazy"
                   />
 
                   <!-- Top Badges Overlay -->
-                  <div class="absolute top-1.5 left-1.5 right-1.5 flex items-center justify-between pointer-events-none text-[10px]">
+                  <div class="absolute top-1.5 left-1.5 right-1.5 flex items-center justify-between pointer-events-none text-xs">
                     <div class="flex items-center gap-1">
                       <span
-                        class="rounded px-1.5 py-0.5 font-bold uppercase drop-shadow"
+                        class="rounded-md px-1.5 py-0.5 font-bold uppercase drop-shadow text-xs"
                         [class]="c.is_pick ? 'bg-primary text-primary-foreground' : 'bg-muted/80 text-foreground'"
                       >
                         {{ c.is_pick ? 'Pick' : 'Runner' }}
                       </span>
 
+                      @if (isStarred) {
+                        <span hlmBadge variant="warning" class="shrink-0 text-[10px] px-1 py-0 h-4 font-bold drop-shadow">
+                          Star
+                        </span>
+                      } @else if (isKept) {
+                        <span hlmBadge variant="success" class="shrink-0 text-[10px] px-1 py-0 h-4 font-bold drop-shadow">
+                          Kept
+                        </span>
+                      } @else if (isRejected) {
+                        <span hlmBadge variant="destructive" class="shrink-0 text-[10px] px-1 py-0 h-4 font-bold drop-shadow">
+                          Reject
+                        </span>
+                      }
+
                       @if (c.is_captioned) {
-                        <span class="rounded bg-success px-1.5 py-0.5 font-bold uppercase text-white drop-shadow">
-                          ✓ Captioned
+                        <span
+                          hlmBadge
+                          variant="outline"
+                          class="shrink-0 text-xs px-1.5 py-0 bg-background/90 font-medium gap-1"
+                          title="Captioned"
+                        >
+                          <ng-icon name="lucideCheck" class="size-2.5 text-success" />
+                          Captioned
                         </span>
                       }
                     </div>
 
                     @if (c.score !== undefined) {
-                      <span class="rounded bg-black/70 px-1.5 py-0.5 font-mono text-white">
+                      <span class="rounded-md bg-secondary/80 px-1.5 py-0.5 text-xs tabular-nums text-white">
                         {{ (c.score * 100).toFixed(0) }}
                       </span>
                     }
@@ -203,7 +266,7 @@ export interface ChunkCandidateGroup {
 
                   <!-- Bottom Timestamp Overlay -->
                   <div class="absolute bottom-1 left-1.5 pointer-events-none">
-                    <span class="rounded bg-black/70 px-1 py-0.5 font-mono text-[10px] text-white">
+                    <span class="rounded-md bg-secondary/80 px-1 py-0.5 tabular-nums text-xs text-white">
                       {{ formatShortTime(c.t !== undefined ? c.t : c.time_s) }}
                     </span>
                   </div>
@@ -214,27 +277,30 @@ export interface ChunkCandidateGroup {
                   <div class="flex items-center gap-1">
                     <button
                       (click)="onSetState(c, 'keep')"
-                      class="p-1 rounded hover:bg-muted text-muted-foreground hover:text-success"
+                      class="size-6 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-success cursor-pointer"
                       [class.text-success]="c.state === 'keep'"
                       title="Keep frame (K)"
+                      aria-label="Keep frame (K)"
                     >
                       <ng-icon name="lucideCheck" class="size-3.5" />
                     </button>
 
                     <button
                       (click)="onSetState(c, 'star')"
-                      class="p-1 rounded hover:bg-muted text-muted-foreground hover:text-warning"
+                      class="size-6 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-warning cursor-pointer"
                       [class.text-warning]="c.state === 'star'"
                       title="Star frame (S)"
+                      aria-label="Star frame (S)"
                     >
                       <ng-icon name="lucideStar" class="size-3.5" />
                     </button>
 
                     <button
                       (click)="onSetState(c, 'reject')"
-                      class="p-1 rounded hover:bg-muted text-muted-foreground hover:text-destructive"
+                      class="size-6 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-destructive cursor-pointer"
                       [class.text-destructive]="c.state === 'reject'"
                       title="Reject frame (X)"
+                      aria-label="Reject frame (X)"
                     >
                       <ng-icon name="lucideX" class="size-3.5" />
                     </button>
@@ -243,8 +309,9 @@ export interface ChunkCandidateGroup {
                   <div>
                     <button
                       (click)="onSwap(c)"
-                      class="p-1 rounded hover:bg-muted text-muted-foreground hover:text-primary"
+                      class="size-6 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-primary cursor-pointer"
                       [title]="c.is_pick ? 'Swap with next best runner-up candidate' : 'Promote runner-up to pick'"
+                      [attr.aria-label]="c.is_pick ? 'Swap with runner-up' : 'Promote runner-up to pick'"
                     >
                       <ng-icon [name]="c.is_pick ? 'lucideArrowLeftRight' : 'lucideArrowUp'" class="size-3.5" />
                     </button>
@@ -255,10 +322,25 @@ export interface ChunkCandidateGroup {
           </div>
         </section>
       } @empty {
-        <div class="py-16 text-center text-xs text-muted-foreground">
-          No candidates match the current filter or none extracted yet.
-        </div>
+        @if (curateService.candidates().length === 0) {
+          <div class="flex flex-col items-center justify-center py-20 text-center gap-2">
+            <ng-icon name="lucideFilm" class="size-8 text-muted-foreground/60" />
+            <p class="font-bold text-sm text-foreground">No Candidates Extracted</p>
+            <p class="text-xs text-muted-foreground max-w-sm">
+              No frames have been extracted for this video yet. Go to the Studio tab and click "Extract & Score 750" to generate candidate frames.
+            </p>
+          </div>
+        } @else {
+          <div class="flex flex-col items-center justify-center py-20 text-center gap-2">
+            <ng-icon name="lucideSearch" class="size-8 text-muted-foreground/60" />
+            <p class="font-bold text-sm text-foreground">No Matching Candidates</p>
+            <p class="text-xs text-muted-foreground max-w-sm">
+              No candidates match the active role or category filters. Try clearing or expanding your filters in the toolbar above.
+            </p>
+          </div>
+        }
       }
+    }
     </div>
   `,
 })
@@ -266,6 +348,7 @@ export class CandidateGridComponent {
   readonly curateService = inject(CurateService);
   readonly chunkService = inject(ChunkService);
   private readonly videoService = inject(VideoService);
+  readonly settingsService = inject(SettingsService);
 
   readonly seekChunk = output<number>();
   readonly formatShortTime = formatShortTime;

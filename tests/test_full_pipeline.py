@@ -196,7 +196,8 @@ def test_concurrent_job_manager():
 
         jm = JobManager(db, settings)
         try:
-            assert jm.executor._max_workers == 4
+            assert jm.caption_executor._max_workers == 4
+            assert jm.decode_executor._max_workers in (1, 2)
             # Hold submitted jobs in 'queued' so cancellation is deterministic (no worker race)
             held: list[tuple] = []
             real_submit = jm.executor.submit

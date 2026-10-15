@@ -28,7 +28,10 @@ import { CandidateState } from '../../core/models/candidate.model';
   template: `
     @if (candidate(); as c) {
       <div
-        class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 animate-in fade-in select-none"
+        class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-xs p-4 animate-in fade-in select-none"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Image Lightbox Preview"
         (click)="onBackdropClick($event)"
       >
         <div
@@ -38,7 +41,9 @@ import { CandidateState } from '../../core/models/candidate.model';
           <!-- Close Button -->
           <button
             (click)="curateService.closeLightbox()"
-            class="absolute top-3 right-3 z-20 flex size-8 items-center justify-center rounded-full bg-black/60 text-white hover:bg-black/90 transition-all cursor-pointer"
+            class="absolute top-3 right-3 z-20 flex size-8 items-center justify-center rounded-full bg-secondary/80 text-secondary-foreground hover:bg-secondary transition-all cursor-pointer"
+            title="Close Lightbox (Escape)"
+            aria-label="Close Lightbox"
           >
             <ng-icon name="lucideX" class="size-4" />
           </button>
@@ -47,15 +52,16 @@ import { CandidateState } from '../../core/models/candidate.model';
           <div class="relative flex-1 bg-black flex items-center justify-center min-h-[300px] lg:min-h-[500px]">
             <img
               [src]="getFullUrl(c)"
-              [alt]="'Full resolution frame at ' + c.time_s"
+              [alt]="'Full resolution frame at ' + formatTime(c.time_s)"
               class="max-h-[85vh] max-w-full object-contain"
             />
 
             <!-- Prev Arrow -->
             <button
               (click)="curateService.prevLightbox()"
-              class="absolute left-3 top-1/2 -translate-y-1/2 flex size-10 items-center justify-center rounded-full bg-black/60 text-white hover:bg-black/90 transition-all cursor-pointer"
+              class="absolute left-3 top-1/2 -translate-y-1/2 flex size-10 items-center justify-center rounded-full bg-secondary/80 text-secondary-foreground hover:bg-secondary transition-all cursor-pointer shadow-md"
               title="Previous frame (Left arrow)"
+              aria-label="Previous frame"
             >
               <ng-icon name="lucideChevronLeft" class="size-6" />
             </button>
@@ -63,8 +69,9 @@ import { CandidateState } from '../../core/models/candidate.model';
             <!-- Next Arrow -->
             <button
               (click)="curateService.nextLightbox()"
-              class="absolute right-3 top-1/2 -translate-y-1/2 flex size-10 items-center justify-center rounded-full bg-black/60 text-white hover:bg-black/90 transition-all cursor-pointer"
+              class="absolute right-3 top-1/2 -translate-y-1/2 flex size-10 items-center justify-center rounded-full bg-secondary/80 text-secondary-foreground hover:bg-secondary transition-all cursor-pointer shadow-md"
               title="Next frame (Right arrow)"
+              aria-label="Next frame"
             >
               <ng-icon name="lucideChevronRight" class="size-6" />
             </button>
@@ -75,13 +82,15 @@ import { CandidateState } from '../../core/models/candidate.model';
             <!-- Timecode & Status -->
             <div class="flex items-center justify-between border-b border-border pb-3">
               <div>
-                <h4 class="font-mono text-base font-bold text-foreground">
+                <h4 class="text-base font-bold text-foreground tabular-nums">
                   {{ formatTime(c.time_s) }}
                 </h4>
-                <span class="text-xs text-muted-foreground">Chunk #{{ c.chunk_id }}</span>
+                <span class="text-xs text-muted-foreground">
+                  Chunk #{{ (c.chunk_position !== undefined ? c.chunk_position + 1 : c.chunk_id) }}
+                </span>
               </div>
               <span
-                class="px-2 py-0.5 rounded text-xs font-bold uppercase"
+                class="px-2 py-0.5 rounded-md text-xs font-bold uppercase tracking-wide"
                 [class]="c.is_pick ? 'bg-primary text-primary-foreground' : 'bg-muted text-foreground'"
               >
                 {{ c.is_pick ? 'Pick' : 'Runner' }}
@@ -95,21 +104,25 @@ import { CandidateState } from '../../core/models/candidate.model';
                 [variant]="c.state === 'keep' ? 'default' : 'outline'"
                 size="sm"
                 (click)="onSetState('keep')"
-                class="flex-1 cursor-pointer gap-1"
+                aria-label="Keep frame (Hotkey K)"
+                class="flex-1 cursor-pointer gap-1 font-semibold"
               >
                 <ng-icon name="lucideCheck" class="size-3.5" />
-                <span>Keep <kbd class="text-[10px]">K</kbd></span>
+                <span>Keep <kbd class="text-xs">K</kbd></span>
               </button>
 
               <button
                 hlmBtn
-                [variant]="c.state === 'star' ? 'default' : 'outline'"
+                [variant]="c.state === 'star' ? 'secondary' : 'outline'"
                 size="sm"
                 (click)="onSetState('star')"
-                class="flex-1 cursor-pointer gap-1"
+                aria-label="Star frame (Hotkey S)"
+                class="flex-1 cursor-pointer gap-1 font-semibold"
+                [class.ring-1]="c.state === 'star'"
+                [class.ring-warning]="c.state === 'star'"
               >
                 <ng-icon name="lucideStar" class="size-3.5 text-warning" />
-                <span>Star <kbd class="text-[10px]">S</kbd></span>
+                <span>Star <kbd class="text-xs">S</kbd></span>
               </button>
 
               <button
@@ -117,10 +130,11 @@ import { CandidateState } from '../../core/models/candidate.model';
                 [variant]="c.state === 'reject' ? 'destructive' : 'outline'"
                 size="sm"
                 (click)="onSetState('reject')"
-                class="flex-1 cursor-pointer gap-1"
+                aria-label="Reject frame (Hotkey X)"
+                class="flex-1 cursor-pointer gap-1 font-semibold"
               >
                 <ng-icon name="lucideX" class="size-3.5" />
-                <span>Reject <kbd class="text-[10px]">X</kbd></span>
+                <span>Reject <kbd class="text-xs">X</kbd></span>
               </button>
             </div>
 
@@ -132,33 +146,33 @@ import { CandidateState } from '../../core/models/candidate.model';
 
               <div class="space-y-2 text-xs">
                 @let m = c.metrics;
-                <div class="flex justify-between items-center">
-                  <span class="text-muted-foreground">Combined Score:</span>
-                  <span class="font-mono font-bold text-primary">{{ ((c.score || 0) * 100).toFixed(1) }}</span>
+                <div class="flex justify-between items-center py-0.5 border-b border-border/40">
+                  <span class="text-muted-foreground font-medium">Combined Score:</span>
+                  <span class="tabular-nums font-bold text-primary">{{ ((c.score || 0) * 100).toFixed(1) }}</span>
                 </div>
-                <div class="flex justify-between items-center">
+                <div class="flex justify-between items-center py-0.5 border-b border-border/40">
                   <span class="text-muted-foreground">Blur Laplacian:</span>
-                  <span class="font-mono">{{ (m?.blur_laplacian || 0).toFixed(1) }}</span>
+                  <span class="tabular-nums font-medium text-foreground">{{ (m?.blur_laplacian || 0).toFixed(1) }}</span>
                 </div>
-                <div class="flex justify-between items-center">
+                <div class="flex justify-between items-center py-0.5 border-b border-border/40">
                   <span class="text-muted-foreground">Color Entropy:</span>
-                  <span class="font-mono">{{ (m?.color_entropy || 0).toFixed(2) }}</span>
+                  <span class="tabular-nums font-medium text-foreground">{{ (m?.color_entropy || 0).toFixed(2) }}</span>
                 </div>
-                <div class="flex justify-between items-center">
+                <div class="flex justify-between items-center py-0.5 border-b border-border/40">
                   <span class="text-muted-foreground">Edge Density:</span>
-                  <span class="font-mono">{{ (m?.edge_density || 0).toFixed(3) }}</span>
+                  <span class="tabular-nums font-medium text-foreground">{{ (m?.edge_density || 0).toFixed(3) }}</span>
                 </div>
-                <div class="flex justify-between items-center">
+                <div class="flex justify-between items-center py-0.5 border-b border-border/40">
                   <span class="text-muted-foreground">Face Score:</span>
-                  <span class="font-mono">{{ ((m?.face_score || 0) * 100).toFixed(1) }}</span>
+                  <span class="tabular-nums font-medium text-foreground">{{ ((m?.face_score || 0) * 100).toFixed(1) }}</span>
                 </div>
-                <div class="flex justify-between items-center">
+                <div class="flex justify-between items-center py-0.5 border-b border-border/40">
                   <span class="text-muted-foreground">Person Score:</span>
-                  <span class="font-mono">{{ ((m?.person_score || 0) * 100).toFixed(1) }}</span>
+                  <span class="tabular-nums font-medium text-foreground">{{ ((m?.person_score || 0) * 100).toFixed(1) }}</span>
                 </div>
-                <div class="flex justify-between items-center">
+                <div class="flex justify-between items-center py-0.5">
                   <span class="text-muted-foreground">Equipment Score:</span>
-                  <span class="font-mono">{{ ((m?.equipment_score || 0) * 100).toFixed(1) }}</span>
+                  <span class="tabular-nums font-medium text-foreground">{{ ((m?.equipment_score || 0) * 100).toFixed(1) }}</span>
                 </div>
               </div>
             </div>

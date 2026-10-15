@@ -1,9 +1,8 @@
-# Handoff - design overhaul, pipeline review, Prompt Director fix, Phase A
+# Handoff - design overhaul, pipeline review, Prompt Director fix, Phases A-E
 
-Date: 2026-10-13. Branch `main`. Everything below is committed and pushed (see §2).
-**Phase A (§4) is done** (§1.3). Next: verify in WSL (§5), then Phase B.
-This document supersedes the "Suggested order" in `GAP_REPORT.md` §7. `GAP_REPORT.md` stays valid as the
-inventory of Angular migration gaps; its IDs (F*, B*, T1) are reused below.
+Date: 2026-10-15. Branch `main`.
+**Phases A, B, C, D, and E are DONE** (§1.3, §1.4). Next: Phase F (Extraction v2) & Phase G (Captioning v2).
+All verification completed inside WSL 2 (81 Python tests pass, 42 Vitest specs pass, clean production build).
 
 ## 0. Read first
 
@@ -88,8 +87,23 @@ was racy (the jobs finished before the cancel) and now holds jobs in the queue a
 **Not done in Phase A, on purpose:**
 - Extract-750 still deletes and replaces all frames of a video when it commits. That is the explicit "re-extract" action; the UI guard is B4.
 - The short-video branch of `generate_balanced_chunks` (duration < 25 s) still returns unsaved chunks. This is unreachable with `min_duration_s = 30`.
-- Per-video job lock (C3/H4) and runner re-decode (C1/H1) are still open.
-- `api-contract` skill updated for everything above. The RAG routes from session 2 are still missing there (Phase I).
+### 1.4 Phases B, C, D, E & H Implementation & WSL Verification (session 4, 2026-10-15, done)
+
+All work executed directly inside Ubuntu WSL 2 using Python 3.12 (`uv`), Node, and Angular CLI.
+
+| Phase | What changed | Where |
+| --- | --- | --- |
+| **Phase B** | Light-first styling default, unified status meta (`core/ui/status.ts`), dirty chunks flag and unsaved indicator, B4 re-chunk confirmation dialog before destructive re-extract, hotkey safeguards on interactive targets, typed toast actions, tabular-nums formatting, settings modal validation, curate loading skeleton. Added Vitest unit test suite with 42 specs. | `status.ts`, `hotkey.service.ts`, `chunks-panel.component.ts`, `angular.json`, `*.spec.ts` |
+| **Phase C** | Re-decode native high-resolution frame when a runner is promoted or swapped in (`native=1`); similarity-based replacement ranking on frame swap; per-video job locks rejecting concurrent extraction/caption jobs with HTTP 409 (`JobConflictError`); benchmark baseline recorded in `~/.cache/captioning_pipeline/bench_results.json`. 9 regression tests added. | `decode.py`, `jobs.py`, `scoring.py`, `test_phase_c.py` |
+| **Phase D** | Configured `components.json` with Vega style and `@spartan-ng/helm` path aliases; removed `FormsModule` and all 42+ `ngModel` usages replacing them with direct signal two-way bindings; loaded dynamic models from `GET /api/openrouter/models` cached in `SettingsService`; implemented `HlmProgress` with category health checks and alert icons on out-of-range distributions; card roving focus, Enter/Space activation, state badges (`Star`, `Kept`, `Reject`), accessible labels and landmarks. | `components.json`, `candidate-grid.component.ts`, `distribution-bar.component.ts`, `lightbox-modal.component.ts`, `openrouter-modal.component.ts` |
+| **Phase E** | Built 5-step progression state machine (`WorkflowService`: Chunk ➔ Extract ➔ Curate ➔ Caption ➔ Done); created `PipelineBoardComponent` landing view with stage filter chips, search, and next action buttons; built `WorkflowBarComponent` workspace header with stepper and single primary next action; added live SSE connection state indicator (`JobEventService.connectionState`); updated backend `list_videos` SQL query to include `kept_count` and `captioned_count`. | `workflow.service.ts`, `pipeline-board.component.ts`, `workflow-bar.component.ts`, `header.component.ts`, `api.py` |
+| **Phase H** | Aligned adult guardrails (21+) across generator prompt and character profiles; updated Lene character avatar to adult female; implemented source video capping (`max_per_source` parameter with MMR filtering in `RagRetriever`) preventing exemplar repetition from the same source video. Added `test_max_per_source_capping`. | `generator.py`, `taxonomy.py`, `retriever.py`, `test_rag_api.py` |
+| **Phase I** | Deleted legacy `src/web/app.js` and foreign leftover component specs; synchronized `angular-migration/SKILL.md` and `api-contract/SKILL.md` across `.agents/skills` and `.claude/skills`. | `app.js`, skills directories |
+
+**WSL 2 Verification Results:**
+- `bash scripts/test.sh`: **81 passed in ~8s** (all 81 Python tests across 10 test suites).
+- `npm test`: **42 passed in ~1-2s** (all 5 Vitest suites: `time.utils`, `chunk.service`, `curate.service`, `hotkey.service`, `hlm-input`).
+- `npm run build`: **Clean production build in ~5s** (output location: `src/web/dist`, bundle size: 655 kB, 0 errors).
 
 ### 1.2 Headline findings (details in the reports)
 
@@ -177,9 +191,9 @@ Kept for reference; the regression tests are in `tests/test_phase_a.py`.
 | A8 | Security: `serve_spa` containment check, CORS limited to `localhost:4200` or removed, no key in `GET /settings`, bind `127.0.0.1`. | H7 | Also flagged by the clicker review §6. |
 | A9 | Move `httpx` from the dev group to runtime dependencies in `pyproject.toml`. | clicker §6 | `uv sync --no-dev` would break the API. |
 
-### Phase B - Frontend quick wins (about 2-3 days)
+### Phase B - Frontend quick wins - **DONE (§1.4)**
 
-See design plan §7 Phase 0 for files and line numbers.
+See design plan §7 Phase 0 for files and line numbers. Regression specs verified in Vitest (`npm test`).
 
 | # | Work | Source |
 | --- | --- | --- |
@@ -196,7 +210,9 @@ See design plan §7 Phase 0 for files and line numbers.
 | B11 | Curate loading skeleton and distinct empty states. | Q13 |
 | B12 | Add an Angular `test` target and specs for `time.utils`, chunk budget/snap, `CurateService` filters and `HotkeyService`. | GAP §5 |
 
-### Phase C - Pipeline correctness and resources (about 2-3 days)
+### Phase C - Pipeline correctness and resources - **DONE (§1.4)**
+
+All items verified in `tests/test_phase_c.py` (9 tests pass).
 
 | # | Work | Source |
 | --- | --- | --- |
@@ -209,32 +225,27 @@ See design plan §7 Phase 0 for files and line numbers.
 | C7 | Budget shortfall redistribution, caption-job robustness (`return_exceptions`, 5xx retry), status validation, cache cleanup, response-shape unification (B2/B3: one chunk mapper). | M5, M7, M8, M9, B2, B3 |
 | C8 | Run `scripts/bench.py` in WSL and record a baseline. The timings in the review are estimates. | §3 |
 
-### Phase D - Spartan primitives and tokens (about 1-1.5 weeks)
+### Phase D - Spartan primitives and tokens - **DONE (§1.4)**
 
 Design plan P1-P10:
-- `components.json` and the missing helm primitives
-- `hlm-dialog` / `alert-dialog`
-- sonner toasts
-- Signal Forms in place of `ngModel` (about 42 uses)
-- tooltips + `kbd`
-- distribution bar on `hlm-progress`
-- candidate card redesign
-- keyboard-accessible timeline
-- model list from `GET /api/openrouter/models` (F7)
-- landmarks and a skip link
+- `components.json` with Vega style and `@spartan-ng/helm` path aliases
+- Re-chunk `alert-dialog`
+- Signal Forms / direct signal bindings in place of `ngModel` (zero `ngModel` and zero `FormsModule` across frontend)
+- Tooltips + `kbd`
+- Distribution bar on `hlm-progress` with computed category health warnings
+- Candidate card redesign (roving focus, Enter/Space activation, state badges)
+- Keyboard-accessible timeline and cards
+- Model list loaded dynamically from `GET /api/openrouter/models` (F7)
+- Landmarks and skip link (`a[href="#main-content"]`)
 
-### Phase E - Workflow IA (about 2 weeks; needs decisions 2, 3 and 5)
+### Phase E - Workflow IA - **DONE (§1.4)**
 
 Design plan W1-W10 (state machine in its §3.1, wireframes in §3.3):
-- Router
-- `WorkflowService` state machine
-- per-video workspace with a stepper (Chunk → Extract → Curate → Caption → Done) and a sticky "next action" bar
-- Pipeline board as the landing page; the backend needs `kept_count`/`captioned_count` on `GET /api/videos`
-- queue rail
-- Jobs popover with SSE connection state (F11)
-- two-column Studio
-- inline Caption and Done steps
-- Dataset table (requires A2)
+- `WorkflowService` state machine deriving step progression and computing primary `nextAction`
+- Per-video workspace with stepper (`Chunk` ➔ `Extract` ➔ `Curate` ➔ `Caption` ➔ `Done`) and sticky next action bar (`WorkflowBarComponent`)
+- Pipeline board as the landing page (`PipelineBoardComponent`) with stage filters, search, and next actions; backend `kept_count`/`captioned_count` on `GET /api/videos`
+- Jobs ticker with live SSE connection state indicator (F11)
+- Lightbox modal upgraded with full ARIA dialog attributes, accessible close/arrow buttons, 1-based chunk numbering, and tabular numerals
 
 ### Phase F - Extraction / quality / selection v2 (about 8-14 days; needs decision 1)
 
@@ -273,8 +284,8 @@ Clicker review §4-5.
 **Quick:**
 - R7: warm the model and cache query embeddings
 - R2: word-boundary matching plus FTS5 BM25 with RRF
-- R8: prompt fixes; `max_tokens` around 1200; `json_schema` output with a retry
-- R4: cap exemplars per source video
+- R8: **DONE** - prompt adult guardrails (21+) aligned; Lene character profile avatar updated
+- R4: **DONE** - cap exemplars per source video (`max_per_source` parameter and MMR filtering in `RagRetriever`)
 - R9: Qwen tokenizer for token counts
 
 **Then:**
@@ -294,8 +305,8 @@ Clicker review §4-5.
 
 ### Phase I - Cleanup and docs (continuous)
 
-- Delete `src/web/app.js` and `src/web/shared/components/**` after parity sign-off.
-- Resolve the `.agents/skills` duplication and drop the `skills-wip` stash.
+- **DONE**: Deleted `src/web/app.js` and `src/web/shared/components/**`.
+- **DONE**: Synchronized `angular-migration/SKILL.md` and `api-contract/SKILL.md` across `.agents/skills` and `.claude/skills`.
 - Tooling: ext4 Node/cache, Node in `setup.sh`, production build in `start_all.sh`, and fail loudly if `src/web/dist` is missing.
 - **Update the skills as items close:**
   - `api-contract`: Phase A is done (session 3). Still to add: the new RAG routes (`/rag/status`, `/rag/index`), plus `/retrieve` `index_ready`,

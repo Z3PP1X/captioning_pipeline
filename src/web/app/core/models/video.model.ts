@@ -22,6 +22,8 @@ export interface Video {
   letterbox?: Record<string, number> | null;
   chunk_count?: number;
   export_count?: number;
+  kept_count?: number;
+  captioned_count?: number;
 }
 
 export interface FilmstripThumbnail {

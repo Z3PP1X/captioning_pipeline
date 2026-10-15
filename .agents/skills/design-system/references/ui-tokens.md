@@ -42,4 +42,4 @@ Page padding: `p-4` mobile, `md:p-6`, `lg:p-8`; page wrapper `mx-auto flex w-ful
 
 ## Motion
 
-150–200ms ease transitions (`transition-colors`, `duration-150`); `motion-safe:` for anything that moves; `tw-animate-css` for enter/exit. A global `prefers-reduced-motion` rule in `src/styles.css` neutralises animations/transitions.
+150–200ms ease transitions (`transition-colors`, `duration-150`); `motion-safe:` for anything that moves; `tw-animate-css` for enter/exit. A global `prefers-reduced-motion` rule in `src/web/styles.css` neutralises animations/transitions.

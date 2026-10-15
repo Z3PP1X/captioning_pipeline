@@ -5,8 +5,8 @@ import {
   inject,
   input,
   output,
+  signal,
 } from '@angular/core';
-import { FormsModule } from '@angular/forms';
 import { NgIcon, provideIcons } from '@ng-icons/core';
 import {
   lucideTrash2,
@@ -15,6 +15,10 @@ import {
   lucideZap,
   lucidePlay,
   lucideRefreshCw,
+  lucideCheck,
+  lucideAlertTriangle,
+  lucideAlertCircle,
+  lucideClock,
 } from '@ng-icons/lucide';
 import { HlmButtonImports } from '@spartan-ng/helm/button';
 import { HlmBadgeImports } from '@spartan-ng/helm/badge';
@@ -22,12 +26,13 @@ import { ApiError } from '../../core/services/api.service';
 import { ChunkService } from '../../core/services/chunk.service';
 import { VideoService } from '../../core/services/video.service';
 import { JobEventService } from '../../core/services/job-event.service';
+import { SettingsService } from '../../core/services/settings.service';
 import { formatHms, parseTimestamp } from '../../core/utils/time.utils';
 import { ChunkItem } from '../../core/models/chunk.model';
 
 @Component({
   selector: 'app-chunks-panel',
-  imports: [FormsModule, NgIcon, HlmButtonImports, HlmBadgeImports],
+  imports: [NgIcon, HlmButtonImports, HlmBadgeImports],
   providers: [
     provideIcons({
       lucideTrash2,
@@ -36,6 +41,10 @@ import { ChunkItem } from '../../core/models/chunk.model';
       lucideZap,
       lucidePlay,
       lucideRefreshCw,
+      lucideCheck,
+      lucideAlertTriangle,
+      lucideAlertCircle,
+      lucideClock,
     }),
   ],
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -51,11 +60,19 @@ import { ChunkItem } from '../../core/models/chunk.model';
             {{ chunkService.chunks().length }} / 15 max
           </span>
           <span
-            class="rounded-full px-2.5 py-0.5 text-xs font-semibold border"
-            [class]="budgetBadgeClass()"
+            hlmBadge
+            [variant]="budgetVariant()"
+            class="gap-1 font-medium text-xs"
           >
-            Budget: {{ chunkService.budgetSum() }}%
+            <ng-icon [name]="budgetIcon()" class="size-3" />
+            Budget: {{ chunkService.budgetSum() }}%{{ chunkService.budgetSum() !== 100 ? ' (must be 100%)' : '' }}
           </span>
+          @if (chunkService.isDirty()) {
+            <span hlmBadge variant="warning" class="gap-1 font-medium text-xs">
+              <ng-icon name="lucideAlertCircle" class="size-3" />
+              Unsaved changes
+            </span>
+          }
         </div>
 
         <div class="flex items-center gap-2">
@@ -65,12 +82,9 @@ import { ChunkItem } from '../../core/models/chunk.model';
             title="Set captioning model for all chunks"
           >
             <option value="" disabled selected>Set All Models...</option>
-            <option value="google/gemma-4-31b-it">Gemma 4 31B (Default)</option>
-            <option value="deepseek/deepseek-v4.1-flash">DeepSeek V4.1 Flash</option>
-            <option value="google/gemini-2.0-flash-exp:free">Gemini 2.0 Free</option>
-            <option value="qwen/qwen-2.5-vl-72b-instruct">Qwen 2.5 VL 72B</option>
-            <option value="x-ai/grok-4.7">Grok 4.7</option>
-            <option value="mistralai/pixtral-12b">Pixtral 12B</option>
+            @for (m of settingsService.openRouterModels(); track m.id) {
+              <option [value]="m.id">{{ m.name }}</option>
+            }
           </select>
 
           <button
@@ -112,28 +126,60 @@ import { ChunkItem } from '../../core/models/chunk.model';
             <span>Save Chunks</span>
           </button>
 
-          <button
-            hlmBtn
-            variant="default"
-            size="sm"
-            (click)="onExtract750()"
-            [disabled]="!videoService.currentVideo() || chunkService.chunks().length === 0 || chunkService.isExtracting() || !!activeExtractionJob()"
-            [title]="chunkService.chunks().length === 0 ? 'Click Auto-Suggest first to define scene chunks' : (activeExtractionJob() ? 'Extraction actively running' : 'Extract 750 candidates and run 7-dimension scoring')"
-            class="cursor-pointer gap-1.5 font-bold"
-          >
-            @if (activeExtractionJob()) {
-              <ng-icon name="lucideRefreshCw" class="size-3.5 animate-spin" />
-              <span>Extracting ({{ (activeExtractionJob()!.progress * 100).toFixed(0) }}%)...</span>
-            } @else if (chunkService.isExtracting()) {
-              <ng-icon name="lucideRefreshCw" class="size-3.5 animate-spin" />
-              <span>Starting...</span>
-            } @else {
-              <ng-icon name="lucideZap" class="size-3.5" />
-              <span>Extract & Score 750</span>
+          <div class="flex flex-col items-end">
+            <button
+              hlmBtn
+              variant="default"
+              size="sm"
+              (click)="onExtract750()"
+              [disabled]="!videoService.currentVideo() || chunkService.chunks().length === 0 || chunkService.isExtracting() || !!activeExtractionJob()"
+              class="cursor-pointer gap-1.5 font-bold"
+            >
+              @if (activeExtractionJob()) {
+                <ng-icon name="lucideRefreshCw" class="size-3.5 animate-spin" />
+                <span>Extracting ({{ (activeExtractionJob()!.progress * 100).toFixed(0) }}%)...</span>
+              } @else if (chunkService.isExtracting()) {
+                <ng-icon name="lucideRefreshCw" class="size-3.5 animate-spin" />
+                <span>Starting...</span>
+              } @else {
+                <ng-icon name="lucideZap" class="size-3.5" />
+                <span>Extract & Score 750</span>
+              }
+            </button>
+            @if (disabledReason()) {
+              <span class="text-xs text-muted-foreground mt-0.5">
+                {{ disabledReason() }}
+              </span>
             }
-          </button>
+          </div>
         </div>
       </div>
+
+      <!-- Re-chunk confirmation dialog (B4) -->
+      @if (rechunkConfirmOpen()) {
+        <div class="fixed inset-0 z-50 flex items-center justify-center bg-secondary/80 backdrop-blur-xs p-4 animate-in fade-in select-none">
+          <div class="relative w-full max-w-md rounded-xl border border-destructive/30 bg-card p-6 shadow-2xl flex flex-col gap-4">
+            <div class="flex items-center gap-2 text-destructive">
+              <ng-icon name="lucideAlertTriangle" class="size-5 shrink-0" />
+              <h3 class="font-bold text-base text-foreground">Confirm Destructive Re-chunking</h3>
+            </div>
+            <p class="text-xs text-muted-foreground leading-relaxed">
+              {{ rechunkConfirmMessage() }}
+            </p>
+            <p class="text-xs font-semibold text-destructive">
+              This will delete existing candidate picks and curation history for the removed chunks. This action cannot be undone.
+            </p>
+            <div class="flex justify-end gap-2 pt-2 border-t border-border">
+              <button hlmBtn variant="outline" size="sm" (click)="onCancelRechunk()">
+                Cancel
+              </button>
+              <button hlmBtn variant="destructive" size="sm" (click)="onConfirmRechunk()">
+                Continue & Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      }
 
       <!-- Active Extraction Progress Banner -->
       @if (activeExtractionJob()) {
@@ -158,7 +204,7 @@ import { ChunkItem } from '../../core/models/chunk.model';
       <div class="flex flex-col gap-1.5 max-h-80 overflow-y-auto overflow-x-auto pr-1">
         <!-- List Column Headers -->
         @if (chunkService.chunks().length > 0) {
-          <div class="grid grid-cols-[135px_95px_95px_85px_1fr_110px_165px_36px] items-center gap-2.5 px-3 py-1.5 text-[11px] font-semibold text-muted-foreground uppercase tracking-wider border-b border-border/50 min-w-[840px]">
+          <div class="grid grid-cols-[135px_95px_95px_85px_1fr_110px_165px_36px] items-center gap-2.5 px-3 py-1.5 text-xs font-semibold text-muted-foreground uppercase tracking-wider border-b border-border/50 min-w-[840px]">
             <div>Chunk</div>
             <div>Start</div>
             <div>End</div>
@@ -196,11 +242,22 @@ import { ChunkItem } from '../../core/models/chunk.model';
 
               @if (chunk.captioned_count !== undefined && (chunk.picks_count || 0) > 0) {
                 @if (chunk.is_fully_captioned) {
-                  <span class="shrink-0 rounded px-1.5 py-0.2 text-[10px] font-bold bg-success/15 text-success border border-success/30" title="Captioned">
-                    ✓
+                  <span
+                    hlmBadge
+                    variant="success"
+                    class="shrink-0 text-xs px-1.5 py-0 h-4.5 gap-1"
+                    title="Captioned"
+                  >
+                    <ng-icon name="lucideCheck" class="size-2.5" />
                   </span>
                 } @else {
-                  <span class="shrink-0 rounded px-1 py-0.2 text-[10px] font-medium bg-primary/10 text-primary border border-primary/20" title="Progress">
+                  <span
+                    hlmBadge
+                    variant="outline"
+                    class="shrink-0 text-xs px-1.5 py-0 h-4.5 font-medium gap-1"
+                    title="Progress"
+                  >
+                    <ng-icon name="lucideClock" class="size-2.5" />
                     {{ chunk.captioned_count }}/{{ chunk.picks_count }}
                   </span>
                 }
@@ -245,8 +302,8 @@ import { ChunkItem } from '../../core/models/chunk.model';
                 min="0"
                 max="100"
                 step="1"
-                [ngModel]="chunk.budget_pct"
-                (ngModelChange)="onBudgetChange(idx, $event)"
+                [value]="chunk.budget_pct"
+                (input)="onBudgetChange(idx, +$any($event.target).value)"
                 class="flex-1 accent-primary h-1.5 bg-muted rounded-lg cursor-pointer min-w-16"
               />
               <span class="font-bold text-primary text-xs w-8 text-right tabular-nums">
@@ -257,8 +314,8 @@ import { ChunkItem } from '../../core/models/chunk.model';
             <!-- Column 6: Rule Selector -->
             <div (click)="$event.stopPropagation()">
               <select
-                [ngModel]="chunk.rule"
-                (ngModelChange)="onRuleChange(idx, $event)"
+                [value]="chunk.rule"
+                (change)="onRuleChange(idx, $any($event.target).value)"
                 class="h-7 w-full rounded border border-input bg-card px-1.5 text-xs text-foreground focus:ring-1 focus:ring-ring cursor-pointer"
               >
                 <option value="person">Person</option>
@@ -272,16 +329,13 @@ import { ChunkItem } from '../../core/models/chunk.model';
             <!-- Column 7: Model Selector -->
             <div (click)="$event.stopPropagation()">
               <select
-                [ngModel]="chunk.caption_model || 'google/gemma-4-31b-it'"
-                (ngModelChange)="onModelChange(idx, $event)"
+                [value]="chunk.caption_model || 'google/gemma-4-31b-it'"
+                (change)="onModelChange(idx, $any($event.target).value)"
                 class="h-7 w-full rounded border border-input bg-card px-1.5 text-xs text-foreground focus:ring-1 focus:ring-ring cursor-pointer truncate"
               >
-                <option value="google/gemma-4-31b-it">Gemma 4 31B (Default)</option>
-                <option value="deepseek/deepseek-v4.1-flash">DeepSeek V4.1 Flash</option>
-                <option value="google/gemini-2.0-flash-exp:free">Gemini 2.0 Free</option>
-                <option value="qwen/qwen-2.5-vl-72b-instruct">Qwen 2.5 VL 72B</option>
-                <option value="x-ai/grok-4.7">Grok 4.7</option>
-                <option value="mistralai/pixtral-12b">Pixtral 12B</option>
+                @for (m of settingsService.openRouterModels(); track m.id) {
+                  <option [value]="m.id">{{ m.name }}</option>
+                }
               </select>
             </div>
 
@@ -310,6 +364,7 @@ export class ChunksPanelComponent {
   readonly chunkService = inject(ChunkService);
   readonly videoService = inject(VideoService);
   private readonly jobEvents = inject(JobEventService);
+  readonly settingsService = inject(SettingsService);
 
   readonly currentTime = input<number>(0);
   readonly seek = output<number>();
@@ -330,11 +385,30 @@ export class ChunksPanelComponent {
     return null;
   });
 
-  readonly budgetBadgeClass = computed(() => {
+  readonly rechunkConfirmOpen = signal<boolean>(false);
+  readonly rechunkConfirmMessage = signal<string>('');
+  private pendingRechunkAction: ((confirm: boolean) => Promise<void>) | null = null;
+
+  readonly budgetVariant = computed(() => {
     const sum = this.chunkService.budgetSum();
-    if (sum === 100) return 'bg-success/15 text-success border-success/30';
-    if (sum > 100) return 'bg-primary/20 text-primary border-primary/40';
-    return 'bg-warning/15 text-warning border-warning/30';
+    if (sum === 100) return 'success';
+    if (sum > 100) return 'danger';
+    return 'warning';
+  });
+
+  readonly budgetIcon = computed(() => {
+    const sum = this.chunkService.budgetSum();
+    if (sum === 100) return 'lucideCheck';
+    if (sum > 100) return 'lucideAlertTriangle';
+    return 'lucideAlertCircle';
+  });
+
+  readonly disabledReason = computed(() => {
+    if (!this.videoService.currentVideo()) return 'Select a video from the queue first';
+    if (this.activeExtractionJob()) return `Extraction job #${this.activeExtractionJob()!.job_id} running`;
+    if (this.chunkService.isExtracting()) return 'Extraction job dispatching...';
+    if (this.chunkService.chunks().length === 0) return 'Auto-suggest or add scene chunks first';
+    return null;
   });
 
   isCurrentChunk(chunk: ChunkItem): boolean {
@@ -383,19 +457,74 @@ export class ChunksPanelComponent {
   }
 
   /**
-   * Runs a chunk write; when the backend refuses to delete chunks that hold picks (409), asks once and
-   * retries with confirmation. Returns false when the user declines.
-   * TODO(B4): replace window.confirm with an hlm alert-dialog.
+   * Runs a chunk write; guards re-chunking after curation/export or on 409 conflicts
+   * using an inline confirmation modal instead of window.confirm (B4).
    */
   private async withRechunkConfirm(write: (confirm: boolean) => Promise<void>): Promise<boolean> {
+    const video = this.videoService.currentVideo();
+    const isPostExtract = video && ['curating', 'curating_300', 'captioning', 'exported'].includes(video.status);
+
+    if (isPostExtract) {
+      return new Promise<boolean>((resolve) => {
+        this.rechunkConfirmMessage.set(
+          `Video status is "${video.status}". Modifying scene chunks will delete existing frames and curation picks.`
+        );
+        this.pendingRechunkAction = async (confirmed: boolean) => {
+          if (!confirmed) {
+            resolve(false);
+            return;
+          }
+          try {
+            await write(true);
+            resolve(true);
+          } catch (err) {
+            this.jobEvents.showToast('Re-chunk Failed', String(err), video.id, true);
+            resolve(false);
+          }
+        };
+        this.rechunkConfirmOpen.set(true);
+      });
+    }
+
     try {
       await write(false);
       return true;
     } catch (err) {
       if (!(err instanceof ApiError) || err.status !== 409) throw err;
-      if (!window.confirm(`${err.message}\n\nThis cannot be undone. Continue?`)) return false;
-      await write(true);
-      return true;
+      return new Promise<boolean>((resolve) => {
+        this.rechunkConfirmMessage.set(err.message || 'Chunks hold active curation picks.');
+        this.pendingRechunkAction = async (confirmed: boolean) => {
+          if (!confirmed) {
+            resolve(false);
+            return;
+          }
+          try {
+            await write(true);
+            resolve(true);
+          } catch (e) {
+            this.jobEvents.showToast('Re-chunk Failed', String(e), video?.id ?? null, true);
+            resolve(false);
+          }
+        };
+        this.rechunkConfirmOpen.set(true);
+      });
+    }
+  }
+
+  onCancelRechunk(): void {
+    if (this.pendingRechunkAction) {
+      this.pendingRechunkAction(false);
+      this.pendingRechunkAction = null;
+    }
+    this.rechunkConfirmOpen.set(false);
+  }
+
+  async onConfirmRechunk(): Promise<void> {
+    const action = this.pendingRechunkAction;
+    this.pendingRechunkAction = null;
+    this.rechunkConfirmOpen.set(false);
+    if (action) {
+      await action(true);
     }
   }
 
