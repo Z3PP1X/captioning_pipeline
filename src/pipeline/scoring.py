@@ -236,7 +236,7 @@ class ScoringEngine:
         self,
         candidates: list[dict[str, Any]],
         chunks: list[dict[str, Any]],
-        target_total: int = 300,
+        target_total: int = 180,
         category_quotas: dict[str, float] | None = None,
         mmr_lambda: float = 0.65,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, float]]:

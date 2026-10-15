@@ -90,29 +90,64 @@ import { Person, DetectedFace } from '../../core/models/person.model';
         <div class="flex flex-col gap-5 p-6 overflow-y-auto">
           <!-- Video Context Indicator -->
           @if (currentVideo(); as v) {
-            <div class="flex items-center justify-between p-3 rounded-xl bg-muted/40 border border-border/60 text-xs">
-              <div class="flex flex-col">
-                <span class="text-muted-foreground">Current Video:</span>
+            <div class="flex flex-col gap-2 p-3 rounded-xl bg-muted/40 border border-border/60 text-xs">
+              <div class="flex items-center justify-between">
+                <span class="text-muted-foreground font-semibold">Current Video:</span>
                 <span class="font-bold text-foreground truncate max-w-xs">{{ v.name }}</span>
               </div>
-              <div class="flex items-center gap-2">
-                @if (v.target_person_name) {
-                  <span hlmBadge variant="secondary" class="gap-1 bg-primary/10 text-primary border-primary/20">
-                    🎯 {{ v.target_person_name }}
+
+              <!-- Positive & Negative Badges -->
+              <div class="flex flex-wrap items-center gap-1.5 pt-1 border-t border-border/40">
+                <span class="text-[11px] text-muted-foreground font-medium">Positive (Prioritize):</span>
+                @for (pos of v.positive_persons || []; track pos.id) {
+                  <span hlmBadge variant="secondary" class="gap-1 bg-primary/10 text-primary border-primary/20 text-[11px]">
+                    🎯 {{ pos.name }}
                   </span>
+                } @empty {
+                  <span class="text-[11px] text-muted-foreground italic">None</span>
+                }
+
+                <span class="text-[11px] text-muted-foreground font-medium ml-2">Negative (Exclude):</span>
+                @for (neg of v.negative_persons || []; track neg.id) {
+                  <span hlmBadge variant="destructive" class="gap-1 bg-destructive/10 text-destructive border-destructive/20 text-[11px]">
+                    🚫 {{ neg.name }}
+                  </span>
+                } @empty {
+                  <span class="text-[11px] text-muted-foreground italic">None</span>
+                }
+
+                @if ((v.positive_persons?.length || 0) > 0 || (v.negative_persons?.length || 0) > 0) {
                   <button
                     hlmBtn
                     variant="ghost"
                     size="xs"
-                    (click)="onClearVideoTarget()"
-                    class="h-6 text-xs text-muted-foreground hover:text-destructive cursor-pointer"
+                    (click)="onClearVideoPersons()"
+                    class="h-6 text-xs text-muted-foreground hover:text-destructive cursor-pointer ml-auto"
+                    title="Remove all person filters for this video"
                   >
-                    Clear
+                    Clear All
                   </button>
-                } @else {
-                  <span class="text-muted-foreground italic">No target person set</span>
                 }
               </div>
+
+              <!-- Re-evaluate button on already extracted frames -->
+              @if (v.status !== 'new') {
+                <div class="flex items-center justify-between pt-1 border-t border-border/40 text-[11px] text-muted-foreground">
+                  <span>Recognition runs locally on extracted candidate images</span>
+                  <button
+                    hlmBtn
+                    variant="outline"
+                    size="xs"
+                    (click)="onReEvaluateFaces()"
+                    [disabled]="isSubmitting()"
+                    class="h-6 gap-1 cursor-pointer text-primary"
+                    title="Re-run face recognition and positive/negative rules across all extracted images"
+                  >
+                    <ng-icon name="lucideZap" class="size-3" [class.animate-spin]="isSubmitting()" />
+                    <span>Re-evaluate Extracted Images</span>
+                  </button>
+                </div>
+              }
             </div>
           }
 
@@ -209,18 +244,34 @@ import { Person, DetectedFace } from '../../core/models/person.model';
                         <ng-icon name="lucideUserCheck" class="size-3 text-primary" />
                         <span>Tag</span>
                       </button>
-                    } @else {
-                      <!-- Assign as video target -->
+                    } @else if (currentVideo()) {
+                      @let isPos = isPersonPositive(p.id);
+                      @let isNeg = isPersonNegative(p.id);
+
+                      <!-- Toggle Positive Target -->
                       <button
                         hlmBtn
-                        [variant]="isCurrentTarget ? 'default' : 'outline'"
+                        [variant]="isPos ? 'default' : 'outline'"
                         size="xs"
-                        [disabled]="isCurrentTarget || isSubmitting()"
-                        (click)="onSetVideoTarget(p)"
-                        class="cursor-pointer"
-                        title="{{ isCurrentTarget ? 'Currently assigned' : 'Assign to current video' }}"
+                        [disabled]="isSubmitting()"
+                        (click)="onTogglePersonRole(p, 'positive')"
+                        class="cursor-pointer gap-1 text-[11px] h-7 px-2"
+                        title="{{ isPos ? 'Remove positive prioritization' : 'Prioritize frames with ' + p.name }}"
                       >
-                        {{ isCurrentTarget ? 'Active' : 'Assign' }}
+                        <span>{{ isPos ? '🎯 Active' : '+ Positiv' }}</span>
+                      </button>
+
+                      <!-- Toggle Negative Exclusion -->
+                      <button
+                        hlmBtn
+                        [variant]="isNeg ? 'destructive' : 'outline'"
+                        size="xs"
+                        [disabled]="isSubmitting()"
+                        (click)="onTogglePersonRole(p, 'negative')"
+                        class="cursor-pointer gap-1 text-[11px] h-7 px-2"
+                        title="{{ isNeg ? 'Remove negative exclusion' : 'Exclude frames showing exclusively ' + p.name }}"
+                      >
+                        <span>{{ isNeg ? '🚫 Excluded' : '- Negativ' }}</span>
                       </button>
                     }
 
@@ -357,22 +408,39 @@ export class PersonModalComponent implements OnInit {
     }
   }
 
-  async onSetVideoTarget(p: Person): Promise<void> {
+  isPersonPositive(personId: number): boolean {
+    const v = this.currentVideo();
+    if (!v) return false;
+    if (v.positive_person_ids?.includes(personId)) return true;
+    return v.target_person_id === personId;
+  }
+
+  isPersonNegative(personId: number): boolean {
+    const v = this.currentVideo();
+    if (!v) return false;
+    return Boolean(v.negative_person_ids?.includes(personId));
+  }
+
+  async onTogglePersonRole(p: Person, targetRole: 'positive' | 'negative'): Promise<void> {
     const v = this.currentVideo();
     if (!v) return;
 
+    const currentlyActive = targetRole === 'positive' ? this.isPersonPositive(p.id) : this.isPersonNegative(p.id);
+    const newRole = currentlyActive ? 'none' : targetRole;
+
     this.isSubmitting.set(true);
     try {
-      await this.personService.setVideoTargetPerson(v.id, p.id);
+      await this.personService.setVideoPersonRole(v.id, p.id, newRole);
       await this.videoService.loadVideos();
+      await this.curateService.loadCandidates(v.id);
     } catch (err) {
-      console.error('Failed to set video target person:', err);
+      console.error(`Failed to set person role to ${newRole}:`, err);
     } finally {
       this.isSubmitting.set(false);
     }
   }
 
-  async onClearVideoTarget(): Promise<void> {
+  async onClearVideoPersons(): Promise<void> {
     const v = this.currentVideo();
     if (!v) return;
 
@@ -380,11 +448,36 @@ export class PersonModalComponent implements OnInit {
     try {
       await this.personService.setVideoTargetPerson(v.id, null);
       await this.videoService.loadVideos();
+      await this.curateService.loadCandidates(v.id);
     } catch (err) {
-      console.error('Failed to clear video target person:', err);
+      console.error('Failed to clear video persons:', err);
     } finally {
       this.isSubmitting.set(false);
     }
+  }
+
+  async onReEvaluateFaces(): Promise<void> {
+    const v = this.currentVideo();
+    if (!v) return;
+
+    this.isSubmitting.set(true);
+    try {
+      await this.personService.reEvaluateFaces(v.id);
+      await this.videoService.loadVideos();
+      await this.curateService.loadCandidates(v.id);
+    } catch (err) {
+      console.error('Failed to re-evaluate faces on extracted frames:', err);
+    } finally {
+      this.isSubmitting.set(false);
+    }
+  }
+
+  async onSetVideoTarget(p: Person): Promise<void> {
+    await this.onTogglePersonRole(p, 'positive');
+  }
+
+  async onClearVideoTarget(): Promise<void> {
+    await this.onClearVideoPersons();
   }
 
   async onDeletePerson(p: Person): Promise<void> {

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -23,6 +24,7 @@ CREATE TABLE IF NOT EXISTS videos (
     missing INTEGER NOT NULL DEFAULT 0,
     target_person_id INTEGER REFERENCES persons(id) ON DELETE SET NULL,
     target_person_name TEXT,
+    title_hash TEXT,
     autopilot TEXT,
     updated_at REAL
 );
@@ -82,6 +84,13 @@ CREATE TABLE IF NOT EXISTS persons (
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS video_persons (
+    video_id TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+    person_id INTEGER NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+    role TEXT NOT NULL DEFAULT 'positive',
+    created_at REAL NOT NULL,
+    PRIMARY KEY (video_id, person_id)
+);
 """
 
 JSON_COLS = {"watermark_rect", "letterbox", "tags", "metrics", "zs_scores", "crop", "autopilot"}
@@ -115,8 +124,36 @@ class DB:
                 c.execute("ALTER TABLE videos ADD COLUMN target_person_id INTEGER REFERENCES persons(id) ON DELETE SET NULL")
             if "target_person_name" not in video_cols:
                 c.execute("ALTER TABLE videos ADD COLUMN target_person_name TEXT")
+            if "title_hash" not in video_cols:
+                c.execute("ALTER TABLE videos ADD COLUMN title_hash TEXT")
+                try:
+                    from pipeline.indexer import compute_video_title_hash
+                    for v in c.execute("SELECT id, name FROM videos WHERE title_hash IS NULL").fetchall():
+                        if v["name"]:
+                            c.execute("UPDATE videos SET title_hash=? WHERE id=?", (compute_video_title_hash(v["name"]), v["id"]))
+                except Exception:
+                    pass
             if "autopilot" not in video_cols:
                 c.execute("ALTER TABLE videos ADD COLUMN autopilot TEXT")
+
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS video_persons (
+                video_id TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+                person_id INTEGER NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+                role TEXT NOT NULL DEFAULT 'positive',
+                created_at REAL NOT NULL,
+                PRIMARY KEY (video_id, person_id)
+            )
+            """)
+            try:
+                now_ts = time.time()
+                for row in c.execute("SELECT id, target_person_id FROM videos WHERE target_person_id IS NOT NULL").fetchall():
+                    c.execute(
+                        "INSERT OR IGNORE INTO video_persons (video_id, person_id, role, created_at) VALUES (?, ?, 'positive', ?)",
+                        (row["id"], row["target_person_id"], now_ts)
+                    )
+            except Exception:
+                pass
 
     @contextmanager
     def conn(self) -> Iterator[sqlite3.Connection]:
@@ -248,20 +285,75 @@ class DB:
 
     def delete_person(self, person_id: int) -> bool:
         with self.write() as c:
+            c.execute("DELETE FROM video_persons WHERE person_id=?", (person_id,))
             c.execute("UPDATE videos SET target_person_id=NULL, target_person_name=NULL WHERE target_person_id=?", (person_id,))
             cur = c.execute("DELETE FROM persons WHERE id=?", (person_id,))
             return cur.rowcount > 0
 
     def set_video_target_person(self, video_id: str, person_id: int | None) -> dict | None:
-        with self.write() as c:
-            if person_id is not None:
-                person = self.one("SELECT id, name FROM persons WHERE id=?", (person_id,))
-                if not person:
-                    raise ValueError(f"Person {person_id} not found")
-                c.execute(
-                    "UPDATE videos SET target_person_id=?, target_person_name=? WHERE id=?",
-                    (person["id"], person["name"], video_id),
-                )
-            else:
+        if person_id is not None:
+            self.set_video_person_role(video_id, person_id, "positive")
+        else:
+            with self.write() as c:
+                c.execute("DELETE FROM video_persons WHERE video_id=?", (video_id,))
                 c.execute("UPDATE videos SET target_person_id=NULL, target_person_name=NULL WHERE id=?", (video_id,))
         return self.one("SELECT * FROM videos WHERE id=?", (video_id,))
+
+    def get_video_persons(self, video_id: str, include_embeddings: bool = False) -> dict[str, list[dict[str, Any]]]:
+        """Returns {'positive': [person_dict...], 'negative': [person_dict...]} for the video."""
+        rows = self.all(
+            """
+            SELECT p.id, p.name, p.slug, p.exemplar_count, p.face_crop_path, p.embedding,
+                   vp.role, vp.created_at as assigned_at
+            FROM video_persons vp
+            JOIN persons p ON vp.person_id = p.id
+            WHERE vp.video_id = ?
+            ORDER BY vp.created_at ASC
+            """,
+            (video_id,),
+        )
+        out: dict[str, list[dict[str, Any]]] = {"positive": [], "negative": []}
+        for r in rows:
+            role = r["role"] if r["role"] in ("positive", "negative") else "positive"
+            p_data = {
+                "id": r["id"],
+                "name": r["name"],
+                "slug": r["slug"],
+                "exemplar_count": r["exemplar_count"],
+                "face_crop_path": r["face_crop_path"],
+                "face_crop_url": f"/api/persons/{r['id']}/face-crop" if r["face_crop_path"] else None,
+                "role": role,
+                "has_embedding": bool(r.get("embedding")),
+            }
+            if include_embeddings and r.get("embedding") is not None:
+                p_data["embedding"] = r["embedding"]
+            out[role].append(p_data)
+        return out
+
+    def set_video_person_role(self, video_id: str, person_id: int, role: str | None) -> dict[str, Any]:
+        """Assigns person as 'positive', 'negative', or None (remove) for a video."""
+        now = time.time()
+        with self.write() as c:
+            if role in ("positive", "negative"):
+                c.execute(
+                    """
+                    INSERT INTO video_persons (video_id, person_id, role, created_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(video_id, person_id) DO UPDATE SET role=excluded.role
+                    """,
+                    (video_id, person_id, role, now),
+                )
+            else:
+                c.execute("DELETE FROM video_persons WHERE video_id=? AND person_id=?", (video_id, person_id))
+
+            # Sync videos.target_person_id with primary positive person
+            pos = c.execute(
+                "SELECT p.id, p.name FROM video_persons vp JOIN persons p ON vp.person_id=p.id WHERE vp.video_id=? AND vp.role='positive' ORDER BY vp.created_at ASC LIMIT 1",
+                (video_id,),
+            ).fetchone()
+            if pos:
+                c.execute("UPDATE videos SET target_person_id=?, target_person_name=? WHERE id=?", (pos["id"], pos["name"], video_id))
+            else:
+                c.execute("UPDATE videos SET target_person_id=NULL, target_person_name=NULL WHERE id=?", (video_id,))
+
+        return self.get_video_persons(video_id)

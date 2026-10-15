@@ -417,14 +417,23 @@ class JobManager:
             letterbox = video.get("letterbox")
             watermark_rect = video.get("watermark_rect")
 
-            target_person = None
-            target_person_emb = None
-            target_pid = video.get("target_person_id")
-            if target_pid:
-                target_person = self.db.get_person(target_pid)
-                target_person_emb = person_embedding(target_person)
-                if target_person_emb is None:
-                    target_person = None
+            video_persons = self.db.get_video_persons(video_id, include_embeddings=True)
+            pos_persons = video_persons.get("positive", [])
+            neg_persons = video_persons.get("negative", [])
+
+            # Primary positive target person for legacy single target display/compatibility
+            if not pos_persons and video.get("target_person_id"):
+                legacy_p = self.db.get_person(video["target_person_id"])
+                if legacy_p:
+                    pos_persons = [legacy_p]
+
+            pos_embeddings = [person_embedding(p) for p in pos_persons]
+            pos_embeddings = [p for p in pos_embeddings if p is not None]
+            neg_embeddings = [person_embedding(p) for p in neg_persons]
+            neg_embeddings = [n for n in neg_embeddings if n is not None]
+
+            target_person = pos_persons[0] if pos_persons else None
+            target_person_emb = pos_embeddings[0] if pos_embeddings else None
 
             def update_job_progress(p: float, step: str):
                 with self.db.write() as conn:
@@ -438,10 +447,14 @@ class JobManager:
                     "step": step,
                 })
 
-            sample_desc = (
-                f"Sampling candidate frames with target person '{target_person['name']}' face recognition..."
-                if target_person else f"Sampling candidate frames across {total_chunks} chunks..."
-            )
+            if pos_persons and neg_persons:
+                sample_desc = f"Sampling frames with {len(pos_persons)} positive & {len(neg_persons)} negative face filters..."
+            elif pos_persons:
+                sample_desc = f"Sampling candidate frames with target person '{pos_persons[0]['name']}' face recognition..."
+            elif neg_persons:
+                sample_desc = f"Sampling frames excluding {len(neg_persons)} negative person face(s)..."
+            else:
+                sample_desc = f"Sampling candidate frames across {total_chunks} chunks..."
             update_job_progress(0.05, sample_desc)
 
             # 1. Sample candidate frames per chunk (streamed at 512px with pre-crop & gates)
@@ -487,16 +500,26 @@ class JobManager:
                         continue
 
                     # Face detection & target person matching via YuNet + SFace
-                    if target_person_emb is not None:
-                        match_res = self.face_engine.match_frame(img_cropped, target_person_emb)
-                        metrics["target_person_sim"] = match_res["max_sim"]
-                        metrics["target_person_matched"] = match_res["matched"]
+                    if pos_embeddings or neg_embeddings:
+                        match_res = self.face_engine.match_frame_multi(
+                            img_cropped,
+                            positive_features=pos_embeddings,
+                            negative_features=neg_embeddings,
+                        )
+                        # Rule: Exclude frame if exclusively the negative person is visible!
+                        if match_res["excluded"]:
+                            continue
+
+                        metrics["target_person_sim"] = match_res["max_pos_sim"]
+                        metrics["target_person_matched"] = match_res["pos_matched"]
+                        metrics["negative_person_matched"] = match_res["neg_matched"]
                         metrics["face_count"] = match_res["face_count"]
                         metrics["faces"] = match_res["faces"]
                     else:
                         detected_faces = self.face_engine.detect_faces(img_cropped)
                         metrics["target_person_sim"] = 0.0
                         metrics["target_person_matched"] = False
+                        metrics["negative_person_matched"] = False
                         metrics["face_count"] = len(detected_faces)
                         metrics["faces"] = [{"box": f["box"], "score": f["score"]} for f in detected_faces]
 
@@ -604,7 +627,7 @@ class JobManager:
                 })
 
             # 5. Database Commit
-            update_job_progress(0.95, "Committing records to database...")
+            update_job_progress(0.92, "Committing records to database...")
             with self.db.write() as conn:
                 conn.execute("DELETE FROM frames WHERE video_id=?", (video_id,))
                 for rec in saved_records:
@@ -639,19 +662,51 @@ class JobManager:
                         (frame_id, item["chunk_id"], item.get("role", "pick"), item.get("rank", 0), item.get("state", "keep")),
                     )
 
+            # 6. Local postprocessing: Deduplicate >= 95% similar images & trim to target budget (150-200)
+            dedup_report = {}
+            is_autopilot = self.autopilot.get_state(video_id)["stage"] == "extracting"
+            if not is_autopilot:
+                update_job_progress(0.96, "Running local similarity deduplication (≥95%) & score-optimal selection...")
+                sim_threshold = float(user_settings.get("similarity_dedup_threshold", 0.95))
+                target_min = int(user_settings.get("target_curated_min", 150))
+                target_max = int(user_settings.get("target_curated_max", 200))
+                if options.get("target_curated"):
+                    t_cur = int(options["target_curated"])
+                    target_min = min(target_min, t_cur)
+                    target_max = min(target_max, max(t_cur, target_min))
+                try:
+                    from pipeline.refine import Refiner
+                    refiner = Refiner(self.db, self.settings)
+                    dedup_report = refiner.deduplicate_and_trim_similarity(
+                        video_id,
+                        similarity_threshold=sim_threshold,
+                        target_min=target_min,
+                        target_max=target_max,
+                        check_cancel=lambda: self._check_cancel(job_id),
+                    )
+                except Exception as e:
+                    dedup_report = {"error": str(e)}
+
+            with self.db.write() as conn:
                 conn.execute("UPDATE videos SET status='curating_300' WHERE id=?", (video_id,))
                 conn.execute(
                     "UPDATE jobs SET status='finished', error=NULL, progress=1.0, finished_at=? WHERE id=?",
                     (time.time(), job_id),
                 )
 
+            final_picks_count = (
+                dedup_report.get("after_count", len(picks_300))
+                if isinstance(dedup_report, dict) and "after_count" in dedup_report
+                else len(picks_300)
+            )
+            stats["dedup_similarity"] = dedup_report
 
             self.broadcast_event("job_finished", {
                 "job_id": job_id,
                 "video_id": video_id,
                 "video_name": video_name,
                 "chunk_id": None,
-                "picks_count": len(picks_300),
+                "picks_count": final_picks_count,
                 "runners_count": len(runners_450),
                 "stats": stats,
             })
@@ -777,6 +832,8 @@ class JobManager:
 
             total_frames = len(kept_frames)
             vslug = video["slug"]
+            from pipeline.indexer import compute_video_title_hash
+            video_title_hash = video.get("title_hash") or compute_video_title_hash(video["name"])
             per_video_dir = self.settings.finished_dir / "per_video" / vslug
             merged_dir = self.settings.finished_dir / "merged"
             per_video_dir.mkdir(parents=True, exist_ok=True)
@@ -914,6 +971,7 @@ class JobManager:
                                     top_p=top_p,
                                     reasoning_effort=l1_reasoning,
                                     max_dim=openrouter_max_dim,
+                                    video_hash=video_title_hash,
                                 )
                                 l1_success_count += 1
                             except ModelRefusalError:
@@ -933,6 +991,7 @@ class JobManager:
                                         top_p=top_p,
                                         reasoning_effort=None,
                                         max_dim=openrouter_max_dim,
+                                        video_hash=video_title_hash,
                                     )
                                     l2_success_count += 1
                                     caption_model_used = f"{layer2_model} (fallback from {primary_model})"
@@ -954,6 +1013,7 @@ class JobManager:
                                         top_p=top_p,
                                         reasoning_effort=None,
                                         max_dim=openrouter_max_dim,
+                                        video_hash=video_title_hash,
                                     )
                                     l3_success_count += 1
                                     caption_model_used = f"{layer3_model} (fallback from {layer2_model} & {primary_model})"
@@ -973,6 +1033,7 @@ class JobManager:
                             manifest_entry = {
                                 "source_video": video["name"],
                                 "video_id": video_id,
+                                "video_title_hash": video_title_hash,
                                 "chunk_id": item["chunk_id"],
                                 "timestamp_s": item["t"],
                                 "width": w,

@@ -2,6 +2,7 @@ import { Injectable, computed, inject, signal } from '@angular/core';
 import { ApiService } from './api.service';
 import { ChunkItem } from '../models/chunk.model';
 import { FilmstripData } from '../models/video.model';
+import { ChunkPriority, PRIORITY_WEIGHTS } from './autopilot.service';
 
 @Injectable({
   providedIn: 'root',
@@ -24,6 +25,44 @@ export class ChunkService {
       this.chunks().reduce((sum, c) => sum + (c.budget_pct || 0), 0)
     );
   });
+
+  setChunkPriority(index: number, priority: ChunkPriority): void {
+    const list = this.chunks();
+    if (index < 0 || index >= list.length) return;
+
+    const updated = list.map((c, i) => (i === index ? { ...c, priority } : { ...c }));
+    const totalWeight = updated.reduce((sum, c) => {
+      const p = (c.priority || 'normal') as ChunkPriority;
+      return sum + (p === 'skip' ? 0 : (PRIORITY_WEIGHTS[p] ?? 1.0));
+    }, 0);
+
+    if (totalWeight > 0) {
+      let allocated = 0;
+      const nonSkipIndices = updated
+        .map((c, i) => (c.priority !== 'skip' ? i : -1))
+        .filter((i) => i !== -1);
+      const lastNonSkipIdx = nonSkipIndices[nonSkipIndices.length - 1];
+
+      updated.forEach((c, i) => {
+        const p = (c.priority || 'normal') as ChunkPriority;
+        if (p === 'skip') {
+          c.budget_pct = 0;
+        } else if (i === lastNonSkipIdx) {
+          c.budget_pct = Math.max(0, 100 - allocated);
+        } else {
+          const w = PRIORITY_WEIGHTS[p] ?? 1.0;
+          const pct = Math.round((w / totalWeight) * 100);
+          c.budget_pct = pct;
+          allocated += pct;
+        }
+      });
+    } else {
+      updated.forEach((c) => (c.budget_pct = 0));
+    }
+
+    this.chunks.set(updated);
+    this.isDirty.set(true);
+  }
 
   normalizeBudgets(): void {
     const list = this.chunks();

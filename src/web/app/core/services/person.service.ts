@@ -53,6 +53,18 @@ export class PersonService {
     return res.video;
   }
 
+  async getVideoPersons(videoId: string): Promise<{ positive: Person[]; negative: Person[] }> {
+    return this.api.get<{ video_id: string; positive: Person[]; negative: Person[] }>(`/api/videos/${videoId}/persons`);
+  }
+
+  async setVideoPersonRole(videoId: string, personId: number, role: 'positive' | 'negative' | 'none'): Promise<any> {
+    return this.api.post<any>(`/api/videos/${videoId}/persons/${personId}`, { role });
+  }
+
+  async reEvaluateFaces(videoId: string): Promise<any> {
+    return this.api.post<any>(`/api/videos/${videoId}/re-evaluate-faces`, {});
+  }
+
   async tagFaceFromFrame(
     videoId: string,
     frameId: number,

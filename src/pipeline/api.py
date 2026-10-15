@@ -264,7 +264,15 @@ def list_videos(status: str | None = None, search: str | None = None):
 
     query += " ORDER BY v.name ASC"
     videos = db.all(query, tuple(params))
+    from pipeline.indexer import compute_video_title_hash
     for v in videos:
+        if not v.get("title_hash") and v.get("name"):
+            v["title_hash"] = compute_video_title_hash(v["name"])
+        v_persons = db.get_video_persons(v["id"])
+        v["positive_persons"] = v_persons.get("positive", [])
+        v["negative_persons"] = v_persons.get("negative", [])
+        v["positive_person_ids"] = [p["id"] for p in v["positive_persons"]]
+        v["negative_person_ids"] = [p["id"] for p in v["negative_persons"]]
         # The full run (report, swap list) is fetched per video; the list only needs the stage
         ap = v.get("autopilot") if isinstance(v.get("autopilot"), dict) else None
         v["autopilot_stage"] = ap.get("stage") if ap else None
@@ -313,6 +321,14 @@ def get_video(video_id: str):
     vid = db.one("SELECT * FROM videos WHERE id=?", (video_id,))
     if not vid:
         raise HTTPException(status_code=404, detail="Video not found")
+    if not vid.get("title_hash") and vid.get("name"):
+        from pipeline.indexer import compute_video_title_hash
+        vid["title_hash"] = compute_video_title_hash(vid["name"])
+    v_persons = db.get_video_persons(video_id)
+    vid["positive_persons"] = v_persons.get("positive", [])
+    vid["negative_persons"] = v_persons.get("negative", [])
+    vid["positive_person_ids"] = [p["id"] for p in vid["positive_persons"]]
+    vid["negative_person_ids"] = [p["id"] for p in vid["negative_persons"]]
     return {"video": vid}
 
 
@@ -432,12 +448,171 @@ def get_person_crop_endpoint(person_id: int):
     return FileResponse(Path(p["face_crop_path"]), media_type="image/jpeg")
 
 
+class VideoPersonRoleRequest(BaseModel):
+    role: str = Field(default="positive")
+
+
+def _re_evaluate_video_faces(video_id: str) -> dict[str, Any]:
+    video_persons = db.get_video_persons(video_id)
+    pos_ids = [p["id"] for p in video_persons.get("positive", [])]
+    neg_ids = [p["id"] for p in video_persons.get("negative", [])]
+
+    from pipeline.face import person_embedding
+    pos_embeddings = [person_embedding(db.get_person(pid)) for pid in pos_ids]
+    pos_embeddings = [p for p in pos_embeddings if p is not None]
+    neg_embeddings = [person_embedding(db.get_person(pid)) for pid in neg_ids]
+    neg_embeddings = [n for n in neg_embeddings if n is not None]
+
+    frames = db.all(
+        "SELECT id, preview_path, full_path, metrics, zs_scores FROM frames WHERE video_id=?",
+        (video_id,),
+    )
+    if not frames:
+        return {"updated_frames": 0, "pos_matches": 0, "neg_matches": 0, "excluded": 0, "demoted_picks": 0}
+
+    updated_count = 0
+    pos_matches = 0
+    neg_matches = 0
+    excluded_count = 0
+    demoted_picks = []
+
+    with db.write() as conn:
+        for f in frames:
+            img_path = Path(f.get("preview_path") or f.get("full_path") or "")
+            if not img_path.is_file():
+                continue
+            img_bgr = cv2.imread(str(img_path))
+            if img_bgr is None:
+                continue
+
+            metrics = f.get("metrics")
+            if isinstance(metrics, str):
+                try:
+                    metrics = json.loads(metrics)
+                except Exception:
+                    metrics = {}
+            metrics = metrics or {}
+
+            zs = f.get("zs_scores")
+            if isinstance(zs, str):
+                try:
+                    zs = json.loads(zs)
+                except Exception:
+                    zs = {}
+            zs = zs or {}
+
+            if pos_embeddings or neg_embeddings:
+                match_res = jobs.face_engine.match_frame_multi(
+                    img_bgr,
+                    positive_features=pos_embeddings,
+                    negative_features=neg_embeddings,
+                )
+                metrics["target_person_sim"] = match_res["max_pos_sim"]
+                metrics["target_person_matched"] = match_res["pos_matched"]
+                metrics["negative_person_matched"] = match_res["neg_matched"]
+                metrics["excluded"] = match_res["excluded"]
+                metrics["face_count"] = match_res["face_count"]
+                metrics["faces"] = match_res["faces"]
+
+                zs["target_person_sim"] = match_res["max_pos_sim"]
+                zs["target_person_matched"] = match_res["pos_matched"]
+                zs["negative_person_matched"] = match_res["neg_matched"]
+                zs["excluded"] = match_res["excluded"]
+                zs["face_count"] = match_res["face_count"]
+                zs["faces"] = match_res["faces"]
+
+                if match_res["pos_matched"]:
+                    pos_matches += 1
+                if match_res["neg_matched"]:
+                    neg_matches += 1
+                if match_res["excluded"]:
+                    excluded_count += 1
+                    demoted_picks.append(f["id"])
+            else:
+                metrics["target_person_sim"] = 0.0
+                metrics["target_person_matched"] = False
+                metrics["negative_person_matched"] = False
+                metrics["excluded"] = False
+                zs["target_person_sim"] = 0.0
+                zs["target_person_matched"] = False
+                zs["negative_person_matched"] = False
+                zs["excluded"] = False
+
+            conn.execute(
+                "UPDATE frames SET metrics=?, zs_scores=? WHERE id=?",
+                (json.dumps(metrics), json.dumps(zs), f["id"]),
+            )
+            updated_count += 1
+
+        if demoted_picks:
+            for fid in demoted_picks:
+                conn.execute(
+                    "UPDATE picks SET role='runner_up', state='reject' WHERE frame_id=?",
+                    (fid,),
+                )
+
+    jobs.broadcast_event("faces_re_evaluated", {
+        "video_id": video_id,
+        "updated_frames": updated_count,
+        "pos_matches": pos_matches,
+        "neg_matches": neg_matches,
+        "excluded": excluded_count,
+    })
+
+    return {
+        "updated_frames": updated_count,
+        "pos_matches": pos_matches,
+        "neg_matches": neg_matches,
+        "excluded": excluded_count,
+        "demoted_picks": len(demoted_picks),
+    }
+
+
+@app.get("/api/videos/{video_id}/persons")
+def get_video_persons_endpoint(video_id: str):
+    vid = db.one("SELECT id FROM videos WHERE id=?", (video_id,))
+    if not vid:
+        raise HTTPException(status_code=404, detail="Video not found")
+    return {"video_id": video_id, **db.get_video_persons(video_id)}
+
+
+@app.post("/api/videos/{video_id}/persons/{person_id}")
+def set_video_person_role_endpoint(video_id: str, person_id: int, req: VideoPersonRoleRequest):
+    vid = db.one("SELECT id FROM videos WHERE id=?", (video_id,))
+    if not vid:
+        raise HTTPException(status_code=404, detail="Video not found")
+    p = db.get_person(person_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Person not found")
+    role = req.role.strip().lower()
+    if role not in ("positive", "negative", "none"):
+        raise HTTPException(status_code=400, detail="Role must be 'positive', 'negative', or 'none'")
+
+    updated_persons = db.set_video_person_role(video_id, person_id, role if role != "none" else None)
+    re_eval_res = _re_evaluate_video_faces(video_id)
+    return {
+        "video_id": video_id,
+        "persons": updated_persons,
+        "re_evaluation": re_eval_res,
+    }
+
+
+@app.post("/api/videos/{video_id}/re-evaluate-faces")
+def re_evaluate_video_faces_endpoint(video_id: str):
+    vid = db.one("SELECT id FROM videos WHERE id=?", (video_id,))
+    if not vid:
+        raise HTTPException(status_code=404, detail="Video not found")
+    res = _re_evaluate_video_faces(video_id)
+    return {"video_id": video_id, **res}
+
+
 @app.post("/api/videos/{video_id}/target-person")
 def set_video_target_person_endpoint(video_id: str, req: VideoTargetPersonRequest):
     vid = db.one("SELECT id FROM videos WHERE id=?", (video_id,))
     if not vid:
         raise HTTPException(status_code=404, detail="Video not found")
     updated = db.set_video_target_person(video_id, req.person_id)
+    _re_evaluate_video_faces(video_id)
     return {"video": updated}
 
 
@@ -496,27 +671,9 @@ def tag_face_from_frame_endpoint(video_id: str, req: TagFaceRequest):
     # Link video to this target person
     db.set_video_target_person(video_id, person["id"])
 
-    # Re-match all candidate frames for this video with the person embedding
-    target_emb = emb
-    all_frames = db.all("SELECT id, preview_path, full_path, zs_scores FROM frames WHERE video_id=?", (video_id,))
-    updated_count = 0
-
-    with db.write() as conn:
-        for f in all_frames:
-            fpath = f.get("preview_path") or f.get("full_path")
-            if not fpath or not Path(fpath).is_file():
-                continue
-            f_img = cv2.imread(fpath)
-            if f_img is None:
-                continue
-            face_res = jobs.face_engine.match_frame(f_img, target_emb)
-            zs = json.loads(f["zs_scores"]) if f.get("zs_scores") and isinstance(f["zs_scores"], str) else (f.get("zs_scores") or {})
-            zs["target_person_sim"] = face_res["target_person_sim"]
-            zs["target_person_matched"] = face_res["matched"]
-            zs["face_count"] = face_res["face_count"]
-            zs["faces"] = face_res["faces"]
-            conn.execute("UPDATE frames SET zs_scores=? WHERE id=?", (json.dumps(zs), f["id"]))
-            updated_count += 1
+    # Re-evaluate all candidate frames for this video with the updated person embeddings
+    re_eval_res = _re_evaluate_video_faces(video_id)
+    updated_count = re_eval_res["updated_frames"]
 
     jobs.broadcast_event("candidates_updated", {
         "video_id": video_id,
@@ -757,6 +914,44 @@ def start_autopilot_batch(req: AutopilotBatchRequest):
             entry.update(ok=False, error=str(e))
         results.append(entry)
     return {"results": results, "started": sum(1 for r in results if r["ok"])}
+
+
+# ----------------------------------------------------------------------------- Similarity Deduplication & Postprocessing
+class DedupSimilarityRequest(BaseModel):
+    similarity_threshold: float = Field(default=0.95, ge=0.5, le=1.0)
+    target_min: int = Field(default=150, ge=1)
+    target_max: int = Field(default=200, ge=1)
+
+
+@app.post("/api/videos/{video_id}/dedup-similarity")
+@app.post("/api/videos/{video_id}/postprocess-similarity")
+def dedup_similarity_endpoint(video_id: str, req: DedupSimilarityRequest | None = None):
+    """Local postprocessing step per video:
+    Analyzes visual similarity (CLIP cosine), selects the image with the best scoring value
+    for pairs with >= 95% similarity, and constrains the active tagged set to 150 - 200 images.
+    """
+    if not db.one("SELECT id FROM videos WHERE id=?", (video_id,)):
+        raise HTTPException(status_code=404, detail="Video not found")
+    from pipeline.refine import Refiner
+    refiner = Refiner(db, settings)
+    thresh = req.similarity_threshold if req else 0.95
+    t_min = req.target_min if req else 150
+    t_max = req.target_max if req else 200
+    try:
+        report = refiner.deduplicate_and_trim_similarity(
+            video_id, similarity_threshold=thresh, target_min=t_min, target_max=t_max
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    jobs.broadcast_event("job_finished", {
+        "job_id": 0,
+        "video_id": video_id,
+        "step": "dedup_similarity",
+        "picks_count": report["after_count"],
+        "duplicates_removed": report["duplicates_removed"],
+    })
+    return report
 
 
 # ----------------------------------------------------------------------------- Chunks

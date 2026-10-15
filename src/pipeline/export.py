@@ -308,9 +308,13 @@ class Exporter:
                 chunk_tags = []
             zs = item.get("zs_scores") or {}
             frame_tags = zs.get("tags") or []
+            from pipeline.indexer import compute_video_title_hash
+            title_hash = video.get("title_hash") or compute_video_title_hash(video["name"])
             caption_parts = []
             if trigger_word:
                 caption_parts.append(trigger_word)
+                if title_hash:
+                    caption_parts.append(title_hash)
             seen_tags = set(t.lower() for t in caption_parts)
             for t in (chunk_tags + frame_tags):
                 t_clean = t.strip()

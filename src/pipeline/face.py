@@ -176,73 +176,126 @@ class FaceEngine:
         n2 = max(1e-6, float(np.linalg.norm(v2)))
         return max(-1.0, min(1.0, dot / (n1 * n2)))
 
+    def match_frame_multi(
+        self,
+        img_bgr: np.ndarray,
+        positive_features: list[np.ndarray] | np.ndarray | None = None,
+        negative_features: list[np.ndarray] | np.ndarray | None = None,
+        threshold: float = DEFAULT_FACE_MATCH_THRESHOLD,
+    ) -> dict[str, Any]:
+        """Detects faces in frame and compares against multiple positive and negative person embeddings.
+
+        Rules:
+        - Frames where EXCLUSIVELY the negative person is visible are marked excluded = True.
+        - Frames where the negative person IS visible TOGETHER WITH a positive person are NOT excluded (excluded = False).
+        - Frames where positive person is visible are marked pos_matched = True, matched = True.
+        """
+        if not negative_features and getattr(self.match_frame, "__func__", self.match_frame) is not FaceEngine.match_frame:
+            target = positive_features[0] if (isinstance(positive_features, list) and len(positive_features) == 1) else (positive_features or [])
+            try:
+                raw_res = self.match_frame(img_bgr, target, threshold=threshold)
+            except TypeError:
+                raw_res = self.match_frame(img_bgr, target)
+            res = dict(raw_res)
+            res["pos_matched"] = res.get("matched", False)
+            res["neg_matched"] = False
+            res["excluded"] = False
+            res["max_pos_sim"] = res.get("max_sim", res.get("target_person_sim", 0.0))
+            res["max_neg_sim"] = 0.0
+            return res
+
+        faces = self.detect_faces(img_bgr)
+        if not faces:
+            return {
+                "matched": False,
+                "pos_matched": False,
+                "neg_matched": False,
+                "excluded": False,
+                "max_sim": 0.0,
+                "target_person_sim": 0.0,
+                "max_pos_sim": 0.0,
+                "max_neg_sim": 0.0,
+                "face_count": 0,
+                "faces": [],
+            }
+
+        pos_list: list[np.ndarray] = []
+        if isinstance(positive_features, np.ndarray):
+            pos_list = [positive_features]
+        elif isinstance(positive_features, list):
+            pos_list = [p for p in positive_features if p is not None]
+
+        neg_list: list[np.ndarray] = []
+        if isinstance(negative_features, np.ndarray):
+            neg_list = [negative_features]
+        elif isinstance(negative_features, list):
+            neg_list = [n for n in negative_features if n is not None]
+
+        face_results = []
+        max_pos_sim = 0.0
+        max_neg_sim = 0.0
+        pos_detected = False
+        neg_detected = False
+
+        for f in faces:
+            raw_target = f.get("raw") if isinstance(f, dict) else f
+            feat = self.extract_feature(img_bgr, raw_target)
+
+            f_pos_sim = max((self.compute_similarity(feat, p) for p in pos_list), default=0.0) if pos_list else 0.0
+            f_neg_sim = max((self.compute_similarity(feat, n) for n in neg_list), default=0.0) if neg_list else 0.0
+
+            f_pos_match = bool(f_pos_sim >= threshold) if pos_list else False
+            f_neg_match = bool(f_neg_sim >= threshold) if neg_list else False
+
+            if f_pos_match:
+                pos_detected = True
+            if f_neg_match:
+                neg_detected = True
+
+            max_pos_sim = max(max_pos_sim, f_pos_sim)
+            max_neg_sim = max(max_neg_sim, f_neg_sim)
+
+            face_box = f["box"] if isinstance(f, dict) else [int(f[0]), int(f[1]), int(f[2]), int(f[3])]
+            face_score = f["score"] if isinstance(f, dict) else float(f[14]) if len(f) > 14 else 1.0
+
+            face_results.append({
+                "box": face_box,
+                "score": face_score,
+                "sim": round(f_pos_sim, 4),
+                "pos_sim": round(f_pos_sim, 4),
+                "neg_sim": round(f_neg_sim, 4),
+                "matched": f_pos_match,
+                "pos_matched": f_pos_match,
+                "neg_matched": f_neg_match,
+            })
+
+        # Frame is excluded if negative person is visible AND NO positive person is visible:
+        excluded = bool(neg_detected and not pos_detected)
+        best_pos_sim = max(0.0, max_pos_sim)
+
+        return {
+            "matched": pos_detected,
+            "pos_matched": pos_detected,
+            "neg_matched": neg_detected,
+            "excluded": excluded,
+            "max_sim": round(best_pos_sim, 4),
+            "target_person_sim": round(best_pos_sim, 4),
+            "max_pos_sim": round(best_pos_sim, 4),
+            "max_neg_sim": round(max(0.0, max_neg_sim), 4),
+            "face_count": len(faces),
+            "faces": face_results,
+        }
+
     def match_frame(
         self,
         img_bgr: np.ndarray,
         target_features: list[np.ndarray] | np.ndarray,
         threshold: float = DEFAULT_FACE_MATCH_THRESHOLD,
     ) -> dict[str, Any]:
-        """Detects faces in frame and compares against one or more target person embeddings.
-
-        Returns match status, max similarity, and face bounding boxes with per-face scores.
-        """
-        faces = self.detect_faces(img_bgr)
-        if not faces:
-            return {
-                "matched": False,
-                "max_sim": 0.0,
-                "target_person_sim": 0.0,
-                "face_count": 0,
-                "faces": [],
-            }
-
-        targets: list[np.ndarray] = []
-        if isinstance(target_features, np.ndarray):
-            targets = [target_features]
-        elif isinstance(target_features, list):
-            targets = [t for t in target_features if t is not None]
-
-        if not targets:
-            # No targets provided: return detected faces without similarity
-            return {
-                "matched": False,
-                "max_sim": 0.0,
-                "target_person_sim": 0.0,
-                "face_count": len(faces),
-                "faces": [{
-                    "box": f["box"],
-                    "score": f["score"],
-                    "sim": 0.0,
-                    "matched": False,
-                } for f in faces],
-            }
-
-        best_sim = -1.0
-        face_results = []
-
-        for f in faces:
-            raw_target = f.get("raw") if isinstance(f, dict) else f
-            feat = self.extract_feature(img_bgr, raw_target)
-            # Match against all target exemplars and take max
-            f_sim = max(self.compute_similarity(feat, t) for t in targets)
-            best_sim = max(best_sim, f_sim)
-            face_box = f["box"] if isinstance(f, dict) else [int(f[0]), int(f[1]), int(f[2]), int(f[3])]
-            face_score = f["score"] if isinstance(f, dict) else float(f[14]) if len(f) > 14 else 1.0
-            face_results.append({
-                "box": face_box,
-                "score": face_score,
-                "sim": round(f_sim, 4),
-                "matched": bool(f_sim >= threshold),
-            })
-
-        best_sim_val = max(0.0, best_sim)
-        return {
-            "matched": bool(best_sim_val >= threshold),
-            "max_sim": round(best_sim_val, 4),
-            "target_person_sim": round(best_sim_val, 4),
-            "face_count": len(faces),
-            "faces": face_results,
-        }
+        """Detects faces in frame and compares against one or more target person embeddings."""
+        return self.match_frame_multi(
+            img_bgr, positive_features=target_features, negative_features=None, threshold=threshold
+        )
 
     @staticmethod
     def crop_face(img_bgr: np.ndarray, box_or_face: Any, margin: float = 0.30) -> np.ndarray:

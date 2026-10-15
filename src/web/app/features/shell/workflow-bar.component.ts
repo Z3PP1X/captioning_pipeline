@@ -74,6 +74,15 @@ import { videoStatusMeta } from '../../core/ui/status';
               {{ statusMeta().label }}
             </span>
 
+            @if (v.title_hash) {
+              <span
+                class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-mono font-semibold bg-muted text-foreground border border-border"
+                title="Deterministic Video Title Hash for LoRA scene disambiguation"
+              >
+                🏷️ {{ v.title_hash }}
+              </span>
+            }
+
             @if (v.target_person_name) {
               <button
                 type="button"

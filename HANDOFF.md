@@ -1,8 +1,8 @@
-# Handoff - design overhaul, pipeline review, Prompt Director fix, Phases A-E, Database Reset, Dockerization & Face Recognition / Auto-Extraction
+# Handoff - design overhaul, pipeline review, Prompt Director fix, Phases A-E, Database Reset, Dockerization, Face Recognition & Multi-Person Roles / 95% Dedup / Video Hash
 
 Date: 2026-10-15. Branch `main`.
-**Database Reset, Dockerization, Phases A-E, and Phase 1.6 (Face Recognition, Person Tagging & Auto-Extraction) are DONE** (§1.3, §1.4, §1.5, §1.6). Next: Phase F (Extraction v2) & Phase G (Captioning v2).
-All verification completed inside WSL 2 (135 Python tests pass across 14 test suites, 49 Vitest specs pass, clean Angular production build).
+**Database Reset, Dockerization, Phases A-E, Phase 1.6, and Phase 1.7 (Multi-Person Roles, 95% Dedup Budget 150-200, Video Hash Captions) are DONE** (§1.3, §1.4, §1.5, §1.6, §1.7). Next: Phase F (Extraction v2) & Phase G (Captioning v2).
+All verification completed inside WSL 2 (142 Python tests pass across 15 test suites, 49 Vitest specs pass, clean Angular production build).
 
 ## 0. Read first
 
@@ -313,6 +313,37 @@ High-performance, CPU-friendly facial recognition (<10ms inference per frame on 
    - 135 / 135 Python tests passing across all 14 test suites (`bash scripts/test.sh`).
    - 49 / 49 Angular Vitest specs passing (`npm test -- --watch=false`).
    - Angular production build succeeds cleanly in ~5s (`npm run build`).
+
+### Phase 1.7 - Multi-Person Roles, 95% Dedup Budget (150-200), and Deterministic Video Hash - **DONE**
+
+1. **Multi-Person Face Recognition with Positive and Negative Roles (`src/pipeline/face.py`, `db.py`, `jobs.py`)**:
+   - `video_persons` table: maps videos to multiple persons with role `'positive'` (prioritize) or `'negative'` (exclude/reject).
+   - Exclusion logic (`FaceEngine.match_frame_multi`):
+     - `excluded = bool(neg_detected and not pos_detected)`: frames showing exclusively the negative person are excluded/rejected.
+     - Frames showing the negative person *together with* a positive person are NOT excluded (`excluded = False`) and receive positive scoring boost.
+   - Batch face re-evaluation on disk (`POST /api/videos/{video_id}/re-evaluate-faces`): evaluates YuNet/SFace recognition on candidate preview/native frames on disk cache (<1s for 750 frames) without re-decoding raw video streams.
+   - Demotes excluded frames to `runner_up` with `state='reject'`.
+
+2. **Target Image Budget Reduction (150-200) & Score-Optimal 95% Dedup (`src/pipeline/refine.py`, `jobs.py`)**:
+   - `deduplicate_and_trim_similarity`: analyzes cosine similarity matrix across candidate CLIP embeddings.
+   - For image pairs with $\ge 95\%$ visual similarity (`>= 0.950`), retains the image with the superior composite/quality score and demotes near-duplicates to `runner_up` with `state='reject'`.
+   - Trims and selects active `pick` count into the target budget range (150 - 200 images, configurable via `user_settings.target_curated`).
+   - Available via REST endpoint `POST /api/videos/{video_id}/dedup-similarity` and one-click UI button.
+
+3. **Deterministic Video Title Hash in Captions (`src/pipeline/indexer.py`, `openrouter.py`, `jobs.py`)**:
+   - Generates deterministic 8-character hex hash (e.g., `v_3f8a1c02`) from the sanitized video title.
+   - Persisted in `videos.title_hash` with automated SQLite migration and backfill.
+   - System-side caption injection: `OpenRouterCaptioner.sanitize_and_validate_caption` guarantees the trigger token at Token 0 and the video title hash at Token 1 across all 3 captioning layers (L1 Gemma, L2 DeepSeek, L3 Grok) without duplication.
+
+4. **Angular 22 Frontend Integration**:
+   - `PersonModalComponent`: Added `🎯 + Positiv` and `🚫 - Negativ` toggles per person card, active tag badges in the video header, and `⚡ Re-evaluate Extracted Images` button.
+   - `CurateToolbarComponent`: Added `⚡ Dedup 95% (150-200)` action button with live count notifications.
+   - `WorkflowBarComponent`: Displays deterministic video title hash badge (`🏷️ v_3f8a1c02`).
+
+5. **WSL 2 Verification**:
+   - `bash scripts/test.sh`: **142 / 142 passed** (all 15 test suites passing, including `test_face_and_person.py`, `test_refine_and_dedup.py`, and `test_autopilot_e2e.py`).
+   - `npm test -- --watch=false`: **49 / 49 passed** (all 6 Vitest suites).
+   - `npm run build`: **Clean production bundle** (output: `src/web/dist`, 688 kB, 0 errors).
 
 ### Phase F - Extraction / quality / selection v2 (about 8-14 days; needs decision 1)
 

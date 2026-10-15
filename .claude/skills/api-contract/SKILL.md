@@ -69,6 +69,10 @@ Frame row (candidates / curation-300 / swap / chunk candidates): unified across 
 | `DELETE /api/persons/{id}` | - | `{status: "deleted"}` |
 | `GET /api/persons/{id}/crop` | - | Face crop image (JPEG) |
 | `POST /api/videos/{id}/target-person` | `{person_id: number \| null}` | `{status, video_id, target_person_id, target_person_name}` |
+| `GET /api/videos/{id}/persons` | - | `{video_id, positive: Person[], negative: Person[]}` multi-person tags |
+| `POST /api/videos/{id}/persons/{person_id}` | `{role: 'positive'\|'negative'\|'none'}` | `{video_id, persons, re_evaluation}`; assigns positive/negative role or removes person, re-evaluates face detection across extracted frames |
+| `POST /api/videos/{id}/re-evaluate-faces` | - | `{updated_frames, pos_matches, neg_matches, excluded, demoted_picks}`; rapid re-evaluation on disk cache frames without raw video re-decoding |
+| `POST /api/videos/{id}/dedup-similarity` (alias `/postprocess-similarity`) | `{dup_similarity?=0.950, target_count?=180}` | `{before_picks, after_picks, demoted_count, max_similarity, mean_similarity}`; score-optimal dedup (keeps higher composite score) and budget trimming (150-200 frames) |
 | `POST /api/videos/{id}/tag-face-from-frame` | `{frame_id, person_id?, person_name?, face_index?}` | `{status, person, re_scored_count, frame_id}`. Merges 128-dim running centroid, caches avatar crop, instantly re-scores and updates all video candidate frames in SQLite and broadcasts SSE update |
 | `GET /api/frames/{frame_id}/faces` | - | `{frame_id, face_count, faces: [{bbox, confidence, similarity, matched}]}` |
 | `POST /api/videos/{id}/auto-extract` | `{target_person_id?: number}` | `{job_id, status: "queued"}` autonomous chunking + candidate sampling + face match + score prioritization + MMR reduction |

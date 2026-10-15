@@ -309,7 +309,7 @@ class AutoChunker:
         budgets = allocate_budgets([c["end_s"] - c["start_s"] for c in chunks], final_prios)
         total = target_frames
         if total is None:
-            total = int(merged_user_settings(self.db.get_setting("user_settings", {})).get("target_curated", 300))
+            total = int(merged_user_settings(self.db.get_setting("user_settings", {})).get("target_curated", 180))
 
         with self.db.write() as conn:
             for c, prio, bpct in zip(chunks, final_prios, budgets):
@@ -449,7 +449,7 @@ class AutoChunker:
             bpct = norm_pcts[idx]
             rows.append({
                 **c,
-                "k": max(5, int(c.get("k", round(300 * (bpct / 100.0))))),
+                "k": max(5, int(c.get("k", round(180 * (bpct / 100.0))))),
                 "budget_pct": bpct,
                 "priority": prios[idx],
             })

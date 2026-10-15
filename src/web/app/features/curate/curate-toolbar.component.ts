@@ -139,6 +139,20 @@ import { ChunkService } from '../../core/services/chunk.service';
           <ng-icon name="lucideRefreshCw" class="size-3.5" [class.animate-spin]="videoService.isLoading()" />
           <span>Sync Captions</span>
         </button>
+
+        <!-- Similarity Dedup 95% (Postprocessing Step) -->
+        <button
+          hlmBtn
+          variant="outline"
+          size="xs"
+          (click)="onDedupSimilarity()"
+          [disabled]="curateService.isLoading() || !videoService.currentVideo() || curateService.candidates().length === 0"
+          title="Analyze similarity, keep best-scoring frames for pairs >= 95%, and trim active picks to 150-200"
+          class="h-8 cursor-pointer gap-1 text-primary hover:text-primary"
+        >
+          <ng-icon name="lucideZap" class="size-3.5" [class.animate-spin]="curateService.isLoading()" />
+          <span>Dedup 95% (150-200)</span>
+        </button>
       </div>
 
       <!-- Right: Open VLM Captioning Modal -->
@@ -230,6 +244,12 @@ export class CurateToolbarComponent {
     if (video) {
       await this.curateService.loadCandidates(video.id);
     }
+  }
+
+  async onDedupSimilarity(): Promise<void> {
+    const video = this.videoService.currentVideo();
+    if (!video) return;
+    await this.curateService.deduplicateSimilarity(video.id);
   }
 
   async executeConfirmAction(): Promise<void> {

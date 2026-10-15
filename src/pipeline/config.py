@@ -73,9 +73,14 @@ DEFAULT_USER_SETTINGS: dict = {
     "min_export_edge": 0,
     "trigger_word": "restrained_elegance",
     "clip_model": "Xenova/clip-vit-base-patch32:quantized",
-    # 750 candidate extraction & 300 reduction
+    # Candidate extraction & curated reduction (target 150 - 200 images per video)
     "target_candidates": 750,
-    "target_curated": 300,
+    "target_curated": 180,
+    "target_curated_min": 150,
+    "target_curated_max": 200,
+    "similarity_dedup_threshold": 0.95,
+    "video_hash_prefix": "v_",
+    "video_hash_length": 8,
     "category_quotas": {
         "multiple_persons": 0.50,
         "one_person_min": 0.25,

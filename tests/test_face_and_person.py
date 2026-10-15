@@ -209,3 +209,117 @@ def test_tag_face_from_frame_flow(tmp_path, monkeypatch):
     faces_data = f_res.json()
     assert faces_data["frame_id"] == frame_id
     assert faces_data["face_count"] == 1
+
+
+def test_match_frame_multi_positive_and_negative_rules(face_engine, monkeypatch):
+    """Verifies that:
+    1. Frames showing exclusively the negative person are excluded.
+    2. Frames showing the negative person TOGETHER WITH the positive person are NOT excluded.
+    3. Frames showing the positive person are matched positively.
+    """
+    pos_emb = np.zeros(128, dtype=np.float32)
+    pos_emb[0] = 1.0  # Vector pointing along axis 0
+
+    neg_emb = np.zeros(128, dtype=np.float32)
+    neg_emb[1] = 1.0  # Vector pointing along axis 1
+
+    other_emb = np.zeros(128, dtype=np.float32)
+    other_emb[2] = 1.0
+
+    dummy_img = np.full((100, 100, 3), 128, dtype=np.uint8)
+
+    # Helper to mock detect_faces and extract_feature for arbitrary simulated faces
+    def mock_scene(detected_embs: list[np.ndarray]):
+        mock_faces = []
+        for i, _ in enumerate(detected_embs):
+            mock_faces.append(np.array([10 * i, 10, 30, 30, 15, 15, 25, 15, 20, 20, 18, 25, 22, 25, 0.99], dtype=np.float32))
+        monkeypatch.setattr(face_engine, "detect_faces", lambda _img: mock_faces)
+        monkeypatch.setattr(face_engine, "extract_feature", lambda _img, raw: detected_embs[int(raw[0]) // 10])
+
+    # Case 1: ONLY negative person in frame -> EXCLUDED
+    mock_scene([neg_emb])
+    res1 = face_engine.match_frame_multi(dummy_img, positive_features=[pos_emb], negative_features=[neg_emb])
+    assert res1["neg_matched"] is True
+    assert res1["pos_matched"] is False
+    assert res1["excluded"] is True  # Exclusively excluded person
+
+    # Case 2: Negative person AND Positive person in frame -> NOT EXCLUDED!
+    mock_scene([neg_emb, pos_emb])
+    res2 = face_engine.match_frame_multi(dummy_img, positive_features=[pos_emb], negative_features=[neg_emb])
+    assert res2["neg_matched"] is True
+    assert res2["pos_matched"] is True
+    assert res2["excluded"] is False  # Positive person present cancels negative exclusion!
+
+    # Case 3: ONLY positive person in frame -> MATCHED, NOT EXCLUDED
+    mock_scene([pos_emb])
+    res3 = face_engine.match_frame_multi(dummy_img, positive_features=[pos_emb], negative_features=[neg_emb])
+    assert res3["neg_matched"] is False
+    assert res3["pos_matched"] is True
+    assert res3["excluded"] is False
+
+    # Case 4: Random other person in frame -> NOT MATCHED, NOT EXCLUDED
+    mock_scene([other_emb])
+    res4 = face_engine.match_frame_multi(dummy_img, positive_features=[pos_emb], negative_features=[neg_emb])
+    assert res4["neg_matched"] is False
+    assert res4["pos_matched"] is False
+    assert res4["excluded"] is False
+
+
+def test_video_persons_multi_api(tmp_path):
+    client = TestClient(app)
+    import uuid
+    uniq = uuid.uuid4().hex[:8]
+    test_vid = f"vid_multi_{uniq}"
+
+    with db.write() as conn:
+        conn.execute(
+            "INSERT INTO videos (id, name, slug, path, duration, status) VALUES (?, 'multi.mp4', 'multi', ?, 60.0, 'new')",
+            (test_vid, f"/tmp/multi_{uniq}.mp4"),
+        )
+
+    # Create two persons
+    v_pos = np.random.randn(128).astype(np.float32)
+    v_pos /= np.linalg.norm(v_pos)
+    p_pos = db.create_or_update_person(f"Alice_{uniq}", embedding=v_pos)
+
+    v_neg = np.random.randn(128).astype(np.float32)
+    v_neg /= np.linalg.norm(v_neg)
+    p_neg = db.create_or_update_person(f"Bob_{uniq}", embedding=v_neg)
+
+    # Assign Alice as positive
+    res_pos = client.post(f"/api/videos/{test_vid}/persons/{p_pos['id']}", json={"role": "positive"})
+    assert res_pos.status_code == 200
+    assert any(p["id"] == p_pos["id"] for p in res_pos.json()["persons"]["positive"])
+
+    # Assign Bob as negative
+    res_neg = client.post(f"/api/videos/{test_vid}/persons/{p_neg['id']}", json={"role": "negative"})
+    assert res_neg.status_code == 200
+    assert any(p["id"] == p_neg["id"] for p in res_neg.json()["persons"]["negative"])
+
+    # Query GET /api/videos/{video_id}/persons
+    res_get = client.get(f"/api/videos/{test_vid}/persons")
+    assert res_get.status_code == 200
+    data = res_get.json()
+    assert len(data["positive"]) == 1
+    assert data["positive"][0]["name"] == f"Alice_{uniq}"
+    assert len(data["negative"]) == 1
+    assert data["negative"][0]["name"] == f"Bob_{uniq}"
+
+    # Query GET /api/videos/{video_id}
+    res_vid = client.get(f"/api/videos/{test_vid}")
+    assert res_vid.status_code == 200
+    vid_data = res_vid.json()["video"]
+    assert vid_data["positive_person_ids"] == [p_pos["id"]]
+    assert vid_data["negative_person_ids"] == [p_neg["id"]]
+    assert vid_data["target_person_id"] == p_pos["id"]
+
+    # Re-evaluate faces endpoint
+    res_re = client.post(f"/api/videos/{test_vid}/re-evaluate-faces", json={})
+    assert res_re.status_code == 200
+    assert "updated_frames" in res_re.json()
+
+    # Remove Bob from negative
+    res_rem = client.post(f"/api/videos/{test_vid}/persons/{p_neg['id']}", json={"role": "none"})
+    assert res_rem.status_code == 200
+    assert len(res_rem.json()["persons"]["negative"]) == 0
+

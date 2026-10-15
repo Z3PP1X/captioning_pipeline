@@ -9,6 +9,9 @@ export interface ChunkItem {
   rule: 'person' | 'equipment' | 'both' | 'either' | 'none' | string;
   tags?: string[];
   notes?: string;
+  priority?: 'skip' | 'low' | 'normal' | 'high';
+  person_presence?: number | null;
+  face_presence?: number | null;
   captioned_count?: number;
   picks_count?: number;
   exports_count?: number;

@@ -29,6 +29,18 @@ def compute_video_id(path: Path, size: int) -> str:
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
+def compute_video_title_hash(title: str, prefix: str = "v_", length: int = 8) -> str:
+    """Computes a deterministic compact hash from the video title/filename for LoRA scene tagging.
+
+    Example: 'scene_01_bondage.mp4' -> 'v_3f8a1c02'
+    """
+    stem = Path(title).stem if title else "video"
+    cleaned = stem.strip().lower().encode("utf-8")
+    digest = hashlib.sha256(cleaned).hexdigest()[:length]
+    return f"{prefix}{digest}" if prefix else digest
+
+
+
 class Indexer:
     def __init__(self, db: DB, settings: Settings | None = None):
         self.db = db
@@ -69,16 +81,17 @@ class Indexer:
                 conn.execute(
                     """
                     INSERT INTO videos (
-                        id, path, name, slug, size, mtime, duration, fps,
+                        id, path, name, slug, title_hash, size, mtime, duration, fps,
                         width, height, codec, broken, broken_reason, status,
                         missing, updated_at
                     ) VALUES (
-                        :id, :path, :name, :slug, :size, :mtime, :duration, :fps,
+                        :id, :path, :name, :slug, :title_hash, :size, :mtime, :duration, :fps,
                         :width, :height, :codec, :broken, :broken_reason, :status,
                         0, :updated_at
                     )
                     ON CONFLICT(id) DO UPDATE SET
-                        path=excluded.path, name=excluded.name, size=excluded.size,
+                        path=excluded.path, name=excluded.name, slug=excluded.slug,
+                        title_hash=excluded.title_hash, size=excluded.size,
                         mtime=excluded.mtime, duration=excluded.duration, fps=excluded.fps,
                         width=excluded.width, height=excluded.height, codec=excluded.codec,
                         broken=excluded.broken, broken_reason=excluded.broken_reason,
@@ -105,6 +118,7 @@ class Indexer:
             "path": str(path.resolve()),
             "name": path.name,
             "slug": make_slug(path.name),
+            "title_hash": compute_video_title_hash(path.name),
             "size": stat.st_size,
             "mtime": stat.st_mtime,
             "duration": 0.0,

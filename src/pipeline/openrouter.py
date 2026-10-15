@@ -258,8 +258,13 @@ class OpenRouterCaptioner:
         raw_caption: str,
         mode: str = "concept",
         trigger: str = "restrained_elegance",
+        video_hash: str | None = None,
     ) -> tuple[str, list[str]]:
-        """Cleans caption and audits against krea2-character-concept-captioner linter standards."""
+        """Cleans caption and audits against krea2-character-concept-captioner linter standards.
+        
+        Guarantees that `trigger` is placed at Token 0, and `video_hash` (if provided) is
+        placed immediately adjacent at Token 1 for LoRA scene identification and disambiguation.
+        """
         cleaned = raw_caption.strip()
         warnings: list[str] = []
 
@@ -277,15 +282,27 @@ class OpenRouterCaptioner:
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         cleaned = re.sub(r",\s*,+", ",", cleaned).strip(", ")
 
-        # 3. Ensure Token 0 trigger
+        # 3. Ensure Token 0 trigger and Token 1 video_hash
         words = cleaned.split()
         if not words:
-            cleaned = f"{trigger} Photograph of a scene."
+            prefix = f"{trigger} {video_hash}".strip() if video_hash else trigger
+            cleaned = f"{prefix} Photograph of a scene."
         else:
             first = words[0].strip(",.:;")
             if first.lower() != trigger.lower():
-                cleaned = f"{trigger} {cleaned}"
-                warnings.append(f"Prepend trigger '{trigger}' to Token 0 position")
+                to_prepend = [trigger]
+                if video_hash:
+                    to_prepend.append(video_hash)
+                cleaned = f"{' '.join(to_prepend)} {cleaned}"
+                warnings.append(f"Prepend trigger '{trigger}' and hash '{video_hash}' to Token 0 position")
+            elif video_hash:
+                # Trigger is already at Token 0. Ensure video_hash is at Token 1.
+                second = words[1].strip(",.:;") if len(words) > 1 else ""
+                if second.lower() != video_hash.lower():
+                    # Insert video_hash immediately after trigger
+                    rest = " ".join(words[1:])
+                    cleaned = f"{words[0]} {video_hash} {rest}".strip()
+                    warnings.append(f"Inserted video title hash '{video_hash}' adjacent to trigger '{trigger}'")
 
         # 4. Length audit against the mode's requested word range
         n_words = len(cleaned.split())
@@ -313,6 +330,7 @@ class OpenRouterCaptioner:
         top_p: float = 0.90,
         reasoning_effort: str | None = None,
         max_dim: int = 512,
+        video_hash: str | None = None,
     ) -> tuple[str, list[str]]:
 
         """Sends single frame to OpenRouter and returns sanitized caption + validation warnings."""
@@ -389,7 +407,9 @@ class OpenRouterCaptioner:
                         )
                     # Complete but short after retries: accept, sanitize_and_validate_caption warns
 
-                return self.sanitize_and_validate_caption(raw_text, mode=mode, trigger=trigger)
+                return self.sanitize_and_validate_caption(
+                    raw_text, mode=mode, trigger=trigger, video_hash=video_hash
+                )
 
             elif resp.status_code in (400, 403):
                 err_text = resp.text

@@ -223,6 +223,29 @@ export class CurateService {
     }
   }
 
+  async deduplicateSimilarity(
+    videoId: string | number,
+    similarityThreshold = 0.95,
+    targetMin = 150,
+    targetMax = 200
+  ): Promise<any> {
+    try {
+      this.isLoading.set(true);
+      const res = await this.api.post<any>(`/api/videos/${videoId}/dedup-similarity`, {
+        similarity_threshold: similarityThreshold,
+        target_min: targetMin,
+        target_max: targetMax,
+      });
+      await this.loadCandidates(videoId);
+      return res;
+    } catch (err) {
+      console.error('Failed to deduplicate similarity:', err);
+      throw err;
+    } finally {
+      this.isLoading.set(false);
+    }
+  }
+
   openLightbox(candidateId: number): void {
     const list = this.filteredCandidates();
     const idx = list.findIndex((c) => c.id === candidateId);

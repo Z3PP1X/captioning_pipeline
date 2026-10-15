@@ -32,19 +32,23 @@ MAX_REPORTED_SWAPS = 500
 
 @dataclass
 class RefineConfig:
-    dup_similarity: float = 0.92
+    dup_similarity: float = 0.95
     dup_phash: int = 4
     person_focus: float = 0.0
     purge_off_target: bool = True
     fill_from_other_chunks: bool = True
+    target_min: int = 150
+    target_max: int = 200
 
     @classmethod
     def from_settings(cls, user_settings: dict[str, Any], **overrides: Any) -> "RefineConfig":
         auto = user_settings.get("autopilot") or {}
         cfg = cls(
-            dup_similarity=float(auto.get("dup_similarity", cls.dup_similarity)),
+            dup_similarity=float(auto.get("dup_similarity", user_settings.get("similarity_dedup_threshold", 0.95))),
             person_focus=float(auto.get("person_focus", 0.6)),
             purge_off_target=bool(auto.get("purge_off_target", True)),
+            target_min=int(user_settings.get("target_curated_min", 150)),
+            target_max=int(user_settings.get("target_curated_max", 200)),
         )
         for key, value in overrides.items():
             if value is not None and hasattr(cfg, key):
@@ -235,7 +239,7 @@ class Refiner:
     def _load(self, video_id: str) -> list[FrameInfo]:
         rows = self.db.all(
             """
-            SELECT f.id, f.chunk_id, f.t, f.phash, f.embedding, f.zs_scores,
+            SELECT f.id, f.chunk_id, f.t, f.phash, f.embedding, f.zs_scores, f.metrics,
                    p.role, p.rank, p.state
             FROM frames f JOIN picks p ON p.frame_id = f.id
             WHERE f.video_id = ? AND f.embedding IS NOT NULL
@@ -250,19 +254,38 @@ class Refiner:
                 continue
             zs = r.get("zs_scores")
             if isinstance(zs, str):
-                zs = json.loads(zs)
+                try:
+                    zs = json.loads(zs)
+                except Exception:
+                    zs = {}
             zs = zs or {}
-            sim = float(zs.get("target_person_sim", 0.0) or 0.0)
-            matched = bool(zs.get("target_person_matched", False)) or sim >= MATCH_SIM
+            metrics = r.get("metrics")
+            if isinstance(metrics, str):
+                try:
+                    metrics = json.loads(metrics)
+                except Exception:
+                    metrics = {}
+            metrics = metrics or {}
+
+            sim = float(zs.get("target_person_sim", 0.0) or metrics.get("target_person_sim", 0.0) or 0.0)
+            matched = bool(zs.get("target_person_matched", False) or metrics.get("target_person_matched", False)) or sim >= MATCH_SIM
             try:
                 ph = int(r["phash"], 16) if r.get("phash") else None
             except ValueError:
                 ph = None
+
+            base_quality = float(
+                zs.get("composite")
+                or zs.get("quality")
+                or metrics.get("quality")
+                or metrics.get("composite")
+                or 0.5
+            )
             frames.append(FrameInfo(
                 id=r["id"], chunk_id=r["chunk_id"], t=float(r["t"]), role=r["role"], state=r["state"] or "keep",
                 rank=int(r["rank"] or 0), emb=(emb / norm).astype(np.float32), phash=ph,
-                quality=float(zs.get("composite", 0.5)) + (0.25 if matched else 0.0),
-                matched=matched, face_count=int(zs.get("face_count", 0) or 0), sim=sim,
+                quality=base_quality + (0.25 if matched else 0.0),
+                matched=matched, face_count=int(zs.get("face_count", 0) or metrics.get("face_count", 0) or 0), sim=sim,
             ))
         return frames
 
@@ -376,3 +399,159 @@ class Refiner:
             for frame_id in outcome.unreplaced_drops:
                 demote(frame_id)
         return promoted
+
+    def deduplicate_and_trim_similarity(
+        self,
+        video_id: str,
+        similarity_threshold: float = 0.95,
+        target_min: int = 150,
+        target_max: int = 200,
+        check_cancel: Callable[[], None] | None = None,
+        on_progress: Callable[[float, str], None] | None = None,
+    ) -> dict[str, Any]:
+        """Local postprocessing step per video:
+        
+        1. Analyzes pairwise visual similarity (CLIP cosine).
+        2. When two images have >= 95% similarity, selects the image with the best scoring value
+           (highest quality/composite score) and demotes the lower-scoring duplicate.
+        3. Constrains and trims the actual active tagged set to 150 - 200 images.
+        """
+        def progress(p: float, msg: str) -> None:
+            if on_progress:
+                on_progress(p, msg)
+
+        progress(0.1, f"Loading frames for video {video_id}...")
+        frames = self._load(video_id)
+        if not frames:
+            raise RuntimeError("No candidate frames found for video")
+
+        # Current picks and runner-ups
+        current_picks = [f for f in frames if f.role == "pick" and f.state in ("keep", "star")]
+        current_runners = [f for f in frames if f.role == "runner_up" and f.state != "reject"]
+
+        before_count = len(current_picks)
+        if before_count == 0:
+            raise RuntimeError("No active picks found for video to postprocess")
+
+        progress(0.3, f"Analyzing similarity of {before_count} candidate frames (threshold: {similarity_threshold * 100:.0f}%)...")
+
+        # 1. Order picks by priority: user-starred frames first, then best scoring value (quality)
+        ordered_picks = sorted(current_picks, key=lambda f: (f.state == "star", f.quality), reverse=True)
+
+        kept_picks: list[FrameInfo] = []
+        dropped_dups: list[dict[str, Any]] = []
+
+        for cand in ordered_picks:
+            if not kept_picks:
+                kept_picks.append(cand)
+                continue
+
+            # Check cosine similarity against all currently accepted kept frames
+            kept_embs = np.stack([k.emb for k in kept_picks])
+            sims = kept_embs @ cand.emb
+            max_sim_idx = int(np.argmax(sims))
+            max_sim = float(sims[max_sim_idx])
+
+            if max_sim >= similarity_threshold:
+                # Pairwise duplicate >= 95% found!
+                # Since kept_picks was populated in descending score order (higher quality first),
+                # the image with the best scoring value is ALREADY kept_picks[max_sim_idx]!
+                better_frame = kept_picks[max_sim_idx]
+                dropped_dups.append({
+                    "dropped_frame_id": cand.id,
+                    "kept_frame_id": better_frame.id,
+                    "dropped_score": round(cand.quality, 4),
+                    "kept_score": round(better_frame.quality, 4),
+                    "similarity": round(max_sim, 4),
+                    "chunk_id": cand.chunk_id,
+                })
+            else:
+                kept_picks.append(cand)
+
+        # 2. Trim or adjust count to target range: [target_min, target_max] (150 - 200)
+        trimmed_picks: list[FrameInfo] = []
+        if len(kept_picks) > target_max:
+            # Sort by quality and keep the top target_max (preserving starred frames)
+            sorted_by_qual = sorted(kept_picks, key=lambda f: (f.state == "star", f.quality), reverse=True)
+            kept_picks = sorted_by_qual[:target_max]
+            trimmed_picks = sorted_by_qual[target_max:]
+
+        promoted_runners: list[FrameInfo] = []
+        if len(kept_picks) < target_min and current_runners:
+            sorted_runners = sorted(current_runners, key=lambda f: f.quality, reverse=True)
+            for r in sorted_runners:
+                if len(kept_picks) >= target_min:
+                    break
+                kept_embs = np.stack([k.emb for k in kept_picks])
+                if float((kept_embs @ r.emb).max()) < similarity_threshold:
+                    kept_picks.append(r)
+                    promoted_runners.append(r)
+
+        progress(0.7, f"Persisting refined selection ({len(kept_picks)} frames)...")
+        if check_cancel:
+            check_cancel()
+
+        # 3. Persist changes in SQLite
+        dropped_ids = {d["dropped_frame_id"] for d in dropped_dups} | {t.id for t in trimmed_picks}
+        promoted_ids = {p.id for p in promoted_runners}
+
+        with self.db.write() as conn:
+            # Demote dropped duplicates and trimmed picks to runner_up
+            for fid in dropped_ids:
+                conn.execute(
+                    "UPDATE picks SET role='runner_up', state='candidate' WHERE frame_id=?",
+                    (fid,)
+                )
+            # Promote any runners to pick
+            for r in promoted_runners:
+                conn.execute(
+                    """
+                    INSERT INTO picks (frame_id, chunk_id, rank, role, state)
+                    VALUES (?, ?, 100, 'pick', 'keep')
+                    ON CONFLICT(frame_id) DO UPDATE SET role='pick', state='keep'
+                    """,
+                    (r.id, r.chunk_id)
+                )
+            # Ensure kept picks have role='pick' and ordered ranks
+            for rank_idx, k in enumerate(sorted(kept_picks, key=lambda x: (x.state == 'star', x.quality), reverse=True), start=1):
+                conn.execute(
+                    "UPDATE picks SET role='pick', rank=? WHERE frame_id=?",
+                    (rank_idx, k.id)
+                )
+
+        # Ensure promoted runner-ups have native resolution decoded
+        if promoted_runners:
+            from pipeline.decode import ensure_native_frames
+            try:
+                ensure_native_frames(self.db, [r.id for r in promoted_runners])
+            except Exception:
+                pass
+
+        # 4. Measure statistics
+        after_count = len(kept_picks)
+        after_embs = np.stack([k.emb for k in kept_picks]) if kept_picks else np.zeros((0, 512))
+        if after_count > 1:
+            sims_after = after_embs @ after_embs.T
+            np.fill_diagonal(sims_after, -1.0)
+            max_sim_after = float(sims_after.max())
+            mean_nn_sim = float(sims_after.max(axis=1).mean())
+        else:
+            max_sim_after = 0.0
+            mean_nn_sim = 0.0
+
+        report = {
+            "video_id": video_id,
+            "before_count": before_count,
+            "after_count": after_count,
+            "duplicates_removed": len(dropped_dups),
+            "trimmed_to_target": len(trimmed_picks),
+            "promoted_from_runners": len(promoted_runners),
+            "similarity_threshold": similarity_threshold,
+            "target_range": [target_min, target_max],
+            "max_similarity_after": round(max_sim_after, 4),
+            "mean_nn_similarity_after": round(mean_nn_sim, 4),
+            "duplicates": dropped_dups[:100],
+        }
+        progress(1.0, f"Postprocessing complete: {after_count} frames selected ({len(dropped_dups)} duplicates ≥{similarity_threshold*100:.0f}% removed)")
+        return report
+
