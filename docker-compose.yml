@@ -1,0 +1,31 @@
+services:
+  captioning-pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: captioning-pipeline:latest
+    container_name: captioning-pipeline
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - CP_VIDEO_DIR=${CP_VIDEO_DIR:-/videos}
+      - CP_CACHE_DIR=${CP_CACHE_DIR:-/cache}
+      - CP_FINISHED_DIR=${CP_FINISHED_DIR:-/finished}
+      - CP_MODELS_DIR=/app/models
+    volumes:
+      # Video source directory: Windows host path C:\Users\Patri\Videos\_girls
+      - "${VIDEO_DIR:-/mnt/c/Users/Patri/Videos/_girls}:/videos:ro"
+      - "${VIDEO_DIR:-/mnt/c/Users/Patri/Videos/_girls}:/mnt/c/Users/Patri/Videos/_girls:ro"
+
+      # Persistent cache & database (state.db, filmstrips, previews)
+      - "${CACHE_DIR:-/home/z3pp1x/.cache/captioning_pipeline}:/cache"
+      - "${CACHE_DIR:-/home/z3pp1x/.cache/captioning_pipeline}:/root/.cache/captioning_pipeline"
+
+      # Finished dataset export directory
+      - "${FINISHED_DIR:-/mnt/c/Users/Patri/Documents/captioning_pipeline/data/finished}:/finished"
+      - "${FINISHED_DIR:-/mnt/c/Users/Patri/Documents/captioning_pipeline/data/finished}:/mnt/c/Users/Patri/Documents/captioning_pipeline/data/finished"
+
+      # Gemini taxonomy & skills context (optional)
+      - "${GEMINI_SKILLS_DIR:-/home/z3pp1x/.gemini/config/skills}:/root/.gemini/config/skills:ro"

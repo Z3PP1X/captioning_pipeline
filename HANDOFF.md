@@ -1,8 +1,8 @@
-# Handoff - design overhaul, pipeline review, Prompt Director fix, Phases A-E
+# Handoff - design overhaul, pipeline review, Prompt Director fix, Phases A-E, Database Reset & Dockerization
 
 Date: 2026-10-15. Branch `main`.
-**Phases A, B, C, D, and E are DONE** (§1.3, §1.4). Next: Phase F (Extraction v2) & Phase G (Captioning v2).
-All verification completed inside WSL 2 (81 Python tests pass, 42 Vitest specs pass, clean production build).
+**Database Reset, Dockerization, and Phases A, B, C, D, and E are DONE** (§1.3, §1.4, §1.5). Next: Phase F (Extraction v2) & Phase G (Captioning v2).
+All verification completed inside WSL 2 (Docker healthy with 89 videos recognized & ONNX models embedded, 81 Python tests pass, 42 Vitest specs pass, clean Angular production build).
 
 ## 0. Read first
 
@@ -246,6 +246,30 @@ Design plan W1-W10 (state machine in its §3.1, wireframes in §3.3):
 - Pipeline board as the landing page (`PipelineBoardComponent`) with stage filters, search, and next actions; backend `kept_count`/`captioned_count` on `GET /api/videos`
 - Jobs ticker with live SSE connection state indicator (F11)
 - Lightbox modal upgraded with full ARIA dialog attributes, accessible close/arrow buttons, 1-based chunk numbering, and tabular numerals
+
+### Phase 1.5 - Database Reset & Production Dockerization - **DONE**
+
+Full production dockerization and safe database reset completed per user instruction:
+1. **Database Reset**:
+   - Backed up active SQLite database to `~/.cache/captioning_pipeline/state.db.bak_20261015_225653`.
+   - Created `scripts/reset_db.sh` for convenient, safe database resetting with timestamped backup and optional `--purge-all` flag for cached candidates, previews, and filmstrips.
+   - Initialized clean schema via `DB(settings.db_path)`.
+2. **Multi-Stage Dockerfile**:
+   - **Stage 1 (Frontend Builder)**: `node:22-bookworm-slim` builds Angular production bundle into `src/web/dist` (5.3s clean build).
+   - **Stage 2 (Runtime)**: `python:3.12-slim-bookworm` with system dependencies (`ffmpeg`, `libgl1`, `libglib2.0-0`, `curl`, `ca-certificates`, `sqlite3`), `uv` package manager, and Uvicorn runtime.
+   - Pre-downloads and embeds ONNX CLIP models (`Xenova/clip-vit-base-patch32` vision model, text model, and tokenizer) directly into `/app/models` inside the image via `scripts/download_models.py`.
+   - `ClipClassifier` updated with dual-directory resolution: checks mounted cache/custom `CP_MODELS_DIR` first, and falls back to built-in `/app/models` without requiring runtime network requests.
+3. **Docker Compose & Configuration**:
+   - `docker-compose.yml` mounts Windows video folder `${VIDEO_DIR:-/mnt/c/Users/Patri/Videos/_girls}` to `/videos:ro` (and `/mnt/c/Users/Patri/Videos/_girls:ro`), persistent cache (`${CACHE_DIR}`), finished dataset destination (`${FINISHED_DIR}`), and optional Gemini skills directory.
+   - `.env.example` and `.env` provide configuration for `OPENROUTER_API_KEY`, `VIDEO_DIR`, `CACHE_DIR`, `FINISHED_DIR`, and `PORT`.
+   - `.dockerignore` filters out `.git`, `node_modules`, `.venv`, `.angular`, `__pycache__`, data, and database files.
+4. **Verification**:
+   - Container built cleanly (`captioning-pipeline:latest`).
+   - Container running healthy: `0.0.0.0:8000->8000/tcp`.
+   - All 89 source videos scanned and metadata indexed.
+   - Angular SPA root (`/`) and JS bundles (`/main-*.js`) served cleanly (HTTP 200).
+   - ONNX model inference verified inside container (`pixel_values` and `input_ids` inputs resolved).
+   - Full test suites passing: 81 / 81 Python tests in `tests/`, 42 / 42 Angular Vitest specs.
 
 ### Phase F - Extraction / quality / selection v2 (about 8-14 days; needs decision 1)
 

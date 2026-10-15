@@ -33,8 +33,9 @@ def clip_preprocess_bgr(img_bgr: np.ndarray, size: int = 224) -> np.ndarray:
 class ClipClassifier:
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
-        self.models_dir = self.settings.cache_dir / "models"
+        self.models_dir = Path(os.getenv("CP_MODELS_DIR", self.settings.cache_dir / "models"))
         self.models_dir.mkdir(parents=True, exist_ok=True)
+        self.builtin_models_dir = Path("/app/models")
         self.repo = "Xenova/clip-vit-base-patch32"
 
         # Session options
@@ -47,25 +48,27 @@ class ClipClassifier:
         self._cached_prompt_embeddings: dict[str, np.ndarray] = {}
         self._lock = threading.RLock()
 
+    def _resolve_model_path(self, filename: str) -> str:
+        for m_dir in (self.models_dir, self.builtin_models_dir):
+            if m_dir.is_dir():
+                try:
+                    return hf_hub_download(self.repo, filename, cache_dir=str(m_dir), local_files_only=True)
+                except Exception:
+                    pass
+        return hf_hub_download(self.repo, filename, cache_dir=str(self.models_dir))
+
     def _ensure_vision_model(self) -> ort.InferenceSession:
         with self._lock:
             if self._vision_sess is None:
-                try:
-                    v_path = hf_hub_download(self.repo, "onnx/vision_model_quantized.onnx", cache_dir=str(self.models_dir), local_files_only=True)
-                except Exception:
-                    v_path = hf_hub_download(self.repo, "onnx/vision_model_quantized.onnx", cache_dir=str(self.models_dir))
+                v_path = self._resolve_model_path("onnx/vision_model_quantized.onnx")
                 self._vision_sess = ort.InferenceSession(v_path, self.opts, providers=["CPUExecutionProvider"])
             return self._vision_sess
 
     def _ensure_text_model(self) -> tuple[ort.InferenceSession, Tokenizer]:
         with self._lock:
             if self._text_sess is None or self._tokenizer is None:
-                try:
-                    t_path = hf_hub_download(self.repo, "onnx/text_model_quantized.onnx", cache_dir=str(self.models_dir), local_files_only=True)
-                    tok_path = hf_hub_download(self.repo, "tokenizer.json", cache_dir=str(self.models_dir), local_files_only=True)
-                except Exception:
-                    t_path = hf_hub_download(self.repo, "onnx/text_model_quantized.onnx", cache_dir=str(self.models_dir))
-                    tok_path = hf_hub_download(self.repo, "tokenizer.json", cache_dir=str(self.models_dir))
+                t_path = self._resolve_model_path("onnx/text_model_quantized.onnx")
+                tok_path = self._resolve_model_path("tokenizer.json")
                 self._text_sess = ort.InferenceSession(t_path, self.opts, providers=["CPUExecutionProvider"])
                 self._tokenizer = Tokenizer.from_file(tok_path)
                 # Enable padding to 77 tokens (CLIP standard)
