@@ -77,8 +77,9 @@ class ScoringEngine:
         self,
         candidates: list[dict[str, Any]],
         image_embeddings: np.ndarray,
+        target_person_embedding: np.ndarray | None = None,
     ) -> list[dict[str, Any]]:
-        """Compute the 7 scoring dimensions for a batch of candidate frames."""
+        """Compute the 7 scoring dimensions and optional target person prioritization."""
         if len(candidates) == 0:
             return []
 
@@ -123,14 +124,51 @@ class ScoringEngine:
             face_score = scores["face"]
             face_visible_50pct = face_score >= 0.50
 
-            # Composite ranking score
-            comp = (
-                0.35 * sharpness_score
-                + 0.25 * quality_score
-                + 0.18 * max(scores["multiple_persons"], scores["one_person"])
-                + 0.12 * max(scores["tools"], scores["equipment"])
-                + 0.10 * face_score
+            target_sim = float(
+                cand.get("target_person_sim")
+                or metrics.get("target_person_sim")
+                or 0.0
             )
+            target_matched = bool(
+                cand.get("target_person_matched")
+                or metrics.get("target_person_matched")
+                or (target_sim >= 0.363)
+            )
+            face_count = int(
+                cand.get("face_count")
+                or metrics.get("face_count")
+                or (1 if face_visible_50pct else 0)
+            )
+
+            # Composite ranking score: prioritize target person when tagged
+            if target_person_embedding is not None or target_sim > 0.0:
+                is_target = target_sim >= 0.363
+                is_off_target_person = (face_count >= 1) and (target_sim < 0.28)
+
+                person_boost = 0.0
+                if is_target:
+                    person_boost = 0.40 * min(1.0, target_sim / 0.70)
+                    if face_count == 1:
+                        person_boost += 0.20  # Solo target person bonus
+                elif is_off_target_person:
+                    person_boost = -0.50  # Deprioritize other people
+
+                comp = (
+                    0.25 * sharpness_score
+                    + 0.20 * quality_score
+                    + 0.15 * max(scores["multiple_persons"], scores["one_person"])
+                    + 0.10 * max(scores["tools"], scores["equipment"])
+                    + 0.10 * face_score
+                    + 0.35 * person_boost
+                )
+            else:
+                comp = (
+                    0.35 * sharpness_score
+                    + 0.25 * quality_score
+                    + 0.18 * max(scores["multiple_persons"], scores["one_person"])
+                    + 0.12 * max(scores["tools"], scores["equipment"])
+                    + 0.10 * face_score
+                )
 
             scored_dict = {
                 "sharpness": sharpness_score,
@@ -141,6 +179,9 @@ class ScoringEngine:
                 "equipment": scores["equipment"],
                 "face_score": face_score,
                 "face_visible_50pct": face_visible_50pct,
+                "target_person_sim": round(target_sim, 4),
+                "target_person_matched": target_matched,
+                "face_count": face_count,
                 "composite": round(comp, 4),
             }
 
@@ -155,12 +196,19 @@ class ScoringEngine:
         """Calculates current category distribution percentages across selected frames."""
         total = len(frames)
         if total == 0:
-            return {"multiple_pct": 0.0, "one_person_pct": 0.0, "tools_equipment_pct": 0.0, "face_visible_pct": 0.0}
+            return {
+                "multiple_pct": 0.0,
+                "one_person_pct": 0.0,
+                "tools_equipment_pct": 0.0,
+                "face_visible_pct": 0.0,
+                "target_person_pct": 0.0,
+            }
 
         mult_count = 0
         solo_count = 0
         tool_equip_count = 0
         face_count = 0
+        target_count = 0
 
         for f in frames:
             sc = f.get("scores") or f.get("zs_scores") or {}
@@ -172,12 +220,15 @@ class ScoringEngine:
                 tool_equip_count += 1
             if sc.get("face_visible_50pct") or sc.get("face_score", 0.0) >= 0.50:
                 face_count += 1
+            if sc.get("target_person_matched") or sc.get("target_person_sim", 0.0) >= 0.363:
+                target_count += 1
 
         return {
             "multiple_pct": round((mult_count / total) * 100.0, 1),
             "one_person_pct": round((solo_count / total) * 100.0, 1),
             "tools_equipment_pct": round((tool_equip_count / total) * 100.0, 1),
             "face_visible_pct": round((face_count / total) * 100.0, 1),
+            "target_person_pct": round((target_count / total) * 100.0, 1),
             "total_frames": total,
         }
 
@@ -322,6 +373,10 @@ class ScoringEngine:
                         cat_bonus += 0.20 * need_tools
                     if sc.get("face_visible_50pct"):
                         cat_bonus += 0.10
+                    if sc.get("target_person_matched"):
+                        cat_bonus += 0.35 * min(1.0, sc.get("target_person_sim", 0.7) / 0.7)
+                    elif sc.get("face_count", 0) >= 1 and sc.get("target_person_sim", 0.0) < 0.28:
+                        cat_bonus -= 0.30
 
                     cand_q = base_q + cat_bonus
 
@@ -371,7 +426,10 @@ class ScoringEngine:
             # Rank runners by composite quality score descending so p.rank is meaningful (C2/H2)
             unselected_cands = [cand for i, cand in enumerate(c_pool) if i not in selected_indices]
             unselected_cands.sort(
-                key=lambda c: (c.get("scores") or {}).get("composite", c.get("composite", 0.0)),
+                key=lambda c: (
+                    1 if (c.get("scores") or {}).get("target_person_matched") else 0,
+                    (c.get("scores") or {}).get("composite", c.get("composite", 0.0)),
+                ),
                 reverse=True,
             )
             for runner_rank, cand in enumerate(unselected_cands):

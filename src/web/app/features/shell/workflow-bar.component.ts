@@ -73,6 +73,26 @@ import { videoStatusMeta } from '../../core/ui/status';
             >
               {{ statusMeta().label }}
             </span>
+
+            @if (v.target_person_name) {
+              <button
+                type="button"
+                (click)="openPersonModal.emit()"
+                class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-primary/10 text-primary border border-primary/20 hover:bg-primary/20 transition-colors cursor-pointer"
+                title="Target person: {{ v.target_person_name }}. Click to change."
+              >
+                <span>🎯 {{ v.target_person_name }}</span>
+              </button>
+            } @else {
+              <button
+                type="button"
+                (click)="openPersonModal.emit()"
+                class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium border border-border text-muted-foreground hover:text-foreground hover:bg-muted transition-colors cursor-pointer"
+                title="Assign target person for face-prioritized extraction"
+              >
+                <span>🎯 + Person</span>
+              </button>
+            }
           </div>
 
           <!-- Center/Right: Stepper Navigation -->
@@ -214,6 +234,7 @@ export class WorkflowBarComponent {
 
   readonly tabChange = output<'studio' | 'curate' | 'dataset'>();
   readonly openCaptionModal = output<void>();
+  readonly openPersonModal = output<void>();
 
   readonly Math = Math;
 

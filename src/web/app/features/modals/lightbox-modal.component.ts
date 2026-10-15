@@ -1,4 +1,4 @@
-import { ChangeDetectionStrategy, Component, computed, inject } from '@angular/core';
+import { ChangeDetectionStrategy, Component, computed, inject, output } from '@angular/core';
 import { NgIcon, provideIcons } from '@ng-icons/core';
 import {
   lucideCheck,
@@ -6,15 +6,19 @@ import {
   lucideStar,
   lucideChevronLeft,
   lucideChevronRight,
+  lucideTarget,
+  lucideUserPlus,
 } from '@ng-icons/lucide';
 import { HlmButtonImports } from '@spartan-ng/helm/button';
+import { HlmBadgeImports } from '@spartan-ng/helm/badge';
 import { CurateService } from '../../core/services/curate.service';
+import { VideoService } from '../../core/services/video.service';
 import { formatTime } from '../../core/utils/time.utils';
 import { CandidateState } from '../../core/models/candidate.model';
 
 @Component({
   selector: 'app-lightbox-modal',
-  imports: [NgIcon, HlmButtonImports],
+  imports: [NgIcon, HlmButtonImports, HlmBadgeImports],
   providers: [
     provideIcons({
       lucideCheck,
@@ -22,6 +26,8 @@ import { CandidateState } from '../../core/models/candidate.model';
       lucideStar,
       lucideChevronLeft,
       lucideChevronRight,
+      lucideTarget,
+      lucideUserPlus,
     }),
   ],
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -138,6 +144,54 @@ import { CandidateState } from '../../core/models/candidate.model';
               </button>
             </div>
 
+            <!-- Face Recognition & Target Person Match Section -->
+            <div class="flex flex-col gap-2 py-3.5 border-b border-border">
+              <div class="flex items-center justify-between">
+                <span class="text-xs font-bold uppercase tracking-wider text-muted-foreground flex items-center gap-1.5">
+                  <ng-icon name="lucideTarget" class="size-3.5 text-primary" />
+                  <span>Face Recognition</span>
+                </span>
+                @if (c.target_person_matched || (c.target_person_sim && c.target_person_sim >= 0.363)) {
+                  <span hlmBadge variant="secondary" class="bg-primary/20 text-primary border border-primary/30 text-[10px] font-bold">
+                    🎯 Match ({{ Math.round((c.target_person_sim || 0) * 100) }}%)
+                  </span>
+                }
+              </div>
+
+              @if (c.face_count !== undefined && c.face_count > 0) {
+                <div class="flex items-center justify-between text-xs py-0.5">
+                  <span class="text-muted-foreground">Detected Faces:</span>
+                  <span class="font-bold text-foreground">{{ c.face_count }}</span>
+                </div>
+              }
+
+              @if (videoService.currentVideo()?.target_person_name; as tName) {
+                <div class="flex items-center justify-between text-xs py-0.5">
+                  <span class="text-muted-foreground">Target Person:</span>
+                  <span class="font-bold text-primary">{{ tName }}</span>
+                </div>
+                <div class="flex items-center justify-between text-xs py-0.5">
+                  <span class="text-muted-foreground">Identity Similarity:</span>
+                  <span class="tabular-nums font-bold text-foreground">
+                    {{ ((c.target_person_sim || 0) * 100).toFixed(1) }}%
+                  </span>
+                </div>
+              }
+
+              <!-- Tag Person Action Button -->
+              <button
+                hlmBtn
+                variant="outline"
+                size="sm"
+                (click)="tagPerson.emit(c.id)"
+                class="w-full mt-1.5 cursor-pointer gap-1.5 font-semibold text-xs border-primary/40 text-primary hover:bg-primary/10 transition-colors"
+                title="Tag the face detected in this frame to build/update the person identity"
+              >
+                <ng-icon name="lucideUserPlus" class="size-3.5" />
+                <span>Tag Face as Person</span>
+              </button>
+            </div>
+
             <!-- 7-Dimension Scoring Breakdown -->
             <div class="flex flex-col gap-2.5 pt-4">
               <h5 class="text-xs font-bold uppercase tracking-wider text-muted-foreground">
@@ -184,9 +238,12 @@ import { CandidateState } from '../../core/models/candidate.model';
 })
 export class LightboxModalComponent {
   readonly curateService = inject(CurateService);
+  readonly videoService = inject(VideoService);
   readonly candidate = this.curateService.currentLightboxCandidate;
 
+  readonly tagPerson = output<number>();
   readonly formatTime = formatTime;
+  readonly Math = Math;
 
   getFullUrl(c: { video_id?: string | number; id: number; full_url?: string }): string {
     if (c.full_url) return c.full_url;

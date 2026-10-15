@@ -1,8 +1,8 @@
-# Handoff - design overhaul, pipeline review, Prompt Director fix, Phases A-E, Database Reset & Dockerization
+# Handoff - design overhaul, pipeline review, Prompt Director fix, Phases A-E, Database Reset, Dockerization & Face Recognition / Auto-Extraction
 
 Date: 2026-10-15. Branch `main`.
-**Database Reset, Dockerization, and Phases A, B, C, D, and E are DONE** (§1.3, §1.4, §1.5). Next: Phase F (Extraction v2) & Phase G (Captioning v2).
-All verification completed inside WSL 2 (Docker healthy with 89 videos recognized & ONNX models embedded, 81 Python tests pass, 42 Vitest specs pass, clean Angular production build).
+**Database Reset, Dockerization, Phases A-E, and Phase 1.6 (Face Recognition, Person Tagging & Auto-Extraction) are DONE** (§1.3, §1.4, §1.5, §1.6). Next: Phase F (Extraction v2) & Phase G (Captioning v2).
+All verification completed inside WSL 2 (135 Python tests pass across 14 test suites, 49 Vitest specs pass, clean Angular production build).
 
 ## 0. Read first
 
@@ -270,6 +270,49 @@ Full production dockerization and safe database reset completed per user instruc
    - Angular SPA root (`/`) and JS bundles (`/main-*.js`) served cleanly (HTTP 200).
    - ONNX model inference verified inside container (`pixel_values` and `input_ids` inputs resolved).
    - Full test suites passing: 81 / 81 Python tests in `tests/`, 42 / 42 Angular Vitest specs.
+
+### Phase 1.6 - Face Recognition, Character Tagging & Auto-Extraction - **DONE**
+
+High-performance, CPU-friendly facial recognition (<10ms inference per frame on ARM64 WSL) and autonomous frame extraction pipeline integrated to prioritize target characters:
+1. **Face Recognition Engine (`src/pipeline/face.py`)**:
+   - Uses OpenCV YuNet (`face_detection_yunet_2023mar.onnx`) for face detection and landmarks, and SFace (`face_recognition_sface_2021dec.onnx`) for 128-dimensional L2-normalized identity embeddings.
+   - Zero heavyweight external dependencies (no InsightFace, dlib, or CUDA required). Runs natively inside WSL 2 CPU in ~6.09 ms/frame.
+   - Models auto-downloaded by `scripts/download_models.py` to `~/.cache/captioning_pipeline/models/` and `/app/models/` in Docker.
+   - Robust cosine similarity matching against standard SFace threshold (0.363 match cutoff).
+   - Multi-exemplar running centroid averaging: when additional face crops are tagged for a person, new unit-normalized embeddings are merged into a running identity centroid, improving recognition across varying angles and lighting.
+   - Face crop extraction and disk caching for visual avatar confirmation in the UI.
+
+2. **Database & Schema Enhancements (`src/pipeline/db.py`)**:
+   - `persons` table: `id`, `name`, `slug`, `embedding` (BLOB), `exemplar_count`, `crop_path`, `created_at`, `updated_at`.
+   - `videos` table: added `target_person_id` and `target_person_name` foreign key tracking.
+   - `frames` table / responses: enriched with `target_person_sim`, `target_person_matched`, `face_count`, and bounding boxes.
+   - Safe SQLite migrations and helper methods: `create_or_update_person`, `list_persons`, `get_person`, `delete_person`, `set_video_target_person`.
+
+3. **Prioritized Scoring & Diversity (`src/pipeline/scoring.py` & `select.py`)**:
+   - Scoring engine heavily boosts frames containing the target character (+0.40 confidence-scaled boost + 0.20 solo presence bonus) and penalizes off-target/different-face frames (-0.50).
+   - MMR diversity reduction algorithm prioritizes target person candidates while ensuring camera angle and pose diversity across scene chunks.
+   - Distribution metrics calculate `target_person_pct` alongside solo, multi-person, and equipment percentages.
+
+4. **Instant In-Memory/Database Reconciliation**:
+   - Real-time frame tagging endpoint (`POST /api/videos/{video_id}/tag-face-from-frame`): when a face is tagged on any frame, the person's embedding is updated, and all existing candidate frames for the video are instantly re-scored and updated in SQLite without needing a full re-extraction.
+   - Broadcasts updated match scores and frame states via SSE events (`job_progress` / `reconciled`).
+
+5. **Autonomous Extraction (`src/pipeline/jobs.py` & `api.py`)**:
+   - Autonomous extraction job (`submit_auto_extract_job`) and endpoint (`POST /api/videos/{video_id}/auto-extract`): executes autochunking (if needed), chunk-based candidate sampling, face detection, identity matching, score prioritization, and MMR reduction in one seamless automated pipeline.
+
+6. **Angular 22 Frontend Integration**:
+   - `PersonService` (`src/web/app/core/services/person.service.ts`): Signal-based state management for persons, active target person selection, face tagging from frames, and auto-extraction triggers.
+   - `PersonModalComponent` (`src/web/app/features/modals/person-modal.component.ts`): Character management modal with person creation, exemplar count indicators, target person assignment, and one-click auto-extract button.
+   - `WorkflowBarComponent`: Displays the active target person badge (`🎯 Elena`) with click-to-manage action.
+   - `CurateToolbarComponent`: Includes a quick `🎯 Target Person` filter toggle that instantly isolates matching frames in the candidate grid.
+   - `CandidateGridComponent`: Renders high-visibility match percentage badges (`🎯 88%`) on candidate cards, and card-action quick-tag icon button (`lucideTarget`).
+   - `DistributionBarComponent`: Displays a dedicated Target Person stat card with presence percentage and visual progress indicator.
+   - `LightboxModalComponent`: Displays face detection count, target similarity score, and a direct "Tag Face as Person" button to tag characters directly from full-screen inspection.
+
+7. **Verification**:
+   - 135 / 135 Python tests passing across all 14 test suites (`bash scripts/test.sh`).
+   - 49 / 49 Angular Vitest specs passing (`npm test -- --watch=false`).
+   - Angular production build succeeds cleanly in ~5s (`npm run build`).
 
 ### Phase F - Extraction / quality / selection v2 (about 8-14 days; needs decision 1)
 

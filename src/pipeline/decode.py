@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Generator
+from typing import Any, Generator
 
 import cv2
 import av
@@ -89,6 +89,52 @@ def sample_chunk_frames(
                 next_sample_t = t + sample_interval
 
     return sampled
+
+
+def sample_frames_at(
+    path: Path,
+    timestamps: list[float],
+    max_dim: int = 512,
+) -> list[tuple[float, np.ndarray]]:
+    """Decode one frame at (or just after) each timestamp, seeking between them.
+
+    Unlike `sample_chunk_frames` this does not decode the whole range, so probing a handful of frames per
+    scene of a long video is cheap. Frames are downscaled immediately, so memory stays small even for 4K
+    sources. Timestamps that cannot be decoded are skipped.
+    """
+    out: list[tuple[float, np.ndarray]] = []
+    if not timestamps:
+        return out
+
+    try:
+        with av.open(str(path)) as container:
+            stream = container.streams.video[0]
+            tb = stream.time_base
+            for target in sorted(timestamps):
+                try:
+                    container.seek(int(max(0.0, target - 0.5) / tb), stream=stream, backward=True, any_frame=False)
+                except Exception:
+                    pass
+                for frame in safe_decode_frames(container, stream):
+                    if frame.pts is None:
+                        continue
+                    t = float(frame.pts * tb)
+                    if t < target - 0.05:
+                        continue
+                    img_bgr = frame.to_ndarray(format="bgr24")
+                    h, w = img_bgr.shape[:2]
+                    if max_dim > 0 and max(h, w) > max_dim:
+                        scale = max_dim / max(h, w)
+                        img_bgr = cv2.resize(
+                            img_bgr,
+                            (max(16, int(round(w * scale))), max(16, int(round(h * scale)))),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    out.append((round(t, 3), img_bgr))
+                    break
+    except Exception:
+        pass
+    return out
 
 
 def decode_exact_frames(

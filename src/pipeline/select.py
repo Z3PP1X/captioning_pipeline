@@ -52,6 +52,14 @@ def select_diverse_top_k(
             else:
                 c_conf = 1.0 - zs.get("negative", 0.0)
 
+            # Target person identity prioritization
+            if "target_person_sim" in zs:
+                sim = float(zs.get("target_person_sim", 0.0))
+                if zs.get("target_person_matched"):
+                    c_conf = min(1.0, c_conf + 0.35 * sim)
+                elif zs.get("face_count", 0) > 0 and sim < 0.25:
+                    c_conf = max(0.0, c_conf - 0.30)
+
             c["composite_q"] = round(w_q * t1_score + w_c * c_conf, 4)
             rule_passed.append(c)
         else:

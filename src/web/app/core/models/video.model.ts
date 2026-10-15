@@ -24,6 +24,8 @@ export interface Video {
   export_count?: number;
   kept_count?: number;
   captioned_count?: number;
+  target_person_id?: number | null;
+  target_person_name?: string | null;
 }
 
 export interface FilmstripThumbnail {

@@ -15,6 +15,7 @@ import { DatasetViewComponent } from './features/dataset/dataset-view.component'
 import { LightboxModalComponent } from './features/modals/lightbox-modal.component';
 import { SettingsModalComponent } from './features/modals/settings-modal.component';
 import { OpenRouterModalComponent } from './features/modals/openrouter-modal.component';
+import { PersonModalComponent } from './features/modals/person-modal.component';
 import { ToastContainerComponent } from './features/shell/toast-container.component';
 import { PromptClickerViewComponent } from './features/prompt-clicker/prompt-clicker-view.component';
 import { PipelineBoardComponent, BoardNavigateEvent } from './features/pipeline-board/pipeline-board.component';
@@ -41,6 +42,7 @@ import { HotkeyService } from './core/services/hotkey.service';
     LightboxModalComponent,
     SettingsModalComponent,
     OpenRouterModalComponent,
+    PersonModalComponent,
     ToastContainerComponent,
   ],
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -74,6 +76,7 @@ import { HotkeyService } from './core/services/hotkey.service';
             <app-workflow-bar
               (tabChange)="onTabChange($event)"
               (openCaptionModal)="isOpenRouterModalOpen.set(true)"
+              (openPersonModal)="openPersonModal()"
             />
           }
 
@@ -91,6 +94,7 @@ import { HotkeyService } from './core/services/hotkey.service';
               <app-curate-view
                 class="flex-1 min-h-0 flex flex-col overflow-hidden w-full h-full"
                 (openVlmModal)="isOpenRouterModalOpen.set(true)"
+                (openPersonModal)="openPersonModal($event.frameId)"
                 (seekChunk)="onSeekChunk($event)"
               />
             }
@@ -105,7 +109,7 @@ import { HotkeyService } from './core/services/hotkey.service';
       </div>
 
       <!-- Modals & Overlays -->
-      <app-lightbox-modal />
+      <app-lightbox-modal (tagPerson)="openPersonModal($event)" />
 
       <app-settings-modal
         [isOpen]="isSettingsModalOpen()"
@@ -116,6 +120,13 @@ import { HotkeyService } from './core/services/hotkey.service';
         [isOpen]="isOpenRouterModalOpen()"
         (close)="isOpenRouterModalOpen.set(false)"
       />
+
+      @if (isPersonModalOpen()) {
+        <app-person-modal
+          [frameId]="personModalFrameId()"
+          (close)="isPersonModalOpen.set(false)"
+        />
+      }
 
       <app-toast-container (actionRequest)="onToastAction($event)" />
     </div>
@@ -133,6 +144,13 @@ export class AppComponent implements OnInit {
   readonly currentTab = signal<'board' | 'studio' | 'curate' | 'dataset' | 'prompt-clicker'>('board');
   readonly isSettingsModalOpen = signal<boolean>(false);
   readonly isOpenRouterModalOpen = signal<boolean>(false);
+  readonly isPersonModalOpen = signal<boolean>(false);
+  readonly personModalFrameId = signal<number | null>(null);
+
+  openPersonModal(frameId?: number): void {
+    this.personModalFrameId.set(frameId ?? null);
+    this.isPersonModalOpen.set(true);
+  }
 
   constructor() {
     // React to video selection changes

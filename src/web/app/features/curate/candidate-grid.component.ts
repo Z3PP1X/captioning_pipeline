@@ -17,6 +17,7 @@ import {
   lucideFilm,
   lucideSearch,
   lucideTag,
+  lucideTarget,
 } from '@ng-icons/lucide';
 import { HlmButtonImports } from '@spartan-ng/helm/button';
 import { HlmBadgeImports } from '@spartan-ng/helm/badge';
@@ -59,6 +60,7 @@ export interface ChunkCandidateGroup {
       lucideFilm,
       lucideSearch,
       lucideTag,
+      lucideTarget,
     }),
   ],
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -255,6 +257,17 @@ export interface ChunkCandidateGroup {
                           Captioned
                         </span>
                       }
+
+                      @if (c.target_person_matched || (c.target_person_sim && c.target_person_sim >= 0.363)) {
+                        <span
+                          hlmBadge
+                          variant="secondary"
+                          class="shrink-0 text-[10px] px-1 py-0 h-4 font-bold bg-primary/20 text-primary border border-primary/30 drop-shadow"
+                          [title]="'Target Person Match: ' + Math.round((c.target_person_sim || 0) * 100) + '%'"
+                        >
+                          🎯 {{ Math.round((c.target_person_sim || 0) * 100) }}%
+                        </span>
+                      }
                     </div>
 
                     @if (c.score !== undefined) {
@@ -306,7 +319,16 @@ export interface ChunkCandidateGroup {
                     </button>
                   </div>
 
-                  <div>
+                  <div class="flex items-center gap-1">
+                    <button
+                      (click)="tagPerson.emit(c.id)"
+                      class="size-6 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-primary cursor-pointer"
+                      title="Tag person from this frame"
+                      aria-label="Tag person from this frame"
+                    >
+                      <ng-icon name="lucideTarget" class="size-3.5" />
+                    </button>
+
                     <button
                       (click)="onSwap(c)"
                       class="size-6 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-primary cursor-pointer"
@@ -351,7 +373,9 @@ export class CandidateGridComponent {
   readonly settingsService = inject(SettingsService);
 
   readonly seekChunk = output<number>();
+  readonly tagPerson = output<number>();
   readonly formatShortTime = formatShortTime;
+  readonly Math = Math;
 
   readonly chunkGroups = computed<ChunkCandidateGroup[]>(() => {
     const filtered = this.curateService.filteredCandidates();

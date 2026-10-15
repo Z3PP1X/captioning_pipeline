@@ -43,6 +43,10 @@ export interface CandidateFrame {
   chunk_tags?: string[] | string;
   budget_pct?: number;
   caption_model?: string;
+  target_person_sim?: number;
+  target_person_matched?: boolean;
+  face_count?: number;
+  faces?: Array<{ box: [number, number, number, number]; score: number; sim: number; matched: boolean }>;
 }
 
 export interface DistributionStat {
@@ -56,6 +60,8 @@ export interface CurationDistribution {
   one_person?: DistributionStat;
   tools_equipment?: DistributionStat;
   face_visible?: DistributionStat;
+  target_person?: DistributionStat;
+  target_person_pct?: number;
   selected_count?: number;
   target_count?: number;
 }

@@ -50,7 +50,7 @@ Status handling: startup no longer blindly resets `extracting*` to `chunked`; or
 
 ## Module map (`src/pipeline`)
 
-`api.py` routes + SPA serving - `db.py` (JSON cols auto-decoded) - `jobs.py` JobManager + SSE - `reconcile.py` - `autochunk.py` / `autoprocess.py` - `indexer.py` - `decode.py` (PyAV) - `metrics.py` - `classifier.py` / `tagger.py` - `scoring.py` / `select.py` - `openrouter.py` - `export.py` - `streaming.py` (HTTP 206) - `rag/` (`indexer, retriever, generator, linter, taxonomy`). Tables: `videos, chunks, frames, picks, jobs, exports, settings` (+ separate `rag_index.sqlite`).
+`api.py` routes + SPA serving - `db.py` (JSON cols auto-decoded) - `face.py` (YuNet + SFace face recognition) - `jobs.py` JobManager + SSE - `reconcile.py` - `autochunk.py` / `autoprocess.py` - `indexer.py` - `decode.py` (PyAV) - `metrics.py` - `classifier.py` / `tagger.py` - `scoring.py` / `select.py` - `openrouter.py` - `export.py` - `streaming.py` (HTTP 206) - `rag/` (`indexer, retriever, generator, linter, taxonomy`). Tables: `videos, chunks, frames, picks, persons, jobs, exports, settings` (+ separate `rag_index.sqlite`).
 
 Frontend map (`src/web/app`): `core/{models,services,utils}` (api, chunk, curate, dataset, hotkey, job-event, prompt-rag, settings, video services), `features/{shell,studio,curate,dataset,modals,prompt-clicker}` (+ `shared/ui` Spartan helm). See `angular-migration`, `studio-ui-spec`.
 

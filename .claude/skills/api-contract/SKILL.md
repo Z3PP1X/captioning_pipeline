@@ -54,9 +54,38 @@ Chunk = { id, video_id, position, start_s, end_s, k, budget_pct, caption_model: 
 | `POST /api/videos/{id}/curate/keep_all` / `reject_all` | - | `{status, video_id}` sets state of all `role='pick'` rows (server-side bulk; no chunk filter) |
 | `GET /api/frames/{id}/preview` (webp) / `/full` (png) / `GET /api/videos/{id}/frames/{fid}/thumb` | - | images |
 
-Frame row (candidates / curation-300 / swap / chunk candidates): unified across all endpoints: `{id, video_id, chunk_id, t, time_s, metrics, zs_scores, role, rank, state, crop, preview_url, thumb_url, full_url, is_pick, is_captioned, native, chunk_pos, chunk_position, chunk_start, chunk_end, budget_pct, caption_model}`. `is_captioned` = frame has an `exports` row. `native` = 1 if decoded at native camera resolution, 0 if downsampled runner. `state`: `keep|reject|star|candidate`; `role`: `pick|runner_up`.
+Frame row (candidates / curation-300 / swap / chunk candidates): unified across all endpoints: `{id, video_id, chunk_id, t, time_s, metrics, zs_scores, role, rank, state, crop, preview_url, thumb_url, full_url, is_pick, is_captioned, native, chunk_pos, chunk_position, chunk_start, chunk_end, budget_pct, caption_model, target_person_sim, target_person_matched, face_count, faces}`. `is_captioned` = frame has an `exports` row. `native` = 1 if decoded at native camera resolution, 0 if downsampled runner. `state`: `keep|reject|star|candidate`; `role`: `pick|runner_up`.
 
-`distribution`/`stats` = `{multiple_pct, one_person_pct, tools_equipment_pct, face_visible_pct, total_frames}` (computed from `zs_scores`).
+`distribution`/`stats` = `{multiple_pct, one_person_pct, tools_equipment_pct, face_visible_pct, target_person_pct, total_frames}` (computed from `zs_scores` and target face matches).
+
+## Persons & Face recognition (character prioritization)
+
+| Method + path | Body | Response |
+| --- | --- | --- |
+| `GET /api/persons` | - | `{persons: Person[]}` |
+| `POST /api/persons` | `{name: string}` | `{person: Person}` |
+| `GET /api/persons/{id}` | - | `{person: Person}` |
+| `PATCH /api/persons/{id}` | `{name?: string}` | `{person: Person}` |
+| `DELETE /api/persons/{id}` | - | `{status: "deleted"}` |
+| `GET /api/persons/{id}/crop` | - | Face crop image (JPEG) |
+| `POST /api/videos/{id}/target-person` | `{person_id: number \| null}` | `{status, video_id, target_person_id, target_person_name}` |
+| `POST /api/videos/{id}/tag-face-from-frame` | `{frame_id, person_id?, person_name?, face_index?}` | `{status, person, re_scored_count, frame_id}`. Merges 128-dim running centroid, caches avatar crop, instantly re-scores and updates all video candidate frames in SQLite and broadcasts SSE update |
+| `GET /api/frames/{frame_id}/faces` | - | `{frame_id, face_count, faces: [{bbox, confidence, similarity, matched}]}` |
+| `POST /api/videos/{id}/auto-extract` | `{target_person_id?: number}` | `{job_id, status: "queued"}` autonomous chunking + candidate sampling + face match + score prioritization + MMR reduction |
+
+## Autopilot (autonomous extraction, priority review & refinement)
+
+| Method + path | Body | Response |
+| --- | --- | --- |
+| `GET /api/videos/{id}/autopilot` | - | `{stage, video_id, priorities, chunks:[{id,position,start_s,end_s,priority,budget_pct}], target_person, report?}` |
+| `POST /api/videos/{id}/autopilot/start` | `{exclude_ranges?, target_person_id?, target_curated?, review_chunks?}` | `_autopilot_payload`: starts `autopilot_plan` job |
+| `POST /api/videos/{id}/autopilot/priorities` | `{priorities: {chunk_id: "skip"\|"low"\|"normal"\|"high"}}` | Updates scene priorities and dynamically recalibrates scene frame budgets |
+| `POST /api/videos/{id}/autopilot/approve` | `{priorities?}` | Approves plan and launches extraction + refinement cascade |
+| `POST /api/videos/{id}/autopilot/refine` | `{dup_similarity?, dup_phash?, person_focus?, purge_off_target?}` | Runs cross-set deduplication, off-target replacement, and quota repair |
+| `POST /api/videos/{id}/autopilot/reset` | - | Resets autopilot state back to `idle` |
+| `POST /api/autopilot/batch` | `{video_ids: string[], ...config}` | `{queued:[video_id], skipped:[video_id]}` batch autopilot across multiple videos |
+
+
 
 ## Captioning, export, dataset, settings
 

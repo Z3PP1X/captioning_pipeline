@@ -9,7 +9,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Callable
 
 import cv2
 import numpy as np
@@ -35,6 +35,8 @@ from pipeline.openrouter import (
     looks_truncated,
     normalize_reasoning_effort,
 )
+from pipeline.autopilot import Autopilot, JobContext
+from pipeline.face import FaceEngine, person_embedding
 from pipeline.scoring import ScoringEngine
 from pipeline.select import select_diverse_top_k
 from pipeline.tagger import LocalTagger
@@ -77,6 +79,8 @@ class JobManager:
         self.tagger = LocalTagger(self.classifier, self.settings)
         self.scoring_engine = ScoringEngine(self.classifier)
         self.captioner = OpenRouterCaptioner(self.settings)
+        self.face_engine = FaceEngine(self.settings)
+        self.autopilot = Autopilot(self.db, self.settings, self)
         # Dedicated decode executor (1-2 workers) and caption executor (4 workers) (C3/H4)
         self.decode_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="decode_worker")
         self.caption_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="caption_worker")
@@ -264,7 +268,96 @@ class JobManager:
         self.decode_executor.submit(self._run_auto_process_job, job_id, video_id, video_name, target_frames)
         return job_id
 
-    def submit_extract_750_job(self, video_id: str) -> int:
+    def submit_auto_extract_job(self, video_id: str, target_person_id: int | None = None) -> int:
+        """Autonomously extracts candidates for a video with optional target person prioritization:
+        1. Sets target_person_id on video if provided.
+        2. Auto-chunks video if not already chunked.
+        3. Submits extract_750 job with YuNet/SFace face recognition & priority scoring.
+        """
+        if target_person_id is not None:
+            self.db.set_video_target_person(video_id, target_person_id)
+
+        chunks = self.db.all("SELECT id FROM chunks WHERE video_id=?", (video_id,))
+        if not chunks:
+            from pipeline.autochunk import AutoChunker
+            chunker = AutoChunker(self.db, self.settings)
+            chunker.generate_balanced_chunks(video_id, target_frames=300)
+
+        return self.submit_extract_750_job(video_id)
+
+    def submit_autopilot_job(self, job_type: str, video_id: str, runner: Callable[[JobContext], dict[str, Any]]) -> int:
+        """Queue a short job (planning, similarity pass) whose body `runner(ctx)` lives in the autopilot.
+
+        The video keeps its status; the autopilot state tracks the stage. `ctx.then(fn)` callbacks run after
+        the job row is finished, so they may queue the next job for the same video.
+        """
+        now = time.time()
+        vid = self.db.one("SELECT name FROM videos WHERE id=?", (video_id,))
+        video_name = vid["name"] if vid else "Video"
+
+        with self.db.write() as conn:
+            self._assert_no_active_job(video_id)
+            cursor = conn.execute(
+                "INSERT INTO jobs (type, video_id, chunk_id, status, progress, created_at) VALUES (?, ?, NULL, 'queued', 0.0, ?)",
+                (job_type, video_id, now),
+            )
+            job_id = cursor.lastrowid
+
+        self.broadcast_event("job_queued", {"job_id": job_id, "video_id": video_id, "video_name": video_name, "chunk_id": None})
+        self.decode_executor.submit(self._run_autopilot_job, job_id, video_id, video_name, runner)
+        return job_id
+
+    def _run_autopilot_job(
+        self,
+        job_id: int,
+        video_id: str,
+        video_name: str,
+        runner: Callable[[JobContext], dict[str, Any]],
+    ) -> None:
+        if not self._start_job(job_id, video_id, video_name):
+            self.autopilot.on_job_cancelled(video_id)
+            return
+
+        def progress(p: float, step: str) -> None:
+            p = round(min(1.0, max(0.0, p)), 2)
+            with self.db.write() as conn:
+                conn.execute("UPDATE jobs SET progress=? WHERE id=?", (p, job_id))
+            self.broadcast_event("job_progress", {
+                "job_id": job_id, "video_id": video_id, "video_name": video_name,
+                "chunk_id": None, "progress": p, "step": step,
+            })
+
+        ctx = JobContext(job_id, video_id, video_name, progress, lambda: self._check_cancel(job_id))
+        try:
+            result = runner(ctx)
+            with self.db.write() as conn:
+                conn.execute(
+                    "UPDATE jobs SET status='finished', error=NULL, progress=1.0, finished_at=? WHERE id=?",
+                    (time.time(), job_id),
+                )
+            self.broadcast_event("job_finished", {
+                "job_id": job_id, "video_id": video_id, "video_name": video_name, "chunk_id": None, **(result or {}),
+            })
+        except JobCancelled:
+            self._finish_cancelled(job_id, video_id, video_name)
+            self.autopilot.on_job_cancelled(video_id)
+            return
+        except Exception as ex:
+            with self.db.write() as conn:
+                conn.execute("UPDATE jobs SET status='error', error=?, finished_at=? WHERE id=?", (str(ex), time.time(), job_id))
+            self.broadcast_event("job_error", {"job_id": job_id, "video_id": video_id, "video_name": video_name, "error": str(ex)})
+            self.autopilot.on_job_failed(video_id, str(ex))
+            return
+        finally:
+            self._cancel_flags.discard(job_id)
+
+        for callback in ctx.after_finish:
+            try:
+                callback()
+            except Exception as ex:  # a failed follow-up must not turn the finished job into an error
+                self.autopilot.on_job_failed(video_id, str(ex))
+
+    def submit_extract_750_job(self, video_id: str, options: dict[str, Any] | None = None) -> int:
         now = time.time()
         vid = self.db.one("SELECT name FROM videos WHERE id=?", (video_id,))
         video_name = vid["name"] if vid else "Video"
@@ -287,10 +380,10 @@ class JobManager:
             "video_name": video_name,
             "chunk_id": None,
         })
-        self.decode_executor.submit(self._run_extract_750_job, job_id, video_id, video_name)
+        self.decode_executor.submit(self._run_extract_750_job, job_id, video_id, video_name, options or {})
         return job_id
 
-    def _run_extract_750_job(self, job_id: int, video_id: str, video_name: str) -> None:
+    def _run_extract_750_job(self, job_id: int, video_id: str, video_name: str, options: dict[str, Any] | None = None) -> None:
         if not self._start_job(job_id, video_id, video_name):
             return
 
@@ -306,15 +399,32 @@ class JobManager:
                 chunker = AutoChunker(self.db, self.settings)
                 chunks = chunker.generate_balanced_chunks(video_id, target_frames=300)
 
+            # Scenes the human skipped during review are not sampled at all
+            chunks = [c for c in chunks if (c.get("priority") or "normal") != "skip"]
+            if not chunks:
+                raise RuntimeError("Every scene is skipped - nothing to extract")
+
             total_chunks = len(chunks)
             user_settings = merged_user_settings(self.db.get_setting("user_settings", {}))
+            options = options or {}
             target_total = int(user_settings.get("target_candidates", 750))
-            target_curated = int(user_settings.get("target_curated", 300))
+            target_curated = int(options.get("target_curated") or user_settings.get("target_curated", 300))
+            if options.get("target_curated"):
+                target_total = max(target_total, round(target_curated * 2.5))
             category_quotas = user_settings.get("category_quotas")
             mmr_lambda = float(user_settings.get("mmr_lambda", 0.65))
 
             letterbox = video.get("letterbox")
             watermark_rect = video.get("watermark_rect")
+
+            target_person = None
+            target_person_emb = None
+            target_pid = video.get("target_person_id")
+            if target_pid:
+                target_person = self.db.get_person(target_pid)
+                target_person_emb = person_embedding(target_person)
+                if target_person_emb is None:
+                    target_person = None
 
             def update_job_progress(p: float, step: str):
                 with self.db.write() as conn:
@@ -328,7 +438,11 @@ class JobManager:
                     "step": step,
                 })
 
-            update_job_progress(0.05, f"Sampling candidate frames across {total_chunks} chunks...")
+            sample_desc = (
+                f"Sampling candidate frames with target person '{target_person['name']}' face recognition..."
+                if target_person else f"Sampling candidate frames across {total_chunks} chunks..."
+            )
+            update_job_progress(0.05, sample_desc)
 
             # 1. Sample candidate frames per chunk (streamed at 512px with pre-crop & gates)
             all_candidates: list[dict[str, Any]] = []
@@ -372,11 +486,28 @@ class JobManager:
                     if any(phash_hamming_distance(metrics["phash"], kept["metrics"]["phash"]) <= 4 for kept in chunk_cands):
                         continue
 
+                    # Face detection & target person matching via YuNet + SFace
+                    if target_person_emb is not None:
+                        match_res = self.face_engine.match_frame(img_cropped, target_person_emb)
+                        metrics["target_person_sim"] = match_res["max_sim"]
+                        metrics["target_person_matched"] = match_res["matched"]
+                        metrics["face_count"] = match_res["face_count"]
+                        metrics["faces"] = match_res["faces"]
+                    else:
+                        detected_faces = self.face_engine.detect_faces(img_cropped)
+                        metrics["target_person_sim"] = 0.0
+                        metrics["target_person_matched"] = False
+                        metrics["face_count"] = len(detected_faces)
+                        metrics["faces"] = [{"box": f["box"], "score": f["score"]} for f in detected_faces]
+
                     cand_dict = {
                         "chunk_id": ch["id"],
                         "t": t_val,
                         "img_bgr": img_cropped,
                         "metrics": metrics,
+                        "target_person_sim": metrics["target_person_sim"],
+                        "target_person_matched": metrics["target_person_matched"],
+                        "face_count": metrics["face_count"],
                     }
                     seen_cand_ts.add(t_val)
                     chunk_cands.append(cand_dict)
@@ -395,8 +526,14 @@ class JobManager:
             embeddings = self.classifier.embed_images(images_to_embed, batch_size=32)
 
             self._check_cancel(job_id)
-            update_job_progress(0.68, "Evaluating 7-dimension scoring criteria...")
-            self.scoring_engine.score_candidates_batch(all_candidates, embeddings)
+            step_desc = (
+                f"Evaluating scoring with target person '{target_person['name']}' priority..."
+                if target_person else "Evaluating 7-dimension scoring criteria..."
+            )
+            update_job_progress(0.68, step_desc)
+            self.scoring_engine.score_candidates_batch(
+                all_candidates, embeddings, target_person_embedding=target_person_emb
+            )
 
             # 3. Multi-objective reduction
             update_job_progress(0.78, f"Optimizing best {target_curated} frame subset...")
@@ -523,8 +660,12 @@ class JobManager:
             import gc
             gc.collect()
 
+            # An autopilot run continues with the similarity pass (no-op for manual extractions)
+            self.autopilot.on_extract_finished(video_id)
+
         except JobCancelled:
             self._finish_cancelled(job_id, video_id, video_name)
+            self.autopilot.on_job_cancelled(video_id)
         except Exception as ex:
             with self.db.write() as conn:
                 conn.execute("UPDATE jobs SET status='error', error=?, finished_at=? WHERE id=?", (str(ex), time.time(), job_id))
@@ -536,6 +677,7 @@ class JobManager:
                 "video_name": video_name,
                 "error": str(ex),
             })
+            self.autopilot.on_job_failed(video_id, str(ex))
         finally:
             self._cancel_flags.discard(job_id)
 
@@ -1106,9 +1248,23 @@ class JobManager:
         embeddings = self.classifier.embed_images(survivor_images)
         zs_scores = self.classifier.classify_and_score(embeddings, prompts)
 
+        target_pid = video.get("target_person_id")
+        target_person_emb = None
+        if target_pid:
+            target_person_emb = person_embedding(self.db.get_person(target_pid))
+
         for i, s in enumerate(survivors):
             s["embedding"] = embeddings[i]
             s["zs_scores"] = zs_scores[i]
+            if target_person_emb is not None:
+                try:
+                    face_res = self.face_engine.match_frame(s["img_bgr"], target_person_emb)
+                    s["zs_scores"]["target_person_sim"] = face_res["target_person_sim"]
+                    s["zs_scores"]["target_person_matched"] = face_res["matched"]
+                    s["zs_scores"]["face_count"] = face_res["face_count"]
+                    s["zs_scores"]["faces"] = face_res["faces"]
+                except Exception:
+                    pass
 
         # Step 5: MMR Diverse Top-K Selection
         if on_progress:

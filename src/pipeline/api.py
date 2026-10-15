@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -18,11 +19,13 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from pipeline.autochunk import AutoChunker, DestructiveRechunkError
+from pipeline.autochunk import PRIORITIES, AutoChunker, DestructiveRechunkError
+from pipeline.autopilot import AutopilotConfig
 from pipeline.config import DEFAULT_USER_SETTINGS, Settings, VIDEO_STATUSES, get_settings, merged_user_settings
 from pipeline.db import DB
-from pipeline.decode import ensure_native_frame
+from pipeline.decode import ensure_native_frame, sample_frames_at
 from pipeline.export import Exporter
+from pipeline.face import person_embedding
 from pipeline.indexer import Indexer
 from pipeline.jobs import JobConflictError, JobManager
 from pipeline.openrouter import DEFAULT_CAPTION_MAX_TOKENS
@@ -62,6 +65,8 @@ async def lifespan(app: FastAPI):
             "UPDATE jobs SET status='error', error='Server restarted while job was running', finished_at=? WHERE status IN ('running', 'queued')",
             (time.time(),),
         )
+    # An autopilot run whose job died with the server must not stay "running"
+    jobs.autopilot.heal_stale()
     # Sync disk captions and auto-heal stuck statuses
     reconcile_captions_and_state(db, settings)
     indexer.scan_and_sync()
@@ -104,6 +109,10 @@ class ChunkItem(BaseModel):
     rule: str = "person"
     tags: list[str] = Field(default_factory=list)
     notes: str = ""
+    # Autopilot review: how much of the frame budget the scene deserves, and how much the target person shows
+    priority: str = "normal"
+    person_presence: float | None = None
+    face_presence: float | None = None
 
 
 class ChunkPatch(BaseModel):
@@ -172,6 +181,59 @@ class SwapFrameRequest(BaseModel):
         raise ValueError("Must provide either drop_frame_id or deselected_frame_id")
 
 
+class PersonCreate(BaseModel):
+    name: str
+
+
+class PersonPatch(BaseModel):
+    name: str | None = None
+
+
+class VideoTargetPersonRequest(BaseModel):
+    person_id: int | None = None
+
+
+class TagFaceRequest(BaseModel):
+    frame_id: int
+    person_name: str | None = None
+    person_id: int | None = None
+    face_index: int = 0
+
+
+class AutoExtractRequest(BaseModel):
+    target_person_id: int | None = None
+
+
+class AutopilotApproveRequest(BaseModel):
+    # chunk id -> skip | low | normal | high; applied before extraction (budgets are re-derived from them)
+    priorities: dict[int, str] | None = None
+
+
+class AutopilotPrioritiesRequest(BaseModel):
+    priorities: dict[int, str]
+
+
+class AutopilotRefineRequest(BaseModel):
+    dup_similarity: float | None = Field(default=None, ge=0.5, le=1.0)
+    person_focus: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class AutopilotBatchRequest(BaseModel):
+    video_ids: list[str]
+    config: AutopilotConfig = Field(default_factory=AutopilotConfig)
+    # video id -> config fields that replace the shared ones for that video (typically exclude_ranges)
+    per_video: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
+class PersonEnrollRequest(BaseModel):
+    name: str
+    video_id: str
+    time_s: float | None = None
+    times: list[float] | None = None
+    person_id: int | None = None
+    face_index: int = 0  # 0 = the most prominent face in the frame
+
+
 # ----------------------------------------------------------------------------- Videos
 @app.get("/api/videos")
 def list_videos(status: str | None = None, search: str | None = None):
@@ -202,6 +264,11 @@ def list_videos(status: str | None = None, search: str | None = None):
 
     query += " ORDER BY v.name ASC"
     videos = db.all(query, tuple(params))
+    for v in videos:
+        # The full run (report, swap list) is fetched per video; the list only needs the stage
+        ap = v.get("autopilot") if isinstance(v.get("autopilot"), dict) else None
+        v["autopilot_stage"] = ap.get("stage") if ap else None
+        v["autopilot"] = {"stage": ap["stage"], "message": ap.get("message", "")} if ap else None
     return {"videos": videos, "total": len(videos)}
 
 
@@ -303,6 +370,395 @@ def get_filmstrip_thumb(video_id: str, filename: str):
     return FileResponse(p, media_type="image/webp")
 
 
+# ----------------------------------------------------------------------------- Persons & Face Recognition
+def _enrich_person_dict(p: dict[str, Any]) -> dict[str, Any]:
+    p["face_crop_url"] = f"/api/persons/{p['id']}/crop" if p.get("face_crop_path") else None
+    p["has_embedding"] = bool(p.get("embedding"))
+    p.pop("embedding", None)
+    return p
+
+
+@app.get("/api/persons")
+def list_persons_endpoint():
+    rows = db.list_persons()
+    for p in rows:
+        _enrich_person_dict(p)
+    return {"persons": rows, "total": len(rows)}
+
+
+@app.post("/api/persons")
+def create_person_endpoint(req: PersonCreate):
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name cannot be empty")
+    # Initial empty person with zero embedding
+    person = db.create_or_update_person(name, embedding=np.zeros(128, dtype=np.float32))
+    return {"person": _enrich_person_dict(person)}
+
+
+@app.get("/api/persons/{person_id}")
+def get_person_endpoint(person_id: int):
+    p = db.get_person(person_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Person not found")
+    return {"person": _enrich_person_dict(p)}
+
+
+@app.patch("/api/persons/{person_id}")
+def patch_person_endpoint(person_id: int, req: PersonPatch):
+    p = db.get_person(person_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Person not found")
+    if req.name is not None and req.name.strip():
+        with db.write() as conn:
+            conn.execute("UPDATE persons SET name=?, updated_at=? WHERE id=?", (req.name.strip(), time.time(), person_id))
+            conn.execute("UPDATE videos SET target_person_name=? WHERE target_person_id=?", (req.name.strip(), person_id))
+    return {"person": _enrich_person_dict(db.get_person(person_id))}
+
+
+@app.delete("/api/persons/{person_id}")
+def delete_person_endpoint(person_id: int):
+    ok = db.delete_person(person_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Person not found")
+    return {"status": "ok", "deleted": True}
+
+
+@app.get("/api/persons/{person_id}/crop")
+def get_person_crop_endpoint(person_id: int):
+    p = db.get_person(person_id)
+    if not p or not p.get("face_crop_path") or not Path(p["face_crop_path"]).is_file():
+        raise HTTPException(status_code=404, detail="Face crop not found")
+    return FileResponse(Path(p["face_crop_path"]), media_type="image/jpeg")
+
+
+@app.post("/api/videos/{video_id}/target-person")
+def set_video_target_person_endpoint(video_id: str, req: VideoTargetPersonRequest):
+    vid = db.one("SELECT id FROM videos WHERE id=?", (video_id,))
+    if not vid:
+        raise HTTPException(status_code=404, detail="Video not found")
+    updated = db.set_video_target_person(video_id, req.person_id)
+    return {"video": updated}
+
+
+@app.post("/api/videos/{video_id}/tag-face-from-frame")
+def tag_face_from_frame_endpoint(video_id: str, req: TagFaceRequest):
+    vid = db.one("SELECT id, name FROM videos WHERE id=?", (video_id,))
+    if not vid:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    frame = db.one("SELECT * FROM frames WHERE id=? AND video_id=?", (req.frame_id, video_id))
+    if not frame:
+        raise HTTPException(status_code=404, detail="Frame not found for this video")
+
+    # Load image (try native full resolution first, fallback to preview)
+    img_path = Path(frame.get("full_path") or frame.get("preview_path") or "")
+    if not img_path.is_file():
+        raise HTTPException(status_code=400, detail="Frame image file not found on disk")
+
+    img_bgr = cv2.imread(str(img_path))
+    if img_bgr is None:
+        raise HTTPException(status_code=400, detail="Could not read frame image")
+
+    # Detect faces
+    faces = jobs.face_engine.detect_faces(img_bgr)
+    if not faces:
+        raise HTTPException(status_code=400, detail="No faces detected in this frame to tag")
+
+    idx = req.face_index if 0 <= req.face_index < len(faces) else 0
+    face = faces[idx]
+
+    # Extract 128-dim normalized embedding and face crop
+    emb = jobs.face_engine.extract_feature(img_bgr, face)
+    crop = jobs.face_engine.crop_face(img_bgr, face)
+
+    person_name = (req.person_name or "Person").strip()
+    crop_dir = settings.cache_dir / "persons"
+    crop_dir.mkdir(parents=True, exist_ok=True)
+    temp_crop_name = f"face_{int(time.time()*1000)}.jpg"
+    temp_crop_path = crop_dir / temp_crop_name
+    cv2.imwrite(str(temp_crop_path), crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+    person = db.create_or_update_person(
+        name=person_name,
+        embedding=emb,
+        face_crop_path=str(temp_crop_path),
+        person_id=req.person_id,
+    )
+
+    final_crop_path = crop_dir / f"person_{person['id']}.jpg"
+    if temp_crop_path.is_file():
+        temp_crop_path.replace(final_crop_path)
+        with db.write() as conn:
+            conn.execute("UPDATE persons SET face_crop_path=? WHERE id=?", (str(final_crop_path), person["id"]))
+        person["face_crop_path"] = str(final_crop_path)
+
+    # Link video to this target person
+    db.set_video_target_person(video_id, person["id"])
+
+    # Re-match all candidate frames for this video with the person embedding
+    target_emb = emb
+    all_frames = db.all("SELECT id, preview_path, full_path, zs_scores FROM frames WHERE video_id=?", (video_id,))
+    updated_count = 0
+
+    with db.write() as conn:
+        for f in all_frames:
+            fpath = f.get("preview_path") or f.get("full_path")
+            if not fpath or not Path(fpath).is_file():
+                continue
+            f_img = cv2.imread(fpath)
+            if f_img is None:
+                continue
+            face_res = jobs.face_engine.match_frame(f_img, target_emb)
+            zs = json.loads(f["zs_scores"]) if f.get("zs_scores") and isinstance(f["zs_scores"], str) else (f.get("zs_scores") or {})
+            zs["target_person_sim"] = face_res["target_person_sim"]
+            zs["target_person_matched"] = face_res["matched"]
+            zs["face_count"] = face_res["face_count"]
+            zs["faces"] = face_res["faces"]
+            conn.execute("UPDATE frames SET zs_scores=? WHERE id=?", (json.dumps(zs), f["id"]))
+            updated_count += 1
+
+    jobs.broadcast_event("candidates_updated", {
+        "video_id": video_id,
+        "person_id": person["id"],
+        "person_name": person["name"],
+        "exemplar_count": person["exemplar_count"],
+        "updated_frames": updated_count,
+    })
+
+    return {
+        "status": "ok",
+        "person": _enrich_person_dict(person),
+        "updated_frames": updated_count,
+    }
+
+
+@app.get("/api/frames/{frame_id}/faces")
+def get_frame_faces_endpoint(frame_id: int):
+    frame = db.one("SELECT id, video_id, preview_path, full_path, zs_scores FROM frames WHERE id=?", (frame_id,))
+    if not frame:
+        raise HTTPException(status_code=404, detail="Frame not found")
+
+    target_emb = None
+    vid = db.one("SELECT target_person_id FROM videos WHERE id=?", (frame["video_id"],))
+    if vid and vid.get("target_person_id"):
+        target_emb = person_embedding(db.get_person(vid["target_person_id"]))
+
+    img_path = Path(frame.get("full_path") or frame.get("preview_path") or "")
+    if not img_path.is_file():
+        raise HTTPException(status_code=404, detail="Image file not found")
+
+    img_bgr = cv2.imread(str(img_path))
+    if img_bgr is None:
+        raise HTTPException(status_code=400, detail="Could not read frame image")
+
+    match_res = jobs.face_engine.match_frame(img_bgr, target_emb)
+    return {
+        "frame_id": frame_id,
+        "face_count": match_res["face_count"],
+        "target_person_sim": match_res["target_person_sim"],
+        "matched": match_res["matched"],
+        "faces": match_res["faces"],
+    }
+
+
+@app.post("/api/videos/{video_id}/auto-extract")
+def auto_extract_endpoint(video_id: str, req: AutoExtractRequest = None):
+    vid = db.one("SELECT id FROM videos WHERE id=?", (video_id,))
+    if not vid:
+        raise HTTPException(status_code=404, detail="Video not found")
+    pid = req.target_person_id if req else None
+    job_id = jobs.submit_auto_extract_job(video_id, target_person_id=pid)
+    return {"job_id": job_id, "status": "queued"}
+
+
+# ----------------------------------------------------------------------------- Person enrollment from the video
+def _decode_frame_at(video_id: str, t: float, max_dim: int) -> np.ndarray:
+    vid = db.one("SELECT path, letterbox, watermark_rect FROM videos WHERE id=?", (video_id,))
+    if not vid:
+        raise HTTPException(status_code=404, detail="Video not found")
+    frames = sample_frames_at(Path(vid["path"]), [max(0.0, t)], max_dim=max_dim)
+    if not frames:
+        raise HTTPException(status_code=400, detail=f"Could not decode a frame at {t:.2f}s")
+    return frames[0][1]
+
+
+def _sorted_faces(img_bgr: np.ndarray) -> list[dict[str, Any]]:
+    faces = jobs.face_engine.detect_faces(img_bgr)
+    faces.sort(key=lambda f: f["box"][2] * f["box"][3] * f["score"], reverse=True)
+    return faces
+
+
+@app.get("/api/videos/{video_id}/frame-at")
+def get_video_frame_at(video_id: str, t: float = 0.0, max_dim: int = 960):
+    """JPEG of the video at `t` seconds (to pick a face from when enrolling the person to prioritize)."""
+    img = _decode_frame_at(video_id, t, max(64, min(max_dim, 2160)))
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 88])
+    if not ok:
+        raise HTTPException(status_code=500, detail="Could not encode frame")
+    return Response(content=buf.tobytes(), media_type="image/jpeg")
+
+
+@app.get("/api/videos/{video_id}/faces-at")
+def get_video_faces_at(video_id: str, t: float = 0.0, max_dim: int = 960):
+    """Faces at `t`, most prominent first; boxes are in the coordinates of `frame-at` with the same max_dim."""
+    img = _decode_frame_at(video_id, t, max(64, min(max_dim, 2160)))
+    faces = _sorted_faces(img)
+    h, w = img.shape[:2]
+    return {
+        "video_id": video_id,
+        "time_s": t,
+        "width": w,
+        "height": h,
+        "faces": [{"index": i, "box": f["box"], "score": f["score"]} for i, f in enumerate(faces)],
+    }
+
+
+@app.post("/api/persons/enroll")
+def enroll_person_from_video(req: PersonEnrollRequest):
+    """Create (or add exemplars to) a person from the face at one or more timestamps of a video."""
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name cannot be empty")
+    stamps = list(req.times or [])
+    if req.time_s is not None:
+        stamps.insert(0, req.time_s)
+    if not stamps:
+        raise HTTPException(status_code=400, detail="Provide time_s or times")
+
+    crop_dir = settings.cache_dir / "persons"
+    crop_dir.mkdir(parents=True, exist_ok=True)
+    person: dict[str, Any] | None = None
+    enrolled = 0
+    for t in stamps:
+        img = _decode_frame_at(req.video_id, t, 0)  # native resolution: best identity embedding
+        faces = _sorted_faces(img)
+        if not faces:
+            raise HTTPException(status_code=400, detail=f"No face found at {t:.2f}s")
+        face = faces[req.face_index if 0 <= req.face_index < len(faces) else 0]
+        emb = jobs.face_engine.extract_feature(img, face)
+        crop_path = crop_dir / f"enroll_{int(time.time() * 1000)}_{enrolled}.jpg"
+        cv2.imwrite(str(crop_path), jobs.face_engine.crop_face(img, face), [cv2.IMWRITE_JPEG_QUALITY, 95])
+        person = db.create_or_update_person(
+            name, embedding=emb, face_crop_path=str(crop_path),
+            person_id=req.person_id if req.person_id is not None else (person["id"] if person else None),
+        )
+        enrolled += 1
+
+    assert person is not None
+    final_crop = crop_dir / f"person_{person['id']}.jpg"
+    Path(person["face_crop_path"]).replace(final_crop)
+    with db.write() as conn:
+        conn.execute("UPDATE persons SET face_crop_path=? WHERE id=?", (str(final_crop), person["id"]))
+    person["face_crop_path"] = str(final_crop)
+    return {"person": _enrich_person_dict(person), "enrolled": enrolled}
+
+
+# ----------------------------------------------------------------------------- Autopilot
+def _autopilot_payload(video_id: str) -> dict[str, Any]:
+    state = jobs.autopilot.get_state(video_id)
+    video = db.one("SELECT target_person_id, target_person_name FROM videos WHERE id=?", (video_id,)) or {}
+    person = db.get_person(video["target_person_id"]) if video.get("target_person_id") else None
+    return {
+        **state,
+        "video_id": video_id,
+        "target_person": (
+            {"id": person["id"], "name": person["name"], "face_crop_url": f"/api/persons/{person['id']}/crop" if person.get("face_crop_path") else None}
+            if person else None
+        ),
+        "chunks": get_video_scenes_caption_stats(db, video_id),
+        "priorities": list(PRIORITIES),
+    }
+
+
+def _autopilot_errors(fn):
+    """Translate autopilot domain errors to HTTP responses."""
+    from functools import wraps
+
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except DestructiveRechunkError as e:
+            raise _rechunk_conflict(e) from e
+        except LookupError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+    return wrapper
+
+
+@app.get("/api/videos/{video_id}/autopilot")
+def get_autopilot(video_id: str):
+    if not db.one("SELECT id FROM videos WHERE id=?", (video_id,)):
+        raise HTTPException(status_code=404, detail="Video not found")
+    return _autopilot_payload(video_id)
+
+
+@app.post("/api/videos/{video_id}/autopilot/start")
+@_autopilot_errors
+def start_autopilot(video_id: str, config: AutopilotConfig = None):
+    jobs.autopilot.start(video_id, config or AutopilotConfig())
+    return _autopilot_payload(video_id)
+
+
+@app.post("/api/videos/{video_id}/autopilot/priorities")
+@_autopilot_errors
+def set_autopilot_priorities(video_id: str, req: AutopilotPrioritiesRequest):
+    """Human review: set scene priorities; the response carries the re-derived budgets."""
+    if not db.one("SELECT id FROM videos WHERE id=?", (video_id,)):
+        raise HTTPException(status_code=404, detail="Video not found")
+    if jobs.autopilot.get_state(video_id)["stage"] in ("planning", "extracting", "refining"):
+        raise HTTPException(status_code=409, detail="Autopilot is running; wait for it to finish or cancel the job")
+    autochunker.apply_priorities(video_id, req.priorities)
+    return _autopilot_payload(video_id)
+
+
+@app.post("/api/videos/{video_id}/autopilot/approve")
+@_autopilot_errors
+def approve_autopilot(video_id: str, req: AutopilotApproveRequest = None):
+    jobs.autopilot.approve(video_id, req.priorities if req else None)
+    return _autopilot_payload(video_id)
+
+
+@app.post("/api/videos/{video_id}/autopilot/refine")
+@_autopilot_errors
+def refine_autopilot(video_id: str, req: AutopilotRefineRequest = None):
+    """Re-evaluate similarity of the current picks (also for videos curated by hand)."""
+    if not db.one("SELECT id FROM videos WHERE id=?", (video_id,)):
+        raise HTTPException(status_code=404, detail="Video not found")
+    jobs.autopilot.refine(video_id, req.model_dump() if req else None)
+    return _autopilot_payload(video_id)
+
+
+@app.post("/api/videos/{video_id}/autopilot/reset")
+def reset_autopilot(video_id: str):
+    if not db.one("SELECT id FROM videos WHERE id=?", (video_id,)):
+        raise HTTPException(status_code=404, detail="Video not found")
+    if jobs.autopilot.get_state(video_id)["stage"] in ("planning", "extracting", "refining"):
+        raise HTTPException(status_code=409, detail="Autopilot is running; cancel its job first")
+    jobs.autopilot.reset(video_id)
+    return _autopilot_payload(video_id)
+
+
+@app.post("/api/autopilot/batch")
+def start_autopilot_batch(req: AutopilotBatchRequest):
+    """Start the same configuration on many videos; exclusions usually differ, so `per_video` overrides them."""
+    results = []
+    for vid in req.video_ids:
+        entry: dict[str, Any] = {"video_id": vid, "ok": True}
+        try:
+            cfg = AutopilotConfig(**{**req.config.model_dump(), **req.per_video.get(vid, {})})
+            jobs.autopilot.start(vid, cfg)
+        except DestructiveRechunkError as e:
+            entry.update(ok=False, requires_confirm=True, error=str(e))
+        except Exception as e:
+            entry.update(ok=False, error=str(e))
+        results.append(entry)
+    return {"results": results, "started": sum(1 for r in results if r["ok"])}
+
+
 # ----------------------------------------------------------------------------- Chunks
 @app.get("/api/videos/{video_id}/chunks")
 def get_chunks(video_id: str):
@@ -324,7 +780,7 @@ def save_chunks(video_id: str, update: ChunksUpdate):
     try:
         saved = autochunker.save_user_chunks(
             video_id,
-            [c.model_dump() for c in update.chunks],
+            [c.model_dump(exclude_unset=True) for c in update.chunks],
             confirm_destructive=update.confirm_destructive,
         )
         return {
@@ -398,6 +854,10 @@ def trigger_extract_750(video_id: str):
     vid = db.one("SELECT id FROM videos WHERE id=?", (video_id,))
     if not vid:
         raise HTTPException(status_code=404, detail="Video not found")
+    # While the human is reviewing an autopilot plan, extracting means approving it (so it continues to refine)
+    if jobs.autopilot.get_state(video_id)["stage"] == "awaiting_review":
+        state = jobs.autopilot.approve(video_id)
+        return {"job_id": state["job_id"], "status": "queued", "autopilot": state["stage"]}
     job_id = jobs.submit_extract_750_job(video_id)
     return {"job_id": job_id, "status": "queued"}
 
@@ -414,6 +874,20 @@ def _enrich_frame_dict(f: dict[str, Any], exported_ids: set[int] | None = None) 
     f["chunk_start"] = f.get("chunk_start", 0.0)
     f["chunk_end"] = f.get("chunk_end", 0.0)
     f["native"] = f.get("native", 0)
+
+    # Face & Person target metadata
+    zs = f.get("zs_scores")
+    if isinstance(zs, str):
+        try:
+            zs = json.loads(zs)
+        except Exception:
+            zs = {}
+    elif not isinstance(zs, dict):
+        zs = {}
+    f["target_person_sim"] = round(float(zs.get("target_person_sim", 0.0)), 3)
+    f["target_person_matched"] = bool(zs.get("target_person_matched", False))
+    f["face_count"] = int(zs.get("face_count", 0))
+    f["faces"] = zs.get("faces", [])
     return f
 
 

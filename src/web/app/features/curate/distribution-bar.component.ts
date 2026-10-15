@@ -4,6 +4,7 @@ import { lucideUsers, lucideUser, lucideWrench, lucideEye, lucideAlertTriangle }
 import { HlmProgressImports } from '@spartan-ng/helm/progress';
 import { HlmBadgeImports } from '@spartan-ng/helm/badge';
 import { CurateService } from '../../core/services/curate.service';
+import { VideoService } from '../../core/services/video.service';
 
 @Component({
   selector: 'app-distribution-bar',
@@ -87,7 +88,24 @@ import { CurateService } from '../../core/services/curate.service';
         <span class="text-xs text-muted-foreground">(Prioritized)</span>
       </div>
 
-      <!-- Stat 5: Curated Set Total Count -->
+      <!-- Stat 5: Target Person -->
+      @if (videoService.currentVideo()?.target_person_name; as tName) {
+        <div class="flex flex-col gap-1.5 p-2 rounded-lg bg-background border border-primary/40">
+          <div class="flex items-center justify-between text-xs">
+            <span class="font-medium text-foreground flex items-center gap-1.5 truncate" [title]="tName">
+              <span>🎯</span>
+              <span class="truncate">{{ tName }}</span>
+            </span>
+            <span class="font-bold text-primary tabular-nums">{{ dist()?.target_person_pct ?? dist()?.target_person?.pct ?? 0 }}%</span>
+          </div>
+          <hlm-progress [value]="dist()?.target_person_pct ?? dist()?.target_person?.pct ?? 0" class="h-1.5">
+            <hlm-progress-indicator class="bg-primary" />
+          </hlm-progress>
+          <span class="text-xs text-muted-foreground">(Prioritized)</span>
+        </div>
+      }
+
+      <!-- Stat 6: Curated Set Total Count -->
       <div class="col-span-2 sm:col-span-1 flex flex-col justify-center items-center p-2 rounded-lg bg-primary/10 border border-primary/20 text-center">
         <span class="text-xs font-semibold text-foreground uppercase tracking-wide">Curated Set</span>
         <div class="flex items-baseline gap-1">
@@ -107,6 +125,7 @@ import { CurateService } from '../../core/services/curate.service';
 })
 export class DistributionBarComponent {
   private readonly curateService = inject(CurateService);
+  readonly videoService = inject(VideoService);
   readonly dist = this.curateService.distribution;
 
   readonly multipleHealth = computed(() => {

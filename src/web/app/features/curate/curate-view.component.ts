@@ -20,17 +20,23 @@ import { CandidateGridComponent } from './candidate-grid.component';
       <app-distribution-bar class="shrink-0" />
 
       <!-- Curation Filters & Action Toolbar -->
-      <app-curate-toolbar class="shrink-0" (openVlmModal)="openVlmModal.emit()" />
+      <app-curate-toolbar
+        class="shrink-0"
+        (openVlmModal)="openVlmModal.emit()"
+        (openPersonModal)="openPersonModal.emit({})"
+      />
 
       <!-- Scrollable Candidate Frames Grid containered by Chunks -->
       <app-candidate-grid
         class="flex-1 min-h-0 flex flex-col overflow-hidden w-full"
         (seekChunk)="seekChunk.emit($event)"
+        (tagPerson)="openPersonModal.emit({ frameId: $event })"
       />
     </div>
   `,
 })
 export class CurateViewComponent {
   readonly openVlmModal = output<void>();
+  readonly openPersonModal = output<{ frameId?: number }>();
   readonly seekChunk = output<number>();
 }

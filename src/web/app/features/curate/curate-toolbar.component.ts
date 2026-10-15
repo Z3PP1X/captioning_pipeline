@@ -1,6 +1,6 @@
 import { ChangeDetectionStrategy, Component, inject, output, signal } from '@angular/core';
 import { NgIcon, provideIcons } from '@ng-icons/core';
-import { lucideZap, lucideCheck, lucideX, lucideEye, lucideRefreshCw, lucideAlertTriangle } from '@ng-icons/lucide';
+import { lucideZap, lucideCheck, lucideX, lucideEye, lucideRefreshCw, lucideAlertTriangle, lucideTarget } from '@ng-icons/lucide';
 import { HlmButtonImports } from '@spartan-ng/helm/button';
 import { CurateService } from '../../core/services/curate.service';
 import { VideoService } from '../../core/services/video.service';
@@ -9,7 +9,7 @@ import { ChunkService } from '../../core/services/chunk.service';
 @Component({
   selector: 'app-curate-toolbar',
   imports: [NgIcon, HlmButtonImports],
-  providers: [provideIcons({ lucideZap, lucideCheck, lucideX, lucideEye, lucideRefreshCw, lucideAlertTriangle })],
+  providers: [provideIcons({ lucideZap, lucideCheck, lucideX, lucideEye, lucideRefreshCw, lucideAlertTriangle, lucideTarget })],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div class="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-card p-3 shadow-xs select-none">
@@ -59,6 +59,33 @@ import { ChunkService } from '../../core/services/chunk.service';
           <option value="reject">Rejected</option>
           <option value="star">Starred</option>
         </select>
+
+        <!-- Target Person Filter -->
+        @if (videoService.currentVideo()?.target_person_name; as tName) {
+          <button
+            hlmBtn
+            [variant]="curateService.targetPersonOnly() ? 'default' : 'outline'"
+            size="xs"
+            (click)="curateService.targetPersonOnly.set(!curateService.targetPersonOnly())"
+            [title]="'Filter frames matching target person: ' + tName"
+            class="h-8 cursor-pointer gap-1"
+          >
+            <span>🎯 {{ tName }}</span>
+          </button>
+        }
+
+        <!-- Manage Target Person -->
+        <button
+          hlmBtn
+          variant="outline"
+          size="xs"
+          (click)="openPersonModal.emit()"
+          [title]="videoService.currentVideo()?.target_person_name ? 'Change target person' : 'Assign target person'"
+          class="h-8 cursor-pointer gap-1"
+        >
+          <ng-icon name="lucideTarget" class="size-3.5" />
+          <span>{{ videoService.currentVideo()?.target_person_name ? 'Person' : 'Target Person' }}</span>
+        </button>
 
         <!-- Toggle Candidate Pool -->
         <button
@@ -190,6 +217,7 @@ export class CurateToolbarComponent {
   readonly chunkService = inject(ChunkService);
 
   readonly openVlmModal = output<void>();
+  readonly openPersonModal = output<void>();
   readonly confirmAction = signal<'keep_all' | 'reject_all' | null>(null);
 
   toggleCandidatePool(): void {

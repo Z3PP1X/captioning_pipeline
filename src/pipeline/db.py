@@ -21,6 +21,9 @@ CREATE TABLE IF NOT EXISTS videos (
     watermark_rect TEXT, letterbox TEXT,
     filmstrip_ready INTEGER NOT NULL DEFAULT 0,
     missing INTEGER NOT NULL DEFAULT 0,
+    target_person_id INTEGER REFERENCES persons(id) ON DELETE SET NULL,
+    target_person_name TEXT,
+    autopilot TEXT,
     updated_at REAL
 );
 CREATE TABLE IF NOT EXISTS chunks (
@@ -34,7 +37,10 @@ CREATE TABLE IF NOT EXISTS chunks (
     rule TEXT NOT NULL DEFAULT 'person',
     tags TEXT NOT NULL DEFAULT '[]',
     notes TEXT NOT NULL DEFAULT '',
-    dirty INTEGER NOT NULL DEFAULT 1
+    dirty INTEGER NOT NULL DEFAULT 1,
+    priority TEXT NOT NULL DEFAULT 'normal',
+    person_presence REAL,
+    face_presence REAL
 );
 CREATE INDEX IF NOT EXISTS ix_chunks_video ON chunks(video_id);
 CREATE TABLE IF NOT EXISTS frames (
@@ -66,9 +72,19 @@ CREATE TABLE IF NOT EXISTS exports (
     per_video_path TEXT, merged_path TEXT, hash TEXT, exported_at REAL
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS persons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL,
+    slug TEXT UNIQUE NOT NULL,
+    exemplar_count INTEGER NOT NULL DEFAULT 1,
+    embedding BLOB NOT NULL,
+    face_crop_path TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
-JSON_COLS = {"watermark_rect", "letterbox", "tags", "metrics", "zs_scores", "crop"}
+JSON_COLS = {"watermark_rect", "letterbox", "tags", "metrics", "zs_scores", "crop", "autopilot"}
 
 
 class DB:
@@ -79,15 +95,28 @@ class DB:
         with self.conn() as c:
             c.execute("PRAGMA journal_mode=WAL")
             c.executescript(SCHEMA)
-            # Safe migrations: ensure required columns exist in chunks and frames
+            # Safe migrations: ensure required columns exist in chunks, frames, and videos
             cols = [r["name"] for r in c.execute("PRAGMA table_info(chunks)").fetchall()]
             if "budget_pct" not in cols:
                 c.execute("ALTER TABLE chunks ADD COLUMN budget_pct REAL NOT NULL DEFAULT 0.0")
             if "caption_model" not in cols:
                 c.execute("ALTER TABLE chunks ADD COLUMN caption_model TEXT NOT NULL DEFAULT 'google/gemma-4-31b-it'")
+            if "priority" not in cols:
+                c.execute("ALTER TABLE chunks ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'")
+            if "person_presence" not in cols:
+                c.execute("ALTER TABLE chunks ADD COLUMN person_presence REAL")
+            if "face_presence" not in cols:
+                c.execute("ALTER TABLE chunks ADD COLUMN face_presence REAL")
             frame_cols = [r["name"] for r in c.execute("PRAGMA table_info(frames)").fetchall()]
             if "native" not in frame_cols:
                 c.execute("ALTER TABLE frames ADD COLUMN native INTEGER NOT NULL DEFAULT 0")
+            video_cols = [r["name"] for r in c.execute("PRAGMA table_info(videos)").fetchall()]
+            if "target_person_id" not in video_cols:
+                c.execute("ALTER TABLE videos ADD COLUMN target_person_id INTEGER REFERENCES persons(id) ON DELETE SET NULL")
+            if "target_person_name" not in video_cols:
+                c.execute("ALTER TABLE videos ADD COLUMN target_person_name TEXT")
+            if "autopilot" not in video_cols:
+                c.execute("ALTER TABLE videos ADD COLUMN autopilot TEXT")
 
     @contextmanager
     def conn(self) -> Iterator[sqlite3.Connection]:
@@ -134,3 +163,105 @@ class DB:
         with self.write() as c:
             c.execute("INSERT INTO settings(key,value) VALUES(?,?) "
                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, json.dumps(value)))
+
+    def create_or_update_person(
+        self,
+        name: str,
+        embedding: Any,
+        face_crop_path: str | None = None,
+        person_id: int | None = None,
+    ) -> dict:
+        import re
+        import time
+        import numpy as np
+
+        clean_name = name.strip()
+        slug = re.sub(r"[^\w\s-]", "", clean_name).strip().lower()
+        slug = re.sub(r"[-\s]+", "_", slug)[:64] or "person"
+        now = time.time()
+
+        if isinstance(embedding, np.ndarray):
+            emb_blob = embedding.astype(np.float32).tobytes()
+        else:
+            emb_blob = bytes(embedding)
+
+        existing = None
+        if person_id is not None:
+            existing = self.one("SELECT * FROM persons WHERE id=?", (person_id,))
+        if not existing:
+            existing = self.one("SELECT * FROM persons WHERE slug=? OR name=?", (slug, clean_name))
+        with self.write() as c:
+            if existing:
+                # Merge running centroid embedding
+                ex_count = int(existing.get("exemplar_count", 1))
+                old_vec = np.frombuffer(existing["embedding"], dtype=np.float32)
+                new_vec = np.frombuffer(emb_blob, dtype=np.float32)
+                if float(np.linalg.norm(old_vec)) < 1e-6:
+                    # A person created by name only holds a zero placeholder: it is not an exemplar
+                    ex_count = 0
+                merged_vec = (old_vec * ex_count + new_vec) / (ex_count + 1)
+                norm = np.linalg.norm(merged_vec)
+                if norm > 1e-6:
+                    merged_vec /= norm
+                updated_blob = merged_vec.astype(np.float32).tobytes()
+
+                crop_path = face_crop_path or existing.get("face_crop_path")
+                c.execute(
+                    """
+                    UPDATE persons
+                    SET exemplar_count = ?,
+                        embedding = ?,
+                        face_crop_path = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (ex_count + 1, updated_blob, crop_path, now, existing["id"]),
+                )
+                pid = existing["id"]
+            else:
+                cur = c.execute(
+                    """
+                    INSERT INTO persons (name, slug, exemplar_count, embedding, face_crop_path, created_at, updated_at)
+                    VALUES (?, ?, 1, ?, ?, ?, ?)
+                    """,
+                    (clean_name, slug, emb_blob, face_crop_path, now, now),
+                )
+                pid = cur.lastrowid
+
+        return self.get_person(pid)  # type: ignore
+
+    def list_persons(self) -> list[dict]:
+        persons = self.all(
+            """
+            SELECT p.id, p.name, p.slug, p.exemplar_count, p.face_crop_path, p.created_at, p.updated_at,
+                   COUNT(v.id) as video_count
+            FROM persons p
+            LEFT JOIN videos v ON v.target_person_id = p.id
+            GROUP BY p.id
+            ORDER BY p.name ASC
+            """
+        )
+        return persons
+
+    def get_person(self, person_id: int) -> dict | None:
+        return self.one("SELECT * FROM persons WHERE id=?", (person_id,))
+
+    def delete_person(self, person_id: int) -> bool:
+        with self.write() as c:
+            c.execute("UPDATE videos SET target_person_id=NULL, target_person_name=NULL WHERE target_person_id=?", (person_id,))
+            cur = c.execute("DELETE FROM persons WHERE id=?", (person_id,))
+            return cur.rowcount > 0
+
+    def set_video_target_person(self, video_id: str, person_id: int | None) -> dict | None:
+        with self.write() as c:
+            if person_id is not None:
+                person = self.one("SELECT id, name FROM persons WHERE id=?", (person_id,))
+                if not person:
+                    raise ValueError(f"Person {person_id} not found")
+                c.execute(
+                    "UPDATE videos SET target_person_id=?, target_person_name=? WHERE id=?",
+                    (person["id"], person["name"], video_id),
+                )
+            else:
+                c.execute("UPDATE videos SET target_person_id=NULL, target_person_name=NULL WHERE id=?", (video_id,))
+        return self.one("SELECT * FROM videos WHERE id=?", (video_id,))

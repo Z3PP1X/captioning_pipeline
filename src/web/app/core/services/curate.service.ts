@@ -15,6 +15,7 @@ export class CurateService {
   readonly curateChunkFilter = signal<number | 'all'>('all');
   readonly curateRoleFilter = signal<'all' | 'pick' | 'runner_up'>('all');
   readonly curateStateFilter = signal<'all' | 'keep' | 'reject' | 'star'>('all');
+  readonly targetPersonOnly = signal<boolean>(false);
   readonly showRunnerUps = signal<boolean>(false);
   readonly lightboxIndex = signal<number | null>(null);
   readonly isLoading = signal<boolean>(false);
@@ -25,6 +26,7 @@ export class CurateService {
     const roleFilter = this.curateRoleFilter();
     const stateFilter = this.curateStateFilter();
     const showRunners = this.showRunnerUps();
+    const targetOnly = this.targetPersonOnly();
 
     // Unless explicitly viewing runner ups, show only picks by default if not filtered by role
     if (!showRunners && roleFilter === 'all') {
@@ -45,6 +47,10 @@ export class CurateService {
       } else {
         list = list.filter((c) => c.state === stateFilter);
       }
+    }
+
+    if (targetOnly) {
+      list = list.filter((c) => c.target_person_matched || (c.target_person_sim !== undefined && c.target_person_sim >= 0.363));
     }
 
     return list;
@@ -106,6 +112,10 @@ export class CurateService {
         preview_url: c.preview_url || `/api/frames/${c.id}/preview`,
         full_url: c.full_url || `/api/frames/${c.id}/full`,
         state: c.state || (isPick ? 'keep' : 'reject'),
+        target_person_sim: c.target_person_sim ?? c.zs_scores?.['target_person_sim'] ?? 0,
+        target_person_matched: Boolean(c.target_person_matched ?? c.zs_scores?.['target_person_matched']),
+        face_count: c.face_count ?? c.zs_scores?.['face_count'] ?? 0,
+        faces: c.faces ?? c.zs_scores?.['faces'] ?? [],
       });
 
       const normalizedPicks = rawPicks.map((c) => mapCandidate(c, true));
@@ -248,6 +258,7 @@ export class CurateService {
     const soloPct = distData?.one_person_pct ?? distData?.one_person?.pct ?? 0;
     const toolsPct = distData?.tools_equipment_pct ?? distData?.tools_equipment?.pct ?? 0;
     const facePct = distData?.face_visible_pct ?? distData?.face_visible?.pct ?? 0;
+    const targetPct = distData?.target_person_pct ?? distData?.target_person?.pct ?? 0;
 
     const selectedCount = allCandidates.filter((c) => c.state === 'keep' || (c.is_pick && c.state !== 'reject')).length;
 
@@ -268,6 +279,11 @@ export class CurateService {
         pct: Math.round(facePct),
         target_pct: 50,
       },
+      target_person: {
+        pct: Math.round(targetPct),
+        target_pct: 75,
+      },
+      target_person_pct: Math.round(targetPct),
       selected_count: selectedCount,
       target_count: 300,
     });
@@ -282,6 +298,7 @@ export class CurateService {
     let soloCount = 0;
     let toolsCount = 0;
     let faceCount = 0;
+    let targetCount = 0;
 
     for (const c of selected) {
       const zs = c.zs_scores || c.metrics || {};
@@ -289,6 +306,7 @@ export class CurateService {
       if ((zs['one_person'] ?? 0) >= 0.45 || c.categories?.one_person) soloCount++;
       if (Math.max(zs['tools'] ?? 0, zs['equipment'] ?? 0) >= 0.45 || c.categories?.tools_equipment) toolsCount++;
       if ((zs['face_score'] ?? 0) >= 0.50 || zs['face_visible_50pct'] || c.categories?.face_visible) faceCount++;
+      if (c.target_person_matched || (c.target_person_sim ?? 0) >= 0.363) targetCount++;
     }
 
     this.distribution.set({
@@ -308,6 +326,11 @@ export class CurateService {
         pct: Math.round((faceCount / total) * 100),
         target_pct: 50,
       },
+      target_person: {
+        pct: Math.round((targetCount / total) * 100),
+        target_pct: 75,
+      },
+      target_person_pct: Math.round((targetCount / total) * 100),
       selected_count: selected.length,
       target_count: 300,
     });
