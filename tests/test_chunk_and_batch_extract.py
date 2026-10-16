@@ -241,8 +241,8 @@ def test_batch_auto_extract_runner():
 def test_chunk_and_batch_api_endpoints():
     """Verify HTTP API contracts for batch auto-extract and chunk extract."""
     with TestClient(app) as client:
-        # 1. Batch auto extract dispatch
-        res = client.post("/api/videos/batch-auto-extract", json={"only_unextracted": True})
+        # 1. Batch auto extract dispatch (explicit fixture id: the library may hold no eligible video)
+        res = client.post("/api/videos/batch-auto-extract", json={"video_ids": ["fixture_chunk_api_vid"]})
         assert res.status_code == 200
         data = res.json()
         assert "job_id" in data

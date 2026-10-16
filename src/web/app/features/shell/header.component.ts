@@ -114,12 +114,12 @@ import { ActiveJob } from '../../core/models/job.model';
           >
             <span
               class="size-2 rounded-full"
-              [class.bg-success]="connectionState() === 'connected'"
-              [class.bg-warning]="connectionState() === 'connecting'"
+              [class.bg-success-strong]="connectionState() === 'connected'"
+              [class.bg-warning-strong]="connectionState() === 'connecting'"
               [class.animate-pulse]="connectionState() === 'connecting'"
               [class.bg-destructive]="connectionState() === 'disconnected'"
             ></span>
-            <span class="text-[10px] font-semibold hidden xl:inline uppercase tracking-wider">{{ connectionState() }}</span>
+            <span class="text-xs font-semibold hidden xl:inline uppercase tracking-wider">{{ connectionState() }}</span>
           </div>
 
           @for (job of activeJobsList(); track job.job_id) {

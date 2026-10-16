@@ -1,15 +1,50 @@
-import { ChangeDetectionStrategy, Component, inject, output, signal } from '@angular/core';
+import { ChangeDetectionStrategy, Component, OnInit, inject, output, signal } from '@angular/core';
 import { NgIcon, provideIcons } from '@ng-icons/core';
-import { lucideZap, lucideCheck, lucideX, lucideEye, lucideRefreshCw, lucideAlertTriangle, lucideTarget } from '@ng-icons/lucide';
+import {
+  lucideZap,
+  lucideCheck,
+  lucideX,
+  lucideEye,
+  lucideRefreshCw,
+  lucideAlertTriangle,
+  lucideTarget,
+  lucideTags,
+  lucideSparkles,
+  lucideDownload,
+  lucideLoader2,
+  lucideShuffle,
+} from '@ng-icons/lucide';
+import { ReselectDialogComponent } from './reselect-dialog.component';
 import { HlmButtonImports } from '@spartan-ng/helm/button';
+import { HlmNativeSelectImports } from '@spartan-ng/helm/native-select';
 import { CurateService } from '../../core/services/curate.service';
 import { VideoService } from '../../core/services/video.service';
 import { ChunkService } from '../../core/services/chunk.service';
+import { TagService } from '../../core/services/tag.service';
+import { JobEventService } from '../../core/services/job-event.service';
+import { ApiError } from '../../core/services/api.service';
+import { DatasetService } from '../../core/services/dataset.service';
+import { ConfirmService } from '../../core/services/confirm.service';
 
 @Component({
   selector: 'app-curate-toolbar',
-  imports: [NgIcon, HlmButtonImports],
-  providers: [provideIcons({ lucideZap, lucideCheck, lucideX, lucideEye, lucideRefreshCw, lucideAlertTriangle, lucideTarget })],
+  imports: [NgIcon, HlmButtonImports, HlmNativeSelectImports, ReselectDialogComponent],
+  providers: [
+    provideIcons({
+      lucideZap,
+      lucideCheck,
+      lucideX,
+      lucideEye,
+      lucideRefreshCw,
+      lucideAlertTriangle,
+      lucideTarget,
+      lucideTags,
+      lucideSparkles,
+      lucideDownload,
+      lucideLoader2,
+      lucideShuffle,
+    }),
+  ],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div class="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-card p-3 shadow-xs select-none">
@@ -26,39 +61,48 @@ import { ChunkService } from '../../core/services/chunk.service';
       <!-- Center: Filter Dropdowns -->
       <div class="flex flex-wrap items-center gap-2 text-xs">
         <!-- Chunk Filter -->
-        <select
-          [value]="curateService.curateChunkFilter()"
-          (change)="curateService.curateChunkFilter.set($any($event.target).value)"
-          class="h-8 rounded-md border border-input bg-background px-2 text-xs text-foreground focus:ring-1 focus:ring-ring"
+        <label for="curate-chunk-filter" class="sr-only">Filter by chunk</label>
+        <hlm-native-select
+          selectId="curate-chunk-filter"
+          selectClass="text-xs"
+          size="sm"
+          [value]="'' + curateService.curateChunkFilter()"
+          (valueChange)="curateService.curateChunkFilter.set($any($event || 'all'))"
         >
           <option value="all">All Chunks</option>
           @for (chunk of chunkService.chunks(); track chunk.position) {
-            <option [value]="chunk.id || chunk.position">Chunk #{{ chunk.position + 1 }}</option>
+            <option [value]="'' + (chunk.id || chunk.position)">Chunk #{{ chunk.position + 1 }}</option>
           }
-        </select>
+        </hlm-native-select>
 
         <!-- Role Filter -->
-        <select
+        <label for="curate-role-filter" class="sr-only">Filter by role</label>
+        <hlm-native-select
+          selectId="curate-role-filter"
+          selectClass="text-xs"
+          size="sm"
           [value]="curateService.curateRoleFilter()"
-          (change)="curateService.curateRoleFilter.set($any($event.target).value)"
-          class="h-8 rounded-md border border-input bg-background px-2 text-xs text-foreground focus:ring-1 focus:ring-ring"
+          (valueChange)="curateService.curateRoleFilter.set($any($event || 'all'))"
         >
           <option value="all">All Roles</option>
           <option value="pick">300 Picks Only</option>
           <option value="runner_up">450 Runner-ups Only</option>
-        </select>
+        </hlm-native-select>
 
         <!-- State Filter -->
-        <select
+        <label for="curate-state-filter" class="sr-only">Filter by state</label>
+        <hlm-native-select
+          selectId="curate-state-filter"
+          selectClass="text-xs"
+          size="sm"
           [value]="curateService.curateStateFilter()"
-          (change)="curateService.curateStateFilter.set($any($event.target).value)"
-          class="h-8 rounded-md border border-input bg-background px-2 text-xs text-foreground focus:ring-1 focus:ring-ring"
+          (valueChange)="curateService.curateStateFilter.set($any($event || 'all'))"
         >
           <option value="all">All States</option>
           <option value="keep">Keep / Selected</option>
           <option value="reject">Rejected</option>
           <option value="star">Starred</option>
-        </select>
+        </hlm-native-select>
 
         <!-- Target Person Filter -->
         @if (videoService.currentVideo()?.target_person_name; as tName) {
@@ -70,9 +114,62 @@ import { ChunkService } from '../../core/services/chunk.service';
             [title]="'Filter frames matching target person: ' + tName"
             class="h-8 cursor-pointer gap-1"
           >
-            <span>🎯 {{ tName }}</span>
+            <ng-icon name="lucideTarget" class="size-3.5" />
+            <span>{{ tName }}</span>
           </button>
         }
+
+        <!-- Image Tag Filter -->
+        <label for="curate-tag-filter" class="sr-only">Filter by image tag</label>
+        <hlm-native-select
+          selectId="curate-tag-filter"
+          selectClass="text-xs"
+          size="sm"
+          [value]="'' + (curateService.tagFilter() ?? '')"
+          (valueChange)="onTagFilter($event ?? '')"
+        >
+          <option value="">All Tags</option>
+          @for (t of tagService.tags(); track t.id) {
+            <option [value]="'' + t.id">{{ t.name }}</option>
+          }
+        </hlm-native-select>
+        @if (curateService.tagFilter() !== null) {
+          <button
+            hlmBtn
+            size="xs"
+            [variant]="curateService.tagFilterIncludeSuggested() ? 'outline' : 'secondary'"
+            (click)="curateService.tagFilterIncludeSuggested.update((v) => !v)"
+            class="h-8 cursor-pointer"
+            [attr.aria-pressed]="!curateService.tagFilterIncludeSuggested()"
+          >
+            {{ curateService.tagFilterIncludeSuggested() ? 'Confirmed + suggested' : 'Confirmed only' }}
+          </button>
+        }
+
+        <!-- Learn-as-you-tag: library and video-wide suggestions -->
+        <button
+          hlmBtn
+          variant="outline"
+          size="xs"
+          (click)="openTagManager.emit()"
+          title="Tag library: examples, learned accuracy, rename and merge"
+          class="h-8 cursor-pointer gap-1"
+        >
+          <ng-icon name="lucideTags" class="size-3.5" />
+          <span>Tags</span>
+        </button>
+        <button
+          hlmBtn
+          variant="outline"
+          size="xs"
+          (click)="onAutoTag()"
+          [disabled]="autoTagging() || !videoService.currentVideo() || curateService.candidates().length === 0 || tagService.tags().length === 0"
+          title="Suggest learned tags (with locations) on every frame of this video"
+          class="h-8 cursor-pointer gap-1"
+        >
+          <ng-icon name="lucideSparkles" class="size-3.5" [class.animate-pulse]="autoTagging()" />
+          <span>Auto-tag</span>
+        </button>
 
         <!-- Manage Target Person -->
         <button
@@ -105,7 +202,7 @@ import { ChunkService } from '../../core/services/chunk.service';
           hlmBtn
           variant="outline"
           size="xs"
-          (click)="confirmAction.set('keep_all')"
+          (click)="onKeepAll()"
           [disabled]="!videoService.currentVideo() || curateService.candidates().length === 0"
           class="h-8 cursor-pointer gap-1"
         >
@@ -118,7 +215,7 @@ import { ChunkService } from '../../core/services/chunk.service';
           hlmBtn
           variant="outline"
           size="xs"
-          (click)="confirmAction.set('reject_all')"
+          (click)="onRejectAll()"
           [disabled]="!videoService.currentVideo() || curateService.candidates().length === 0"
           class="h-8 cursor-pointer gap-1 text-muted-foreground hover:text-destructive"
         >
@@ -153,6 +250,39 @@ import { ChunkService } from '../../core/services/chunk.service';
           <ng-icon name="lucideZap" class="size-3.5" [class.animate-spin]="curateService.isLoading()" />
           <span>Dedup 95% (150-200)</span>
         </button>
+
+        <!-- Phase F: reselect knobs + learned weights (opens app-reselect-dialog) -->
+        <button
+          hlmBtn
+          variant="outline"
+          size="xs"
+          type="button"
+          (click)="isReselectOpen.set(true)"
+          [disabled]="curateService.isLoading() || !videoService.currentVideo() || curateService.candidates().length === 0"
+          aria-haspopup="dialog"
+          class="h-8 cursor-pointer gap-1"
+        >
+          <ng-icon name="lucideShuffle" class="size-3.5" aria-hidden="true" />
+          <span>Reselect</span>
+        </button>
+
+        <!-- F13: export only this video (POST /api/export {video_id}) -->
+        <button
+          hlmBtn
+          variant="outline"
+          size="xs"
+          (click)="onExportVideo()"
+          [disabled]="isExporting() || !videoService.currentVideo() || curateService.candidates().length === 0"
+          title="Export the kept frames of this video to the finished dataset"
+          class="h-8 cursor-pointer gap-1"
+        >
+          @if (isExporting()) {
+            <ng-icon name="lucideLoader2" class="size-3.5 motion-safe:animate-spin" aria-hidden="true" />
+          } @else {
+            <ng-icon name="lucideDownload" class="size-3.5" aria-hidden="true" />
+          }
+          <span>Export this video</span>
+        </button>
       </div>
 
       <!-- Right: Open VLM Captioning Modal -->
@@ -178,61 +308,49 @@ import { ChunkService } from '../../core/services/chunk.service';
       </div>
     </div>
 
-    <!-- Bulk confirmation dialog -->
-    @if (confirmAction()) {
-      <div class="fixed inset-0 z-50 flex items-center justify-center bg-secondary/80 backdrop-blur-xs p-4 animate-in fade-in select-none">
-        <div class="relative w-full max-w-md rounded-xl border border-border bg-card p-6 shadow-2xl flex flex-col gap-4">
-          <div class="flex items-center gap-2">
-            <ng-icon
-              [name]="confirmAction() === 'reject_all' ? 'lucideAlertTriangle' : 'lucideCheck'"
-              [class]="confirmAction() === 'reject_all' ? 'size-5 text-destructive' : 'size-5 text-primary'"
-            />
-            <h3 class="font-sans font-bold text-base text-foreground">
-              {{ confirmAction() === 'reject_all' ? 'Reject All Candidates?' : 'Keep All Picks?' }}
-            </h3>
-          </div>
-
-          <p class="text-xs text-muted-foreground leading-relaxed">
-            @if (confirmAction() === 'reject_all') {
-              Are you sure you want to mark all candidates for this video as rejected? You will need to manually re-select or re-extract candidates.
-            } @else {
-              Set all curated picks in this video to "Keep"? This accepts all 300 target frames into the dataset.
-            }
-          </p>
-
-          <div class="flex items-center justify-end gap-2 pt-2 border-t border-border">
-            <button
-              hlmBtn
-              variant="outline"
-              size="sm"
-              (click)="confirmAction.set(null)"
-              class="cursor-pointer"
-            >
-              Cancel
-            </button>
-            <button
-              hlmBtn
-              [variant]="confirmAction() === 'reject_all' ? 'destructive' : 'default'"
-              size="sm"
-              (click)="executeConfirmAction()"
-              class="cursor-pointer font-bold"
-            >
-              {{ confirmAction() === 'reject_all' ? 'Reject All' : 'Confirm Keep All' }}
-            </button>
-          </div>
-        </div>
-      </div>
+    @if (isReselectOpen()) {
+      <app-reselect-dialog (close)="isReselectOpen.set(false)" />
     }
+
   `,
 })
-export class CurateToolbarComponent {
+export class CurateToolbarComponent implements OnInit {
   readonly curateService = inject(CurateService);
   readonly videoService = inject(VideoService);
   readonly chunkService = inject(ChunkService);
+  readonly tagService = inject(TagService);
+  private readonly jobEvents = inject(JobEventService);
+  private readonly datasetService = inject(DatasetService);
+  private readonly confirm = inject(ConfirmService);
 
   readonly openVlmModal = output<void>();
   readonly openPersonModal = output<void>();
-  readonly confirmAction = signal<'keep_all' | 'reject_all' | null>(null);
+  readonly openTagManager = output<void>();
+  readonly autoTagging = signal(false);
+  readonly isExporting = signal(false);
+  readonly isReselectOpen = signal(false);
+
+  ngOnInit(): void {
+    this.tagService.loadTags().catch(() => undefined);
+  }
+
+  onTagFilter(value: string): void {
+    this.curateService.tagFilter.set(value ? Number(value) : null);
+  }
+
+  async onAutoTag(): Promise<void> {
+    const video = this.videoService.currentVideo();
+    if (!video) return;
+    this.autoTagging.set(true);
+    try {
+      await this.tagService.suggestForVideo(video.id);
+      this.jobEvents.showToast('Auto-tagging started', 'Suggestions appear in the grid when the job finishes.');
+    } catch (err) {
+      this.jobEvents.showToast('Auto-tagging failed', err instanceof ApiError ? err.message : String(err), null, true);
+    } finally {
+      this.autoTagging.set(false);
+    }
+  }
 
   toggleCandidatePool(): void {
     this.curateService.showRunnerUps.update((v) => !v);
@@ -252,16 +370,52 @@ export class CurateToolbarComponent {
     await this.curateService.deduplicateSimilarity(video.id);
   }
 
-  async executeConfirmAction(): Promise<void> {
-    const action = this.confirmAction();
+  async onKeepAll(): Promise<void> {
     const video = this.videoService.currentVideo();
-    this.confirmAction.set(null);
     if (!video) return;
+    const ok = await this.confirm.ask({
+      title: 'Keep all picks?',
+      description: 'Set all curated picks in this video to "Keep". This accepts all target frames into the dataset.',
+      confirmLabel: 'Keep all',
+      destructive: false,
+    });
+    if (ok) await this.curateService.bulkKeepAll(video.id);
+  }
 
-    if (action === 'keep_all') {
-      await this.curateService.bulkKeepAll(video.id);
-    } else if (action === 'reject_all') {
-      await this.curateService.bulkRejectAll(video.id);
+  async onRejectAll(): Promise<void> {
+    const video = this.videoService.currentVideo();
+    if (!video) return;
+    const ok = await this.confirm.ask({
+      title: 'Reject all candidates?',
+      description:
+        'All candidates of this video are marked as rejected. You will need to re-select frames manually or re-extract.',
+      confirmLabel: 'Reject all',
+    });
+    if (ok) await this.curateService.bulkRejectAll(video.id);
+  }
+
+  async onExportVideo(): Promise<void> {
+    const video = this.videoService.currentVideo();
+    if (!video || this.isExporting()) return;
+    this.isExporting.set(true);
+    try {
+      const res = await this.datasetService.exportVideo(video.id);
+      if (res?.error) {
+        this.jobEvents.showToast('Export failed', res.error, video.id, true);
+      } else if (!res?.exported) {
+        this.jobEvents.showToast('Nothing exported', res?.msg || 'No frames are marked Keep or Star yet.', video.id);
+      } else {
+        const where = res.per_video_dir ? ` to ${res.per_video_dir}` : '';
+        this.jobEvents.showToast('Video exported', `${res.exported} frames of ${video.name} exported${where}.`, video.id, false, {
+          label: 'View dataset',
+          tab: 'dataset',
+          videoId: video.id,
+        });
+      }
+    } catch (err) {
+      this.jobEvents.showToast('Export failed', err instanceof ApiError ? err.message : String(err), video.id, true);
+    } finally {
+      this.isExporting.set(false);
     }
   }
 }

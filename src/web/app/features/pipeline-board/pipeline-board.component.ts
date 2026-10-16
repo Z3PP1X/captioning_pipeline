@@ -53,8 +53,8 @@ export interface BoardNavigateEvent {
       <!-- Top Title & Toolbar -->
       <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 border-b border-border">
         <div>
-          <h1 class="font-display font-black text-xl md:text-2xl text-foreground tracking-tight">
-            PIPELINE BOARD
+          <h1 class="font-display font-black text-xl md:text-2xl uppercase tracking-wide text-foreground">
+            Pipeline board
           </h1>
           <p class="text-xs text-muted-foreground mt-0.5">
             {{ allVideos().length }} videos in library · {{ runningCount() }} active jobs · {{ needsActionCount() }} awaiting curation
@@ -68,7 +68,7 @@ export interface BoardNavigateEvent {
             size="sm"
             (click)="onBatchAutoExtract()"
             [disabled]="isBatchRunning() || videoService.isLoading()"
-            class="cursor-pointer gap-1.5 bg-amber-600 hover:bg-amber-500 text-white font-semibold"
+            class="cursor-pointer gap-1.5 font-semibold"
             title="Sequentially auto-chunk (if needed) and extract frames for all unextracted videos (suitable for overnight runs)"
           >
             <ng-icon
@@ -111,17 +111,17 @@ export interface BoardNavigateEvent {
 
       <!-- Batch Auto-Extract Active Progress Banner -->
       @if (batchJob()) {
-        <div class="mt-4 flex flex-col gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 p-3.5 text-xs">
-          <div class="flex items-center justify-between font-bold text-amber-500">
+        <div class="mt-4 flex flex-col gap-2 rounded-xl border border-warning bg-warning/10 p-3.5 text-xs" role="status">
+          <div class="flex items-center justify-between font-bold text-foreground">
             <div class="flex items-center gap-2">
-              <ng-icon name="lucideRefreshCw" class="size-4 animate-spin" />
-              <span>Overnight Batch Auto-Extraction: {{ batchJob()!.step || 'Processing' }}</span>
+              <ng-icon name="lucideRefreshCw" class="size-4 text-foreground motion-safe:animate-spin" aria-hidden="true" />
+              <span>Overnight batch auto-extraction: {{ batchJob()!.step || 'Processing' }}</span>
             </div>
-            <span class="font-mono text-sm">{{ (batchJob()!.progress * 100).toFixed(0) }}%</span>
+            <span class="text-sm tabular-nums">{{ (batchJob()!.progress * 100).toFixed(0) }}%</span>
           </div>
           <div class="h-2 w-full rounded-full bg-border overflow-hidden">
             <div
-              class="h-full bg-amber-500 transition-all duration-300 rounded-full"
+              class="h-full bg-warning transition-all duration-300 rounded-full"
               [style.width.%]="batchJob()!.progress * 100"
             ></div>
           </div>
@@ -171,7 +171,7 @@ export interface BoardNavigateEvent {
       <!-- Table Container -->
       <div class="flex-1 overflow-auto rounded-xl border border-border bg-card shadow-xs">
         <table class="w-full text-left text-xs border-collapse">
-          <thead class="bg-muted/50 sticky top-0 border-b border-border text-muted-foreground font-semibold uppercase tracking-wider text-[11px]">
+          <thead class="bg-muted/50 sticky top-0 border-b border-border text-muted-foreground font-semibold uppercase tracking-wider text-xs">
             <tr>
               <th class="py-2.5 px-4">Video</th>
               <th class="py-2.5 px-3">Stage Progression</th>
@@ -197,7 +197,7 @@ export interface BoardNavigateEvent {
                     <span class="font-bold truncate max-w-xs md:max-w-sm group-hover:text-primary transition-colors">
                       {{ v.name }}
                     </span>
-                    <span class="text-[11px] text-muted-foreground tabular-nums">
+                    <span class="text-xs text-muted-foreground tabular-nums">
                       {{ v.width }}×{{ v.height }} &middot; {{ v.fps.toFixed(1) }} fps
                     </span>
                   </div>
@@ -206,13 +206,20 @@ export interface BoardNavigateEvent {
                 <!-- Stage Progression Indicator -->
                 <td class="py-2.5 px-3">
                   <div class="flex items-center gap-2">
-                    <span class="text-xs font-mono tracking-widest text-primary drop-shadow-xs">
-                      {{ stageMeta.dots }}
-                    </span>
+                    @if (stageMeta.done !== null) {
+                      <span class="flex items-center gap-1" aria-hidden="true">
+                        @for (i of stageSlots; track i) {
+                          <span
+                            class="size-1.5 rounded-full"
+                            [class]="i < stageMeta.done ? 'bg-primary' : i === stageMeta.done && stageMeta.running ? 'bg-primary/40' : 'bg-border'"
+                          ></span>
+                        }
+                      </span>
+                    }
                     <span
                       hlmBadge
                       [variant]="stageMeta.variant"
-                      class="text-[11px] px-1.5 py-0 font-medium shrink-0"
+                      class="text-xs px-1.5 py-0 font-medium shrink-0"
                     >
                       {{ stageMeta.label }}
                     </span>
@@ -227,7 +234,7 @@ export interface BoardNavigateEvent {
                 <!-- Kept / 300 -->
                 <td class="py-2.5 px-3 text-center tabular-nums">
                   @if ((v.kept_count || 0) > 0) {
-                    <span class="font-bold text-success">{{ v.kept_count }}</span><span class="text-muted-foreground">/300</span>
+                    <span class="font-bold text-success-strong">{{ v.kept_count }}</span><span class="text-muted-foreground">/300</span>
                   } @else {
                     <span class="text-muted-foreground">&mdash;</span>
                   }
@@ -257,7 +264,7 @@ export interface BoardNavigateEvent {
                         size="xs"
                         (click)="onAutoExtractVideo(v)"
                         title="Auto-extract candidate frames for this video"
-                        class="cursor-pointer gap-1 text-amber-500 hover:text-amber-400 hover:border-amber-500/50"
+                        class="cursor-pointer gap-1"
                       >
                         <ng-icon name="lucideZap" class="size-3" />
                         <span class="hidden sm:inline">Auto</span>
@@ -370,46 +377,52 @@ export class PipelineBoardComponent {
     return null;
   }
 
+  /** Five pipeline stages (chunk, extract, curate, caption, export) shown as dots next to the badge. */
+  readonly stageSlots = [0, 1, 2, 3, 4];
+
   getStageProgress(v: Video, activeJob: any): {
-    dots: string;
+    /** Completed stages (0-5); null = no progression (broken / skipped). */
+    done: number | null;
+    /** The stage at index `done` is in progress. */
+    running?: boolean;
     label: string;
     variant: 'default' | 'outline' | 'secondary' | 'destructive' | 'warning' | 'success';
     actionLabel: string;
     targetTab: 'studio' | 'curate';
   } {
     if (v.broken) {
-      return { dots: '!', label: 'Broken', variant: 'destructive', actionLabel: 'Review', targetTab: 'studio' };
+      return { done: null, label: 'Broken', variant: 'destructive', actionLabel: 'Review', targetTab: 'studio' };
     }
     if (activeJob) {
       const pct = Math.round(activeJob.progress * 100);
-      return { dots: '●●◐○○', label: `${activeJob.step} ${pct}%`, variant: 'warning', actionLabel: 'View', targetTab: 'studio' };
+      return { done: 2, running: true, label: `${activeJob.step} ${pct}%`, variant: 'warning', actionLabel: 'View', targetTab: 'studio' };
     }
 
     switch (v.status) {
       case 'new':
-        return { dots: '○○○○○', label: 'New', variant: 'outline', actionLabel: 'Chunk', targetTab: 'studio' };
+        return { done: 0, label: 'New', variant: 'outline', actionLabel: 'Chunk', targetTab: 'studio' };
       case 'chunked':
-        return { dots: '●○○○○', label: 'Chunked', variant: 'secondary', actionLabel: 'Extract', targetTab: 'studio' };
+        return { done: 1, label: 'Chunked', variant: 'secondary', actionLabel: 'Extract', targetTab: 'studio' };
       case 'extracting':
       case 'extracting_750':
-        return { dots: '●●◐○○', label: 'Extracting', variant: 'warning', actionLabel: 'Inspect', targetTab: 'studio' };
+        return { done: 2, running: true, label: 'Extracting', variant: 'warning', actionLabel: 'Inspect', targetTab: 'studio' };
       case 'curating':
       case 'curating_300':
         return {
-          dots: '●●●○○',
+          done: 3,
           label: `Curating (${v.kept_count || 0}/300)`,
           variant: 'default',
           actionLabel: 'Curate',
           targetTab: 'curate',
         };
       case 'captioning':
-        return { dots: '●●●●○', label: 'Captioning', variant: 'warning', actionLabel: 'Monitor', targetTab: 'curate' };
+        return { done: 4, running: true, label: 'Captioning', variant: 'warning', actionLabel: 'Monitor', targetTab: 'curate' };
       case 'exported':
-        return { dots: '●●●●●', label: 'Exported', variant: 'success', actionLabel: 'View Set', targetTab: 'curate' };
+        return { done: 5, label: 'Exported', variant: 'success', actionLabel: 'View Set', targetTab: 'curate' };
       case 'skipped':
-        return { dots: '&mdash;', label: 'Skipped', variant: 'outline', actionLabel: 'Restore', targetTab: 'studio' };
+        return { done: null, label: 'Skipped', variant: 'outline', actionLabel: 'Restore', targetTab: 'studio' };
       default:
-        return { dots: '○○○○○', label: v.status, variant: 'outline', actionLabel: 'Open', targetTab: 'studio' };
+        return { done: 0, label: v.status, variant: 'outline', actionLabel: 'Open', targetTab: 'studio' };
     }
   }
 

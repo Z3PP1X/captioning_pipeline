@@ -134,6 +134,19 @@ export class VideoService {
     }
   }
 
+  /** Switch the LoRA profile; 'character' immediately re-gates the picks on the target person (server side). */
+  async setProfile(
+    videoId: string | number,
+    profile: 'concept' | 'character',
+  ): Promise<{ applied: boolean; reason?: string; demoted?: number[]; promoted?: number[]; cropped?: number[] } | null> {
+    const strId = String(videoId);
+    const res = await this.api.patch<{ video: Video; profile_result?: any }>(`/api/videos/${strId}`, { profile });
+    const cur = this.currentVideo();
+    if (cur && String(cur.id) === strId) this.currentVideo.set({ ...cur, profile });
+    this.videos.update((list) => list.map((v) => (String(v.id) === strId ? { ...v, profile } : v)));
+    return res.profile_result ?? null;
+  }
+
   async updateStatus(videoId: string | number, status: string): Promise<void> {
     const strId = String(videoId);
     try {

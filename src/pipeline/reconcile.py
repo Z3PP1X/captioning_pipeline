@@ -7,8 +7,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+from pipeline.captions import import_caption
 from pipeline.config import Settings, get_settings
 from pipeline.db import DB
+from pipeline.export import existing_caption_kind
 
 logger = logging.getLogger("pipeline.reconcile")
 
@@ -22,7 +24,10 @@ APPROVED = "p.state IN ('keep', 'star')"
 def reconcile_captions_and_state(db: DB, settings: Settings | None = None) -> dict[str, Any]:
     """
     1. Scans settings.finished_dir/per_video on disk for generated captions and PNGs.
-    2. Matches each caption to its corresponding frame and inserts into `exports` table.
+    2. Matches each caption to its corresponding frame and inserts into `exports` table, and imports
+       the text into `captions` (source 'imported', or 'stub' for exporter placeholders). Idempotent:
+       a frame that already has a caption row keeps it (a VLM row is never replaced; a stub row is
+       upgraded when a real caption file shows up).
     3. Auto-heals stuck video statuses (e.g. captioning / extracting_750 when no active jobs exist).
     4. Marks videos as 'exported' if all picks have captions.
     """
@@ -34,6 +39,7 @@ def reconcile_captions_and_state(db: DB, settings: Settings | None = None) -> di
     stats = {
         "captions_found_on_disk": 0,
         "exports_inserted_or_updated": 0,
+        "captions_imported": 0,
         "videos_updated": 0,
         "videos_healed": [],
     }
@@ -87,8 +93,16 @@ def reconcile_captions_and_state(db: DB, settings: Settings | None = None) -> di
         png_path = txt_path.with_suffix(".png")
         merged_png = merged_dir / png_path.name
         merged_txt = merged_dir / txt_path.name
+        kind = existing_caption_kind(txt_path)
+        caption_text = txt_path.read_text(encoding="utf-8").strip() if kind else ""
 
         with db.write() as conn:
+            if caption_text and import_caption(
+                conn, frame_id, vid, caption_text,
+                source="imported" if kind == "caption" else "stub",
+                created_at=txt_path.stat().st_mtime,
+            ):
+                stats["captions_imported"] += 1
             conn.execute(
                 """
                 INSERT INTO exports (frame_id, per_video_path, merged_path, exported_at)

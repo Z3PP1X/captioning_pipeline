@@ -3,6 +3,22 @@
 Date: 2026-10-13. Branch `main`, up to date with `origin/main` at `258a2d3` (pulled this session).
 Scope: what is missing or wrong between the **target** (legacy behaviour in `src/web/app.js` + mim26 design system + Angular/Tailwind/Spartan rules) and the **Angular app that exists** (`src/web/app`). Every item comes from reading code; **nothing was built, run or tested in this session** (no `npm install`, `ng build`, `pytest`, browser run). Treat "verified" as "confirmed by reading source".
 
+> **Status 2026-10-16 (session 5, see HANDOFF §1.9): everything below is closed except the items in "Still open".**
+>
+> | Area | Closed |
+> | --- | --- |
+> | §1 repo state | skills committed upstream; `.claude/skills` canonical, `.agents/skills` mirrored by `scripts/sync_skills.sh`; `skills-wip` stash gone |
+> | §2 functional | F1-F13 (F9 = hash deep links, F7 = server-only key, F13 = "Export this video" in the Curate toolbar) |
+> | §3 backend | B1, B2, B3 (client mapper), B4 (`validate_user_settings`, 400 + `ignored_keys`), B5 (`rebalance: true`); B6 is documentation |
+> | §4 styling | light-first, no emoji icons / raw palette / hex / `text-[Npx]` / `font-mono`, filename h2, shared `hlm-alert-dialog` confirm |
+> | §5 tooling | Vitest target + 103 specs; Node via nvm in `setup.sh`; production `build_web.sh`; server answers 503 instead of serving raw `src/web`; `app.js` and foreign components deleted; ad-hoc scripts pruned; pytest collects `tests/` only |
+>
+> Also closed in session 5: zoneless change detection (zone.js removed), `HttpClient` + `apiErrorInterceptor` in `ApiService`, `hlm-dialog` for the four dialogs, Signal Forms for settings.
+>
+> Closed 2026-10-16 (frontend): toasts on `hlm-toaster` (sonner), no raw `<select>` left (`hlm-native-select`), decisions 3 (status badge + overflow menu) and 4 (`info` badge, `--success-strong` / `--warning-strong`).
+>
+> **Still open:** nothing in this report. Toasts are Spartan sonner and every `<select>` is `hlm-native-select` (session 5). The `.angular/` cache sits on ext4 via `scripts/ng_env.sh`, and the `patch_os.js` cause is documented in the file. Runtime checks in WSL are listed in HANDOFF §5.
+
 ## 0. Read first
 
 Skills in `.claude/skills/` are the detailed source of truth; this report is the prioritised index.
@@ -42,6 +58,8 @@ Hard rules: all Python/Node/uv commands run **inside WSL 2** (`AGENTS.md`); test
 | F12 | P3 | Playhead driven by `timeupdate` (~4 Hz), not `requestAnimationFrame`. | `video-player.component.ts` | Optional smoothness improvement |
 | F13 | P3 | "Export this video" only as per-row "Re-Export" in the Dataset table; no Curate-toolbar action. | `dataset-view`, `curate-toolbar` | Product decision |
 
+**Status 2026-10-16 (frontend):** F1, F4, F5, F6, F7 (server-only key), F8, F9 (hash routes), F10, F12, F13 (Curate toolbar) and B3 (`core/utils/chunk-fields.utils.ts`) are closed; see the "Port status" table in `studio-ui-spec`. F2/F3 were closed earlier (extract saves + normalises first; all statuses selectable); F11 has a header connection-state label (`JobEventService.connectionState`).
+
 ## 3. Backend / contract gaps
 
 | # | Pri | Gap | Where |
@@ -73,7 +91,7 @@ Previously reported mismatches that upstream fixed: SSE `StreamingResponse` impo
 - `node_modules` and the Angular cache sit on `/mnt/c` (slow 9p); no ext4 relocation / `cli.cache.path`. `scripts/patch_os.js` (stubs `os.networkInterfaces`) is an unexplained WSL workaround - cause **unverified**.
 - `scripts/build_web.sh` / `start_all.sh` build with `--configuration development` (unoptimised); `start_all.sh` runs uvicorn without `--reload`.
 - FastAPI serves `src/web` (raw TS) if `src/web/dist` is not built -> broken UI at `:8000`. Always build first; consider failing loudly instead.
-- `zone.js` still used (not zoneless); `provideHttpClient()` registered but `ApiService` uses `fetch`, so no interceptor/central error handling.
+- ~~`zone.js` still used; `ApiService` uses `fetch`~~ **Closed 2026-10-16:** `provideZonelessChangeDetection()`, zone.js removed; `ApiService` on `HttpClient` (`withFetch`) with `apiErrorInterceptor`.
 - `scripts/` gained ~20 ad-hoc scripts (inspect/check/test); several named `test_*.py` are not pytest tests - confirm `pytest` collection only targets `tests/`.
 - Prompt Director (RAG) view: new, undocumented in legacy spec beyond a short section; backend returns 404 "RAG index not built yet" until `scripts/index_rag.py` is run. Top-level keys of the `/api/rag/generate` response were not verified.
 

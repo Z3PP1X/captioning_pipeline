@@ -35,7 +35,7 @@ Destructive actions (Deselect all, deleting a chunk with unsaved edits, cancelli
 
 ## Status, role and state mapping (never by colour alone: icon + text)
 
-Badge variants available: `success | warning | danger | muted` (+ `outline`). Add an `info` variant to `hlm-badge` (token `--info`, foreground text) if "in review" needs separating from "running"; document it in `styling`.
+Badge variants available: `success | warning | danger | muted | info` (+ `outline`); `info` (token `--info`, ink text) separates "in review" (curating) from "running" (warning). State shown by a coloured icon, text or border on white uses `--success-strong` / `--warning-strong` (decision 4, see `colors.md`).
 
 | Video status | Variant | Icon (lucide) | Label |
 | --- | --- | --- | --- |
@@ -83,10 +83,10 @@ On the ink track: filmstrip thumbs full-bleed; scene cuts `bg-background/70` 2 p
 | No emoji, lucide icons | Emoji used as icons/labels in nearly every view | `shell/header.component.ts` (tab labels, logo), `shell/video-queue.component.ts:36,127-130`, `studio/studio-view.component.ts:35-38`, `studio/video-player.component.ts:261`, `curate/distribution-bar.component.ts:12-57`, `curate/candidate-grid.component.ts:77,87`, `modals/openrouter-modal.component.ts:30,150`, `prompt-clicker/prompt-clicker-view.component.ts:134-193` |
 | Tokens only, no raw palette | `bg-black/*`, `text-white`, `bg-black` (modal scrims, thumbnails, player): `modals/*.component.ts`, `curate/candidate-grid.component.ts`, `studio/video-player.component.ts`, `prompt-clicker/...`; `bg-yellow-400/80`, `ring-white`, `bg-black/60`: `studio/timeline.component.ts:48+`; `amber-500` status tint: `shell/video-queue.component.ts:198`. Use `bg-foreground/*`, `bg-secondary`, `text-secondary-foreground`, `bg-warning`. |
 | No hex in code | `ctx.strokeStyle = '#D73816'` in `studio/video-player.component.ts:465` - read `--primary` via `getComputedStyle` instead |
-| Status = semantic badge + icon + text | Hand-built `rounded border ... text-xs` pills with colour classes instead of `hlmBadge` variants (`shell/video-queue.component.ts` status classes, `studio/chunks-panel.component.ts` captioned badges, budget badge uses `text-success`/`text-warning` as text colour - fails the contrast note "never as text on white") |
-| No `alert()` | `core/services/chunk.service.ts:53`, `studio/video-player.component.ts:373`, `modals/openrouter-modal.component.ts:223` |
-| Spartan primitives, no hand-rolled | Modals are custom `fixed inset-0` overlays (`modals/settings`, `lightbox`, `openrouter`) instead of `hlm-dialog`/`sheet` + `alert-dialog`; inputs/selects/checkbox are raw elements with `ngModel` (9 files) instead of helm `input`/`select`/`checkbox`/`switch`; only `HlmButton`, `HlmBadge`, `HlmTooltip` are imported (22/8/2 uses); toasts are a custom container, not `hlm-toaster`; no `progress`, `skeleton`, `empty`, `table` helm usage |
-| Forms: Signal Forms | `FormsModule`/`ngModel` throughout (`styling` rule 6) |
+| Status = semantic badge + icon + text | **Closed (2026-10-16):** queue, studio header, budget and captioned badges are `hlmBadge` variants with ink text and strong-token icons; remaining success/warning text, icons, borders and the SSE dot use `*-strong` tokens |
+| No `alert()` | **Closed:** no `alert()`/`confirm()` left (toasts + `ConfirmService` alert-dialog) |
+| Spartan primitives, no hand-rolled | **Mostly closed (2026-10-16):** settings/caption/person/tag-library use `hlm-dialog`, confirmations `hlm-alert-dialog`; helm input/native-select/checkbox in the dialogs. Toasts are `hlm-toaster` (sonner), all selects `hlm-native-select`, status/bulk actions `hlm-dropdown-menu`. Still custom: the lightbox (ink media surface, keeps `role=dialog` + focus trap) |
+| Forms: Signal Forms | **Closed for the settings dialog** (`form()`, `[formField]`, `settingsFormSchema`); no `ngModel`/`FormsModule` left; other dialogs use direct signal bindings |
 | Signature type only for page titles | `studio-view` renders the **video filename** as an uppercase `h1` (`studio/studio-view.component.ts:29`); `dataset-view` uses the signature style on an `h2`; `prompt-clicker` h1 uses `font-sans font-black`. Page H1 = view name; filename = sentence-case H2/H3. |
 | No extra fonts | `font-mono` for timecodes in 8 files (should be `tabular-nums`); `index.html` still loads Google Fonts (Plus Jakarta Sans, JetBrains Mono); 82 arbitrary `text-[Npx]` sizes instead of the type scale |
 | Touch targets / mobile | Fixed pixel grids (e.g. `grid-cols-[135px_95px_...]` in `studio/chunks-panel.component.ts:160`), `h-screen overflow-hidden` shell, no drawer for the queue below `lg`, `user-select: none` on `body` (blocks copying filenames/captions) |

@@ -45,14 +45,14 @@ def test_build_request_payload_grok47():
         system_prompt="system test",
         model="x-ai/grok-4.7",
         max_tokens=350,  # passed through: the old 300 cap truncated captions (review C3)
-        temperature=0.80,
+        temperature=0.4,
         top_p=0.90,
     )
 
     assert payload["model"] == "x-ai/grok-4.7"
     assert payload["max_tokens"] == 350
     assert "reasoning" not in payload
-    assert payload["temperature"] == 0.80
+    assert payload["temperature"] == 0.4
     assert payload["top_p"] == 0.90
     assert payload["messages"][0]["role"] == "system"
     assert payload["messages"][1]["role"] == "user"
@@ -171,7 +171,7 @@ def test_build_request_payload_gemma_reasoning():
         system_prompt="system test",
         model="google/gemma-4-31b-it",
         max_tokens=300,
-        temperature=0.80,
+        temperature=0.4,
         top_p=0.90,
         reasoning_effort="high",
     )
@@ -179,7 +179,7 @@ def test_build_request_payload_gemma_reasoning():
     assert payload["model"] == "google/gemma-4-31b-it"
     # Reasoning shares max_tokens with the caption, so the budget is raised to leave room for the output
     assert payload["max_tokens"] == 1200
-    assert payload["temperature"] == 0.80
+    assert payload["temperature"] == 0.4
     assert payload["top_p"] == 0.90
     assert payload["reasoning"] == {"effort": "high", "exclude": True}
     assert payload["messages"][0]["role"] == "system"
@@ -196,7 +196,7 @@ def test_api_openrouter_defaults_and_models():
     assert req.fallback_layer3 == "x-ai/grok-4.7"
     assert req.reasoning_effort == "none"
     assert req.max_tokens == 600
-    assert req.temperature > 0.75
+    assert 0.3 <= req.temperature <= 0.5  # Phase G: consistent captions (was 0.80)
 
     models_res = list_openrouter_models()
     models = models_res["models"]

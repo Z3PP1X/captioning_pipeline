@@ -5,7 +5,7 @@ description: Style guide for this Angular project. Use whenever writing or revie
 
 # Styling & UI style guide
 
-This project is Angular 22 + Tailwind CSS v4 + Spartan NG (`@spartan-ng/brain` + generated helm components); app code is in `src/web/app` (see `angular-migration`). Follow these rules for any UI or styling work. Note: the existing app uses only 4 helm primitives (badge, button, tooltip, utils), `ngModel` forms and hand-rolled modals - treat that as debt, not precedent (gaps listed in `design-system/references/studio-adaptations.md`).
+This project is Angular 22 + Tailwind CSS v4 + Spartan NG (`@spartan-ng/brain` + generated helm components); app code is in `src/web/app` (see `angular-migration`). Follow these rules for any UI or styling work. Current state (2026-10-16): dialogs use `hlm-dialog` (settings, caption, person, tag library) and `hlm-alert-dialog` (shared `ConfirmService`); the settings dialog uses Signal Forms; no `ngModel` is left. Toasts use the Spartan sonner (`hlm-toaster`, driven by `JobEventService`), every select is `hlm-native-select` (action menus are `hlm-dropdown-menu`), the studio status is a badge + dropdown-menu. The lightbox stays a custom media surface (`role=dialog`, focus trap) - remaining gaps in `design-system/references/studio-adaptations.md`.
 
 **Visual rules** (colors, typography, spacing, mobile-first layout, contrast) live in the master design guide: [design-system](../design-system/SKILL.md). Read it together with this file — this file covers *how* to build, the design guide covers *what it must look like*.
 
@@ -41,7 +41,8 @@ The helm sources under `src/web/shared/ui` are owned code and carry design-syste
 - Focus rings are solid: `ring-ring` (never `ring-ring/50`), `outline-ring`.
 - `hlmInput` / `hlmTextarea` do **not** use `BrnInput` / `BrnTextarea` as host directive: they re-implement them (host directives `BrnFieldControl` + `BrnFieldControlDescribedBy`, `provideBrnLabelable(...)`, `id` / `forceInvalid` inputs, `data-invalid|touched|dirty|matches-spartan-invalid`) so `aria-invalid` has a single source, `forceInvalid() || BrnFieldControl.spartanInvalid()` (only after touch/submit). Reason: the brain directives bind `aria-invalid` to the raw `invalid()`; with `formControlName` the control resolves one tick late and that binding overrides any touched-aware one, so pristine required fields got `aria-invalid="true"`. Covered by `shared/ui/input/src/lib/hlm-input.spec.ts` (formControlName + `[formControl]`).
 - Button `link` variant: `text-foreground underline underline-offset-4 hover:text-primary`.
-- Badge variants `success | warning | danger | muted` (semantic tints, foreground text).
+- Badge variants `success | warning | danger | muted | info` (semantic tints, foreground text); `success` / `warning` colour their icon with `--success-strong` / `--warning-strong` (`info` with `--info`). Never use `text-success` / `text-warning` / `border-success` etc. on light surfaces - use the `*-strong` tokens (see `design-system/references/colors.md`).
+- `hlm-native-select` re-applies its bound `value` when the projected `<option>`s change (a `MutationObserver` on the host, only when a matching option exists). Without it, options rendered later by `@for` (async model lists) left the browser on the first option although the model held another value; this replaced per-option `[selected]` bindings. Covered by `shared/ui/native-select/src/lib/hlm-native-select.spec.ts`.
 - No raw palette classes in primitives (`text-gray-*` → `text-muted-foreground`, overlay `bg-black/*` → `bg-foreground/*`).
 
 ## Tailwind conventions

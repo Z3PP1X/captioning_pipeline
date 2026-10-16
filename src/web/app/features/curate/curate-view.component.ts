@@ -24,6 +24,7 @@ import { CandidateGridComponent } from './candidate-grid.component';
         class="shrink-0"
         (openVlmModal)="openVlmModal.emit()"
         (openPersonModal)="openPersonModal.emit({})"
+        (openTagManager)="openTagManager.emit()"
       />
 
       <!-- Scrollable Candidate Frames Grid containered by Chunks -->
@@ -39,4 +40,5 @@ export class CurateViewComponent {
   readonly openVlmModal = output<void>();
   readonly openPersonModal = output<{ frameId?: number }>();
   readonly seekChunk = output<number>();
+  readonly openTagManager = output<void>();
 }

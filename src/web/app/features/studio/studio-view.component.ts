@@ -1,4 +1,4 @@
-import { ChangeDetectionStrategy, Component, ViewChild, effect, inject } from '@angular/core';
+import { ChangeDetectionStrategy, Component, effect, inject, signal, viewChild } from '@angular/core';
 import { NgIcon, provideIcons } from '@ng-icons/core';
 import { lucideClock, lucideMaximize2, lucideZap, lucideFilm } from '@ng-icons/lucide';
 import { VideoService } from '../../core/services/video.service';
@@ -7,7 +7,7 @@ import { VideoPlayerComponent } from './video-player.component';
 import { TimelineComponent } from './timeline.component';
 import { ChunksPanelComponent } from './chunks-panel.component';
 import { formatShortTime } from '../../core/utils/time.utils';
-import { ALL_VIDEO_STATUSES } from '../../core/ui/status';
+import { VideoStatusMenuComponent } from './video-status-menu.component';
 
 @Component({
   selector: 'app-studio-view',
@@ -16,6 +16,7 @@ import { ALL_VIDEO_STATUSES } from '../../core/ui/status';
     VideoPlayerComponent,
     TimelineComponent,
     ChunksPanelComponent,
+    VideoStatusMenuComponent,
   ],
   providers: [
     provideIcons({
@@ -35,10 +36,12 @@ import { ALL_VIDEO_STATUSES } from '../../core/ui/status';
 
       <!-- Video Header Bar -->
       <div class="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-card p-4 shadow-xs">
-        <div class="flex flex-col gap-1">
-          <h1 class="font-display font-black text-lg md:text-xl uppercase tracking-wide text-foreground">
+        <div class="flex flex-col gap-1 min-w-0">
+          <h1 class="font-display font-black text-xs uppercase tracking-wide text-muted-foreground">Chunking studio</h1>
+          <!-- The filename is data: sentence case, never uppercased (studio-adaptations) -->
+          <h2 class="font-sans font-bold text-base md:text-lg text-foreground break-all">
             {{ video ? video.name : 'Select a video from the queue' }}
-          </h1>
+          </h2>
 
           @if (video) {
             <div class="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
@@ -63,18 +66,7 @@ import { ALL_VIDEO_STATUSES } from '../../core/ui/status';
         </div>
 
         @if (video) {
-          <div class="flex items-center gap-2 text-xs">
-            <label class="font-medium text-muted-foreground">Status:</label>
-            <select
-              [value]="video.status"
-              (change)="onStatusChange(video.id, $any($event.target).value)"
-              class="h-8 rounded-md border border-input bg-background px-2.5 text-xs font-semibold text-foreground focus:ring-1 focus:ring-ring"
-            >
-              @for (s of statuses; track s.value) {
-                <option [value]="s.value">{{ s.label }}</option>
-              }
-            </select>
-          </div>
+          <app-video-status-menu [video]="video" />
         }
       </div>
 
@@ -86,13 +78,13 @@ import { ALL_VIDEO_STATUSES } from '../../core/ui/status';
 
       <!-- Filmstrip Timeline -->
       <app-timeline
-        [currentTime]="currentTime"
+        [currentTime]="currentTime()"
         (seek)="onTimelineSeek($event)"
       />
 
       <!-- Chunks Management Panel -->
       <app-chunks-panel
-        [currentTime]="currentTime"
+        [currentTime]="currentTime()"
         (seek)="onTimelineSeek($event)"
       />
     </div>
@@ -102,36 +94,29 @@ export class StudioViewComponent {
   readonly videoService = inject(VideoService);
   readonly chunkService = inject(ChunkService);
 
-  @ViewChild('player') playerRef!: VideoPlayerComponent;
+  readonly player = viewChild<VideoPlayerComponent>('player');
 
-  currentTime = 0;
+  readonly currentTime = signal(0);
   readonly formatShortTime = formatShortTime;
-  readonly statuses = ALL_VIDEO_STATUSES;
 
   constructor() {
+    // "Seek" from Curate switches to this view: wait until the player exists before consuming the request
     effect(() => {
       const seekTime = this.chunkService.requestedSeekTime();
-      if (seekTime !== null && seekTime !== undefined) {
-        this.currentTime = seekTime;
-        if (this.playerRef) {
-          this.playerRef.seek(seekTime);
-        }
-        this.chunkService.requestedSeekTime.set(null);
-      }
+      const player = this.player();
+      if (seekTime === null || seekTime === undefined) return;
+      this.currentTime.set(seekTime);
+      if (!player) return;
+      player.seek(seekTime);
+      this.chunkService.requestedSeekTime.set(null);
     });
   }
 
   onPlayerTimeChange(time: number): void {
-    this.currentTime = time;
+    this.currentTime.set(time);
   }
 
   onTimelineSeek(time: number): void {
-    if (this.playerRef) {
-      this.playerRef.seek(time);
-    }
-  }
-
-  onStatusChange(videoId: string | number, status: string): void {
-    this.videoService.updateStatus(videoId, status);
+    this.player()?.seek(time);
   }
 }

@@ -63,3 +63,36 @@ def test_characters_taxonomy_and_linter():
     res_lene = lint_prompt(lene_prompt, archetype="tags", trigger="restrained_elegance", character="lene")
     assert "lene" in res_lene["clean_prompt"].lower()
     assert "petite" in res_lene["clean_prompt"].lower()
+
+
+def test_eval_query_text_and_source_ids():
+    from pipeline.rag.evaluation import query_text
+    from pipeline.rag.indexer import extract_source_id, record_key
+
+    assert query_text("a b c d e", 3) == "a b c" and query_text("a b", 0) == "a b"
+    assert extract_source_id("vid_a_0001") == "vid_a" and extract_source_id("clip_frame_12") == "clip"
+    assert record_key({"frame_id": 7, "stem": "x"}) == "frame:7" and record_key({"frame_id": None, "stem": "x"}) == "stem:x"
+
+
+def test_rag_auto_reindex_setting_defaults_on_and_validates():
+    from pipeline.config import DEFAULT_USER_SETTINGS, validate_user_settings
+
+    assert DEFAULT_USER_SETTINGS["rag_auto_reindex"] is True
+    clean, errors, _ = validate_user_settings({"rag_auto_reindex": False})
+    assert clean == {"rag_auto_reindex": False} and not errors
+    assert validate_user_settings({"rag_auto_reindex": "yes"})[1]
+
+
+def test_rag_image_index_setting_defaults_on_and_validates():
+    from pipeline.config import DEFAULT_USER_SETTINGS, validate_user_settings
+
+    assert DEFAULT_USER_SETTINGS["rag_image_index"] is True
+    clean, errors, ignored = validate_user_settings({"rag_image_index": False})
+    assert clean == {"rag_image_index": False} and not errors and not ignored
+    assert validate_user_settings({"rag_image_index": 1})[1]
+
+
+def test_dense_mode_defaults():
+    from pipeline.rag.retriever import DEFAULT_DENSE_MODE, DENSE_MODES
+
+    assert DENSE_MODES == ("whole", "domain") and DEFAULT_DENSE_MODE == "domain"

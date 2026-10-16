@@ -87,3 +87,27 @@ export const ALL_VIDEO_STATUSES = [
   { value: 'skipped', label: 'Skipped' },
   { value: 'ignored', label: 'Ignored' },
 ] as const;
+
+export type VideoStatusValue = (typeof ALL_VIDEO_STATUSES)[number]['value'];
+
+export function videoStatusLabel(status: string | null | undefined): string {
+  return ALL_VIDEO_STATUSES.find((s) => s.value === status)?.label ?? (status || 'New');
+}
+
+/**
+ * The status the video's data implies (decision 3: "derived status"), mirroring `reconcile.py`:
+ * every approved pick exported -> `exported`; any picks -> `curating_300`; any chunks -> `chunked`; else `new`.
+ * `kept_count` stands in for the approved picks (same keep/star/non-rejected pick filter as the server).
+ * Manual states (`skipped`, `ignored`) are ignored here: "Restore" moves a skipped video back to this value.
+ */
+export function derivedVideoStatus(
+  video: Pick<Video, 'chunk_count' | 'kept_count' | 'export_count'>,
+  chunkCount: number = video.chunk_count ?? 0,
+): VideoStatusValue {
+  const kept = video.kept_count ?? 0;
+  const exported = video.export_count ?? 0;
+  if (kept > 0 && exported >= kept) return 'exported';
+  if (kept > 0) return 'curating_300';
+  if (chunkCount > 0) return 'chunked';
+  return 'new';
+}

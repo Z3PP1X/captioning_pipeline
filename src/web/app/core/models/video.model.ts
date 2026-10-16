@@ -19,6 +19,8 @@ export interface Video {
   broken_reason?: string | null;
   status: 'new' | 'chunked' | 'extracting' | 'curating' | 'curating_300' | 'captioning' | 'exported' | 'skipped' | string;
   title_hash?: string | null;
+  /** LoRA profile: 'character' gates picks on the target person, crops multi-person picks, captions in character mode. */
+  profile?: 'concept' | 'character';
   watermark_rect?: WatermarkRect | null;
   letterbox?: Record<string, number> | null;
   chunk_count?: number;

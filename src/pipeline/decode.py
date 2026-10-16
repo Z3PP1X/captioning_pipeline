@@ -13,8 +13,8 @@ def safe_decode_frames(container: av.container.Container, stream: av.video.Video
     """Safely decode frames from container stream, gracefully handling corrupted packets/frames."""
     try:
         for packet in container.demux(stream):
-            if packet.dts is None and packet.pts is None:
-                continue
+            # The last packet has neither pts nor dts: it is the flush packet. Decoding it drains the frames the
+            # decoder still buffers (B-frame reordering); skipping it lost the final frames of every video.
             try:
                 for frame in packet.decode():
                     yield frame
@@ -28,6 +28,49 @@ def safe_decode_frames(container: av.container.Container, stream: av.video.Video
         pass
 
 
+def _frame_to_bgr(frame: av.VideoFrame, max_dim: int) -> np.ndarray:
+    """Downscale in swscale (no full-resolution array for 4K sources), falling back to numpy + cv2."""
+    w, h = int(frame.width), int(frame.height)
+    if max_dim > 0 and max(w, h) > max_dim:
+        scale = max_dim / max(w, h)
+        new_w, new_h = max(16, int(round(w * scale))), max(16, int(round(h * scale)))
+        try:
+            return frame.reformat(width=new_w, height=new_h, format="bgr24", interpolation="AREA").to_ndarray()
+        except Exception:
+            img = frame.to_ndarray(format="bgr24")
+            return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return frame.to_ndarray(format="bgr24")
+
+
+def _motion_thumb(frame: av.VideoFrame) -> np.ndarray | None:
+    try:
+        return frame.reformat(width=64, height=36, format="gray").to_ndarray().astype(np.float32)
+    except Exception:
+        return None
+
+
+def pick_window_peak(members: list[dict[str, Any]], motion_weight: float = 0.5) -> dict[str, Any]:
+    """Pick the sharpest / stillest sub-sample of one window.
+
+    Each member has `sharp` (Laplacian variance) and `motion` (mean |frame difference| to the previous decoded
+    frame, grey levels; None if unknown). Both are normalised within the window, so the absolute scale of a
+    shot does not matter: score = sharp / max_sharp - motion_weight * motion / max(max_motion, 2).
+    The 2-grey-level floor keeps sensor noise in a static shot from being amplified into "motion".
+    """
+    if len(members) == 1:
+        return members[0]
+    max_sharp = max(1e-6, max(float(m["sharp"]) for m in members))
+    motions = [float(m["motion"]) for m in members if m.get("motion") is not None]
+    max_motion = max(2.0, max(motions) if motions else 0.0)
+    best, best_score = members[0], -float("inf")
+    for m in members:
+        mot = float(m["motion"]) if m.get("motion") is not None else max_motion
+        score = float(m["sharp"]) / max_sharp - motion_weight * (mot / max_motion)
+        if score > best_score:
+            best, best_score = m, score
+    return best
+
+
 def sample_chunk_frames(
     path: Path,
     start_s: float,
@@ -35,14 +78,26 @@ def sample_chunk_frames(
     sample_fps: float = 4.0,
     max_samples: int = 120,
     max_dim: int = 720,
+    window_peak: int = 0,
+    motion_weight: float = 0.5,
+    stats_out: dict[str, Any] | None = None,
 ) -> list[tuple[float, np.ndarray]]:
     """Decode frames in [start_s, end_s] sampled at sample_fps.
-    
+
     Caps candidate frame count at max_samples to prevent unbounded memory spikes
     on long scene chunks. Downscales candidates to max_dim (default 720) to maintain
     minimal RAM consumption (~100MB per chunk) while preserving full visual fidelity
     for Tier-1 quality scoring and CLIP embeddings.
+
+    `window_peak >= 2` switches to window-peak sampling (review §4 Stage B): the timeline is cut into windows
+    of one sampling interval, `window_peak` sub-samples are taken per window, and only the sharpest/stillest
+    one is kept (`pick_window_peak`). The number of returned samples is unchanged; only one window's frames are
+    held in memory. `stats_out`, if given, receives `{mode, windows, subsamples, motion: {t: energy}}`.
     """
+    if window_peak and window_peak >= 2:
+        return _sample_chunk_frames_window_peak(
+            path, start_s, end_s, sample_fps, max_samples, max_dim, int(window_peak), motion_weight, stats_out
+        )
     sampled: list[tuple[float, np.ndarray]] = []
     chunk_dur = end_s - start_s
     if chunk_dur <= 0:
@@ -88,6 +143,98 @@ def sample_chunk_frames(
                 sampled.append((round(t, 3), img_bgr))
                 next_sample_t = t + sample_interval
 
+    if stats_out is not None:
+        stats_out.update({"mode": "uniform", "windows": len(sampled), "subsamples": len(sampled)})
+    return sampled
+
+
+def _sample_chunk_frames_window_peak(
+    path: Path,
+    start_s: float,
+    end_s: float,
+    sample_fps: float,
+    max_samples: int,
+    max_dim: int,
+    oversample: int,
+    motion_weight: float,
+    stats_out: dict[str, Any] | None,
+) -> list[tuple[float, np.ndarray]]:
+    sampled: list[tuple[float, np.ndarray]] = []
+    motion_by_t: dict[float, float] = {}
+    chunk_dur = end_s - start_s
+    if chunk_dur <= 0:
+        return sampled
+
+    # Same window count as the uniform path, so the downstream budget does not change
+    if chunk_dur * sample_fps > max_samples:
+        window_s = chunk_dur / max_samples
+    else:
+        window_s = 1.0 / max(0.2, sample_fps)
+    sub_interval = window_s / oversample
+
+    window: list[dict[str, Any]] = []
+    window_idx = -1
+    windows = 0
+    subsamples = 0
+
+    def flush() -> None:
+        nonlocal windows
+        if not window:
+            return
+        best = pick_window_peak(window, motion_weight)
+        sampled.append((best["t"], best["img"]))
+        if best.get("motion") is not None:
+            motion_by_t[best["t"]] = round(float(best["motion"]), 3)
+        windows += 1
+        window.clear()
+
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        tb = stream.time_base
+        seek_pts = int(max(0.0, start_s - 0.2) / tb)
+        try:
+            container.seek(seek_pts, stream=stream, backward=True, any_frame=False)
+        except Exception:
+            pass
+
+        next_sub_t = start_s
+        prev_frame: av.VideoFrame | None = None
+        for frame in safe_decode_frames(container, stream):
+            if frame.pts is None:
+                continue
+            t = float(frame.pts * tb)
+            if t < start_s:
+                prev_frame = frame
+                continue
+            if t > end_s:
+                break
+            if t >= next_sub_t:
+                idx = min(int((t - start_s) / window_s), max(0, max_samples - 1))
+                if idx != window_idx:
+                    flush()
+                    window_idx = idx
+                img_bgr = _frame_to_bgr(frame, max_dim)
+                gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+                sharp = float(cv2.Laplacian(gray, cv2.CV_32F).var())
+                motion = None
+                if prev_frame is not None:
+                    cur_small, prev_small = _motion_thumb(frame), _motion_thumb(prev_frame)
+                    if cur_small is not None and prev_small is not None:
+                        motion = float(np.abs(cur_small - prev_small).mean())
+                window.append({"t": round(t, 3), "img": img_bgr, "sharp": sharp, "motion": motion})
+                subsamples += 1
+                next_sub_t = t + sub_interval
+            prev_frame = frame
+        flush()
+
+    if stats_out is not None:
+        stats_out.update({
+            "mode": "window_peak",
+            "windows": windows,
+            "subsamples": subsamples,
+            "window_s": round(window_s, 3),
+            "motion": motion_by_t,
+        })
     return sampled
 
 

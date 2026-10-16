@@ -24,6 +24,49 @@ def phash_hamming_distance(h1: str, h2: str) -> int:
     return bin(v1 ^ v2).count("1")
 
 
+def compute_dhash(img: np.ndarray, hash_size: int = 8) -> str:
+    """64-bit difference hash (gradient sign of a 9x8 grey thumbnail) as a 16-char hex string.
+
+    Much cheaper than the DCT pHash and robust to small exposure changes, so it runs on every raw sample
+    before metrics, face detection and CLIP. Accepts BGR or grey input.
+    """
+    gray = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    small = cv2.resize(gray, (hash_size + 1, hash_size), interpolation=cv2.INTER_AREA)
+    bits = (small[:, 1:] > small[:, :-1]).flatten()
+    val = 0
+    for b in bits:
+        val = (val << 1) | int(b)
+    return f"{val:0{hash_size * hash_size // 4}x}"
+
+
+def dhash_dedup_consecutive(
+    samples: list[tuple[float, np.ndarray]],
+    max_distance: int,
+) -> tuple[list[tuple[float, np.ndarray]], int]:
+    """Drop samples whose dHash is within `max_distance` bits of the last kept sample.
+
+    `samples` are in time order; comparing against the last *kept* sample collapses a static stretch to its
+    first frame. `max_distance <= 0` disables the pass. Returns (kept samples, number dropped).
+    """
+    if max_distance <= 0 or len(samples) < 2:
+        return list(samples), 0
+    kept: list[tuple[float, np.ndarray]] = []
+    last_hash: str | None = None
+    dropped = 0
+    for t, img in samples:
+        try:
+            h = compute_dhash(img)
+        except Exception:
+            kept.append((t, img))
+            continue
+        if last_hash is not None and phash_hamming_distance(h, last_hash) <= max_distance:
+            dropped += 1
+            continue
+        kept.append((t, img))
+        last_hash = h
+    return kept, dropped
+
+
 def compute_tier1_metrics(img_bgr: np.ndarray) -> dict:
     """Evaluate Tier-1 metrics on 512px downscaled frame (~4.5 ms per frame)."""
     h, w = img_bgr.shape[:2]

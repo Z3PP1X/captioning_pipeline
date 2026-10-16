@@ -1,69 +1,116 @@
-import { ChangeDetectionStrategy, Component, inject, output } from '@angular/core';
-import { NgIcon, provideIcons } from '@ng-icons/core';
-import { lucideCheck, lucideX, lucideAlertTriangle } from '@ng-icons/lucide';
-import { JobEventService, ToastAction } from '../../core/services/job-event.service';
-import { VideoService } from '../../core/services/video.service';
+import { ChangeDetectionStrategy, Component, DestroyRef, effect, inject, output, untracked } from '@angular/core';
+import { toast } from '@spartan-ng/brain/sonner';
+import { HlmToasterImports } from '@spartan-ng/helm/sonner';
+import { JobEventService, ToastAction, ToastNotification } from '../../core/services/job-event.service';
 
+/**
+ * Renders `JobEventService.toasts()` through the Spartan sonner (`hlm-toaster`).
+ *
+ * The service stays the single source of truth (`showToast` / `dismissToast`, auto-dismiss after 9 s, errors and
+ * `persistent` toasts stay until closed); this component only mirrors that list into the sonner store:
+ * - new entries become sonner toasts (`error` for errors, `success` when they carry an action, `info` otherwise)
+ *   with `duration: Infinity`, so the service timer decides when a toast goes away;
+ * - closing / swiping a toast calls `dismissToast`, entries removed by the service are dismissed in sonner;
+ * - a typed `ToastAction` renders as the sonner action button and is emitted via `actionRequest`
+ *   (the app shell navigates to `action.tab` and selects `action.videoId`).
+ *
+ * The sonner list is `position: fixed` with z-index 999999999, i.e. above the CDK overlay container (1000) that
+ * hosts `hlm-dialog`, so toasts stay readable over open dialogs. `expand` keeps stacked toasts fully legible.
+ */
 @Component({
   selector: 'app-toast-container',
-  imports: [NgIcon],
-  providers: [provideIcons({ lucideCheck, lucideX, lucideAlertTriangle })],
+  imports: [HlmToasterImports],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
-    <div class="fixed bottom-4 right-4 z-50 flex flex-col gap-2 max-w-sm w-full pointer-events-none select-none">
-      @for (toast of jobEvents.toasts(); track toast.id) {
-        <div
-          class="pointer-events-auto flex items-start gap-3 rounded-xl border border-border bg-card p-3 shadow-xl animate-in slide-in-from-bottom-2 text-xs"
-          [class.border-destructive]="toast.isError"
-          [class.border-primary]="!toast.isError"
-        >
-          <div
-            class="flex size-6 shrink-0 items-center justify-center rounded-full"
-            [class]="toast.isError ? 'bg-destructive/15 text-destructive' : 'bg-primary/15 text-primary'"
-          >
-            @if (toast.isError) {
-              <ng-icon name="lucideAlertTriangle" class="size-3.5" />
-            } @else {
-              <ng-icon name="lucideCheck" class="size-3.5" />
-            }
-          </div>
-
-          <div class="flex-1 flex flex-col gap-0.5">
-            <span class="font-bold text-foreground">{{ toast.title }}</span>
-            <span class="text-muted-foreground text-xs leading-tight">{{ toast.message }}</span>
-
-            @if (toast.action) {
-              <button
-                (click)="onAction(toast.action)"
-                class="mt-1 text-xs font-bold text-primary hover:underline text-left cursor-pointer"
-              >
-                {{ toast.action.label }}
-              </button>
-            }
-          </div>
-
-          <button
-            (click)="jobEvents.dismissToast(toast.id)"
-            class="text-muted-foreground hover:text-foreground cursor-pointer p-0.5"
-            title="Dismiss notification"
-          >
-            <ng-icon name="lucideX" class="size-3" />
-          </button>
-        </div>
-      }
-    </div>
+    <hlm-toaster
+      position="bottom-right"
+      [expand]="true"
+      [closeButton]="true"
+      [visibleToasts]="5"
+      [toastOptions]="toastOptions"
+    />
   `,
 })
 export class ToastContainerComponent {
   readonly jobEvents = inject(JobEventService);
-  private readonly videoService = inject(VideoService);
 
   readonly actionRequest = output<ToastAction>();
 
-  onAction(action: ToastAction): void {
-    if (action.videoId) {
-      this.videoService.selectVideo(String(action.videoId));
+  /**
+   * Surface colours come from the `hlm-toaster` CSS variables (popover / border). Ink title, muted description;
+   * errors add a destructive border and icon on top of the error icon shape (status never by colour alone).
+   */
+  protected readonly toastOptions = {
+    classes: {
+      toast: 'shadow-xl',
+      title: 'text-sm font-semibold text-foreground',
+      description: 'text-xs text-muted-foreground!',
+      error: 'border-destructive! [&_[data-icon]]:text-destructive',
+      closeButton: 'bg-popover! text-muted-foreground! hover:text-foreground! border-border!',
+    },
+  };
+
+  /** Ids currently mirrored into the sonner store. */
+  private readonly mirrored = new Set<string>();
+
+  constructor() {
+    effect(() => {
+      const list = this.jobEvents.toasts();
+      untracked(() => this.sync(list));
+    });
+
+    inject(DestroyRef).onDestroy(() => {
+      for (const id of this.mirrored) toast.dismiss(id);
+      this.mirrored.clear();
+    });
+  }
+
+  private sync(list: ToastNotification[]): void {
+    const ids = new Set(list.map((t) => t.id));
+    for (const id of Array.from(this.mirrored)) {
+      if (!ids.has(id)) {
+        this.mirrored.delete(id);
+        toast.dismiss(id);
+      }
     }
-    this.actionRequest.emit(action);
+    for (const t of list) {
+      if (this.mirrored.has(t.id)) continue;
+      this.mirrored.add(t.id);
+      this.show(t);
+    }
+  }
+
+  private show(t: ToastNotification): void {
+    // Removed by sonner itself (close button, swipe, action click): drop it from the service without
+    // dismissing again, so the sonner exit animation can finish.
+    const release = () => {
+      this.mirrored.delete(t.id);
+      this.jobEvents.dismissToast(t.id);
+    };
+    const action = t.action;
+    const options = {
+      id: t.id,
+      description: t.message,
+      duration: Number.POSITIVE_INFINITY,
+      important: !!t.isError,
+      onDismiss: release,
+      action: action
+        ? {
+            label: action.label,
+            onClick: () => {
+              this.actionRequest.emit(action);
+              release();
+            },
+          }
+        : undefined,
+    };
+    // Errors: octagon-x; finished jobs (they carry a next step): check; everything else: info
+    if (t.isError) {
+      toast.error(t.title, options);
+    } else if (action) {
+      toast.success(t.title, options);
+    } else {
+      toast.info(t.title, options);
+    }
   }
 }

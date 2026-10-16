@@ -10,6 +10,7 @@ from typing import Any
 import cv2
 import numpy as np
 
+from pipeline.captions import get_accepted_caption, import_caption
 from pipeline.config import Settings, get_settings, merged_user_settings
 from pipeline.db import DB
 
@@ -191,6 +192,29 @@ def link_or_copy(src: Path, dst: Path) -> None:
         dst.write_bytes(src.read_bytes())
 
 
+def write_caption_files(
+    text: str, per_txt: Path, merged_txt: Path | None = None, stale_sidecars: tuple[Path, ...] = ()
+) -> bool:
+    """Writes a caption from the captions table to its .txt artefact (and the merged link) when it differs.
+
+    Stub sidecars are removed: they would mark the real caption as a stub again. Returns True on change.
+    """
+    text = (text or "").strip()
+    changed = False
+    if not per_txt.is_file() or per_txt.read_text(encoding="utf-8").strip() != text:
+        per_txt.parent.mkdir(parents=True, exist_ok=True)
+        per_txt.write_text(text, encoding="utf-8")
+        changed = True
+    for stale in stale_sidecars:
+        if stale.exists():
+            stale.unlink()
+            changed = True
+    if merged_txt is not None and (changed or not merged_txt.exists()):
+        merged_txt.parent.mkdir(parents=True, exist_ok=True)
+        link_or_copy(per_txt, merged_txt)
+    return changed
+
+
 class Exporter:
     def __init__(self, db: DB, settings: Settings | None = None):
         self.db = db
@@ -255,8 +279,21 @@ class Exporter:
             per_json_path = per_video_dir / json_filename
             merged_img_path = merged_dir / img_filename
 
+            # The captions table is the source of truth: a VLM/imported row (re)writes the .txt artefact
+            db_caption = get_accepted_caption(self.db, item["id"])
+            if db_caption:
+                write_caption_files(
+                    db_caption["text"], per_txt_path, merged_dir / txt_filename,
+                    stale_sidecars=(per_json_path, merged_dir / json_filename),
+                )
+
             # Never overwrite a VLM caption: re-link it and record the export only
             has_caption = existing_caption_kind(per_txt_path) == "caption"
+            if has_caption and not db_caption:
+                # Caption file from before the captions table: adopt it as the frame's caption
+                with self.db.write() as conn:
+                    import_caption(conn, item["id"], video_id, per_txt_path.read_text(encoding="utf-8"),
+                                   source="imported", created_at=per_txt_path.stat().st_mtime)
             if has_caption and per_img_path.is_file():
                 for src_p, dst_p in [(per_img_path, merged_img_path), (per_txt_path, merged_dir / txt_filename)]:
                     if not dst_p.exists():
@@ -308,6 +345,13 @@ class Exporter:
                 chunk_tags = []
             zs = item.get("zs_scores") or {}
             frame_tags = zs.get("tags") or []
+            # User-confirmed image tags (learn-as-you-tag) lead the stub caption: they were verified by a human
+            image_tags = [r["name"] for r in self.db.all(
+                "SELECT t.name FROM frame_tags ft JOIN image_tags t ON t.id=ft.tag_id "
+                "WHERE ft.frame_id=? AND ft.status='confirmed' ORDER BY t.name",
+                (item["id"],),
+            )]
+            frame_tags = image_tags + list(frame_tags)
             from pipeline.indexer import compute_video_title_hash
             title_hash = video.get("title_hash") or compute_video_title_hash(video["name"])
             caption_parts = []
@@ -326,6 +370,10 @@ class Exporter:
 
             caption_text = ", ".join(caption_parts)
             per_txt_path.write_text(caption_text, encoding="utf-8")
+            with self.db.write() as conn:
+                # Placeholder row only: never displaces a VLM/imported caption, replaced by the caption job
+                import_caption(conn, item["id"], video_id, caption_text, source="stub",
+                               trigger=trigger_word or None, created_at=now)
 
             # JSON metadata sidecar
             meta_payload = {
@@ -340,6 +388,7 @@ class Exporter:
                 "caption_source": "stub",
                 "metrics": item.get("metrics"),
                 "zero_shot_scores": zs,
+                "image_tags": image_tags,
                 "exported_at": now,
             }
             per_json_path.write_text(json.dumps(meta_payload, indent=2), encoding="utf-8")

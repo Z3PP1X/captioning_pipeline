@@ -3,12 +3,32 @@ import { ApiService } from './api.service';
 import { ChunkItem } from '../models/chunk.model';
 import { FilmstripData } from '../models/video.model';
 import { ChunkPriority, PRIORITY_WEIGHTS } from './autopilot.service';
+import { SettingsService } from './settings.service';
+
+/** Maximum number of chunks per video (spec: "max 15 chunks"). */
+export const MAX_CHUNKS = 15;
+/** Snap-to-cut radius used when `settings.snap_window_s` is not set (spec default). */
+export const DEFAULT_SNAP_WINDOW_S = 1.5;
+
+/**
+ * Even budget split per spec: `floor(100 / n)` each, the remainder distributed +1 to the first chunks
+ * (e.g. 3 chunks -> 34/33/33, 7 chunks -> 15/15/14/14/14/14/14).
+ */
+export function evenBudgetSplit(count: number): number[] {
+  if (count <= 0) return [];
+  const share = Math.floor(100 / count);
+  const remainder = 100 % count;
+  return Array.from({ length: count }, (_, idx) => share + (idx < remainder ? 1 : 0));
+}
+
+export type AddChunkResult = 'added' | 'invalid_range' | 'max_reached';
 
 @Injectable({
   providedIn: 'root',
 })
 export class ChunkService {
   private readonly api = inject(ApiService);
+  private readonly settingsService = inject(SettingsService);
 
   readonly chunks = signal<ChunkItem[]>([]);
   readonly filmstrip = signal<FilmstripData | null>(null);
@@ -73,12 +93,8 @@ export class ChunkService {
     if (currentSum === 100) return;
 
     if (currentSum === 0) {
-      const equalShare = Math.floor(100 / count);
-      const remainder = 100 % count;
-      const updated = list.map((c, idx) => ({
-        ...c,
-        budget_pct: idx === 0 ? equalShare + remainder : equalShare,
-      }));
+      const split = evenBudgetSplit(count);
+      const updated = list.map((c, idx) => ({ ...c, budget_pct: split[idx] }));
       this.chunks.set(updated);
       this.isDirty.set(true);
       return;
@@ -121,11 +137,18 @@ export class ChunkService {
     }
   }
 
-  addChunk(start: number, end: number): boolean {
-    if (start >= end) return false;
+  /** Adds a chunk; In/Out may be given in either order (the range uses min/max per spec). */
+  addChunk(inPoint: number, outPoint: number): boolean {
+    return this.tryAddChunk(inPoint, outPoint) === 'added';
+  }
+
+  tryAddChunk(inPoint: number, outPoint: number): AddChunkResult {
+    const start = Math.min(inPoint, outPoint);
+    const end = Math.max(inPoint, outPoint);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end - start <= 0) return 'invalid_range';
     const current = this.chunks();
-    if (current.length >= 15) {
-      return false;
+    if (current.length >= MAX_CHUNKS) {
+      return 'max_reached';
     }
 
     const newChunk: ChunkItem = {
@@ -141,19 +164,15 @@ export class ChunkService {
     const updated = [...current, newChunk].sort((a, b) => a.start_s - b.start_s);
     updated.forEach((c, idx) => (c.position = idx));
 
-    // Normalize budget percentages
-    const count = updated.length;
-    const equalShare = Math.floor(100 / count);
-    const remainder = 100 % count;
-    updated.forEach((c, idx) => {
-      c.budget_pct = idx === 0 ? equalShare + remainder : equalShare;
-    });
+    // Re-normalise budgets: even split, remainder +1 to the first chunks
+    const split = evenBudgetSplit(updated.length);
+    updated.forEach((c, idx) => (c.budget_pct = split[idx]));
 
     this.chunks.set(updated);
     this.inPoint.set(null);
     this.outPoint.set(null);
     this.isDirty.set(true);
-    return true;
+    return 'added';
   }
 
   deleteChunk(index: number): void {
@@ -270,14 +289,24 @@ export class ChunkService {
     }
   }
 
-  snapTimeToCut(time: number, maxDistance = 0.5): number {
+  /** Current snap radius: `settings.snap_window_s` (default 1.5 s). */
+  snapWindow(): number {
+    const w = this.settingsService.settings().snap_window_s;
+    return typeof w === 'number' && Number.isFinite(w) && w >= 0 ? w : DEFAULT_SNAP_WINDOW_S;
+  }
+
+  /** Snaps to the nearest scene cut within the snap window (when Snap Cuts is on). */
+  snapTimeToCut(time: number, maxDistance: number = this.snapWindow()): number {
     if (!this.snapCuts()) return time;
-    const cutList = this.cuts();
-    for (const cut of cutList) {
-      if (Math.abs(cut - time) <= maxDistance) {
-        return cut;
+    let best = time;
+    let bestDist = Infinity;
+    for (const cut of this.cuts()) {
+      const dist = Math.abs(cut - time);
+      if (dist <= maxDistance && dist < bestDist) {
+        best = cut;
+        bestDist = dist;
       }
     }
-    return time;
+    return best;
   }
 }

@@ -20,6 +20,7 @@ import {
 } from '@ng-icons/lucide';
 import { HlmButtonImports } from '@spartan-ng/helm/button';
 import { HlmBadgeImports } from '@spartan-ng/helm/badge';
+import { HlmNativeSelectImports } from '@spartan-ng/helm/native-select';
 import { VideoService } from '../../core/services/video.service';
 import { JobEventService } from '../../core/services/job-event.service';
 import { formatShortTime } from '../../core/utils/time.utils';
@@ -29,7 +30,7 @@ import { videoStatusMeta, ALL_VIDEO_STATUSES, StatusMeta } from '../../core/ui/s
 
 @Component({
   selector: 'app-video-queue',
-  imports: [NgIcon, HlmButtonImports, HlmBadgeImports],
+  imports: [NgIcon, HlmButtonImports, HlmBadgeImports, HlmNativeSelectImports],
   providers: [
     provideIcons({
       lucideRefreshCw,
@@ -106,16 +107,19 @@ import { videoStatusMeta, ALL_VIDEO_STATUSES, StatusMeta } from '../../core/ui/s
 
         <!-- Status Filter & Counter -->
         <div class="flex items-center justify-between gap-2">
-          <select
+          <label for="queue-status-filter" class="sr-only">Filter by status</label>
+          <hlm-native-select
+            size="sm"
+            selectId="queue-status-filter"
+            selectClass="text-xs"
             [value]="videoService.statusFilter()"
-            (change)="onStatusChange($any($event.target).value)"
-            class="h-7 rounded-md border border-input bg-background px-2 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+            (valueChange)="onStatusChange($event ?? '')"
           >
-            <option value="">All Statuses</option>
+            <option value="">All statuses</option>
             @for (s of statuses; track s.value) {
               <option [value]="s.value">{{ s.label }}</option>
             }
-          </select>
+          </hlm-native-select>
 
           <span class="text-xs font-medium text-muted-foreground">
             {{ videoService.filteredVideos().length }} videos
@@ -155,7 +159,7 @@ import { videoStatusMeta, ALL_VIDEO_STATUSES, StatusMeta } from '../../core/ui/s
               <span
                 hlmBadge
                 [variant]="meta.variant"
-                class="shrink-0 text-[11px] gap-1 font-medium"
+                class="shrink-0 text-xs gap-1 font-medium"
               >
                 <ng-icon
                   [name]="meta.icon"
@@ -182,7 +186,7 @@ import { videoStatusMeta, ALL_VIDEO_STATUSES, StatusMeta } from '../../core/ui/s
               </span>
               @if ((video.kept_count || 0) > 0) {
                 <span class="inline-flex items-center gap-1 text-foreground font-medium">
-                  <ng-icon name="lucideListChecks" class="size-3 text-success" />
+                  <ng-icon name="lucideListChecks" class="size-3 text-success-strong" />
                   {{ video.kept_count }}/300
                 </span>
               }

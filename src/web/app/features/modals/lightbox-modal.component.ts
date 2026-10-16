@@ -1,4 +1,5 @@
-import { ChangeDetectionStrategy, Component, computed, inject, output } from '@angular/core';
+import { ChangeDetectionStrategy, Component, computed, effect, inject, output } from '@angular/core';
+import { CdkTrapFocus } from '@angular/cdk/a11y';
 import { NgIcon, provideIcons } from '@ng-icons/core';
 import {
   lucideCheck,
@@ -8,17 +9,29 @@ import {
   lucideChevronRight,
   lucideTarget,
   lucideUserPlus,
+  lucideTags,
+  lucideSparkles,
+  lucideQuote,
+  lucideScanSearch,
+  lucideLoader2,
 } from '@ng-icons/lucide';
+import { PromptRagService } from '../../core/services/prompt-rag.service';
+import { JobEventService } from '../../core/services/job-event.service';
 import { HlmButtonImports } from '@spartan-ng/helm/button';
 import { HlmBadgeImports } from '@spartan-ng/helm/badge';
 import { CurateService } from '../../core/services/curate.service';
 import { VideoService } from '../../core/services/video.service';
 import { formatTime } from '../../core/utils/time.utils';
-import { CandidateState } from '../../core/models/candidate.model';
+import { candidateChunkInfo } from '../../core/utils/chunk-fields.utils';
+import { CandidateState, CandidateFrame } from '../../core/models/candidate.model';
+import { TagService } from '../../core/services/tag.service';
+import { TagBox, TagLearnResponse } from '../../core/models/tag.model';
+import { RegionOverlayComponent, OverlayBox } from '../tags/region-overlay.component';
+import { FrameTagsPanelComponent } from '../tags/frame-tags-panel.component';
 
 @Component({
   selector: 'app-lightbox-modal',
-  imports: [NgIcon, HlmButtonImports, HlmBadgeImports],
+  imports: [CdkTrapFocus, NgIcon, HlmButtonImports, HlmBadgeImports, RegionOverlayComponent, FrameTagsPanelComponent],
   providers: [
     provideIcons({
       lucideCheck,
@@ -28,20 +41,29 @@ import { CandidateState } from '../../core/models/candidate.model';
       lucideChevronRight,
       lucideTarget,
       lucideUserPlus,
+      lucideTags,
+      lucideSparkles,
+      lucideQuote,
+      lucideScanSearch,
+      lucideLoader2,
     }),
   ],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     @if (candidate(); as c) {
       <div
-        class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-xs p-4 animate-in fade-in select-none"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Image Lightbox Preview"
+        class="fixed inset-0 z-50 flex items-center justify-center bg-secondary/80 backdrop-blur-xs p-4 animate-in fade-in select-none"
         (click)="onBackdropClick($event)"
       >
+        <!-- Custom media surface (not hlm-dialog): keeps dialog semantics and traps focus while open;
+             focus starts on the image area and returns to the opener (grid card) when the lightbox closes -->
         <div
           class="relative flex flex-col lg:flex-row max-h-[90vh] max-w-6xl w-full rounded-xl border border-border bg-card overflow-hidden shadow-2xl"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Image Lightbox Preview"
+          cdkTrapFocus
+          [cdkTrapFocusAutoCapture]="true"
           (click)="$event.stopPropagation()"
         >
           <!-- Close Button -->
@@ -55,12 +77,27 @@ import { CandidateState } from '../../core/models/candidate.model';
           </button>
 
           <!-- Main Image View & Prev/Next Arrows -->
-          <div class="relative flex-1 bg-black flex items-center justify-center min-h-[300px] lg:min-h-[500px]">
-            <img
-              [src]="getFullUrl(c)"
-              [alt]="'Full resolution frame at ' + formatTime(c.time_s)"
-              class="max-h-[85vh] max-w-full object-contain"
-            />
+          <div
+            class="relative flex-1 bg-secondary flex items-center justify-center min-h-[300px] lg:min-h-[500px] outline-none"
+            tabindex="-1"
+            cdkFocusInitial
+          >
+            <!-- The wrapper is exactly the size of the rendered image, so overlay boxes line up with it -->
+            <div class="relative inline-block max-h-[85vh] max-w-full">
+              <img
+                [src]="getFullUrl(c)"
+                [alt]="'Full resolution frame at ' + formatTime(c.time_s)"
+                class="block max-h-[85vh] max-w-full object-contain"
+                draggable="false"
+              />
+              <app-region-overlay
+                [boxes]="overlayBoxes()"
+                [drawMode]="tagService.drawMode()"
+                [pendingBox]="tagService.pendingBox()"
+                [highlightTagId]="tagService.highlightTagId()"
+                (boxDrawn)="onBoxDrawn($event)"
+              />
+            </div>
 
             <!-- Prev Arrow -->
             <button
@@ -92,7 +129,8 @@ import { CandidateState } from '../../core/models/candidate.model';
                   {{ formatTime(c.time_s) }}
                 </h4>
                 <span class="text-xs text-muted-foreground">
-                  Chunk #{{ (c.chunk_position !== undefined ? c.chunk_position + 1 : c.chunk_id) }}
+                  @let chunkPos = chunkInfo(c).position;
+                  Chunk #{{ chunkPos !== null ? chunkPos + 1 : c.chunk_id }}
                 </span>
               </div>
               <span
@@ -125,9 +163,9 @@ import { CandidateState } from '../../core/models/candidate.model';
                 aria-label="Star frame (Hotkey S)"
                 class="flex-1 cursor-pointer gap-1 font-semibold"
                 [class.ring-1]="c.state === 'star'"
-                [class.ring-warning]="c.state === 'star'"
+                [class.ring-warning-strong]="c.state === 'star'"
               >
-                <ng-icon name="lucideStar" class="size-3.5 text-warning" />
+                <ng-icon name="lucideStar" class="size-3.5 text-warning-strong" />
                 <span>Star <kbd class="text-xs">S</kbd></span>
               </button>
 
@@ -152,8 +190,9 @@ import { CandidateState } from '../../core/models/candidate.model';
                   <span>Face Recognition</span>
                 </span>
                 @if (c.target_person_matched || (c.target_person_sim && c.target_person_sim >= 0.363)) {
-                  <span hlmBadge variant="secondary" class="bg-primary/20 text-primary border border-primary/30 text-[10px] font-bold">
-                    🎯 Match ({{ Math.round((c.target_person_sim || 0) * 100) }}%)
+                  <span hlmBadge variant="secondary" class="gap-1 bg-primary/20 text-primary border border-primary/30 text-xs font-bold">
+                    <ng-icon name="lucideTarget" class="size-3" />
+                    Match ({{ Math.round((c.target_person_sim || 0) * 100) }}%)
                   </span>
                 }
               </div>
@@ -190,6 +229,38 @@ import { CandidateState } from '../../core/models/candidate.model';
                 <ng-icon name="lucideUserPlus" class="size-3.5" />
                 <span>Tag Face as Person</span>
               </button>
+            </div>
+
+            <!-- Learn-as-you-tag image tags -->
+            <app-frame-tags-panel [frameId]="c.id" (changed)="onTagsChanged(c, $event)" />
+
+            <!-- Prompt Director links: caption as description seed, or image-similar exemplars -->
+            <div class="flex flex-col gap-2 py-3 border-b border-border" role="group" aria-labelledby="lb-prompt-title">
+              <span id="lb-prompt-title" class="text-xs font-bold uppercase tracking-wider text-muted-foreground flex items-center gap-1">
+                <ng-icon name="lucideSparkles" class="size-3.5" aria-hidden="true" />
+                Prompt Director
+              </span>
+              <div class="grid grid-cols-2 gap-2">
+                <button
+                  hlmBtn
+                  variant="outline"
+                  size="sm"
+                  type="button"
+                  (click)="onUseAsSeed(c)"
+                  [disabled]="rag.isSeeding()"
+                  aria-describedby="lb-seed-help"
+                >
+                  <ng-icon [name]="rag.isSeeding() ? 'lucideLoader2' : 'lucideQuote'" class="size-3.5" [class.animate-spin]="rag.isSeeding()" aria-hidden="true" />
+                  Use as prompt seed
+                </button>
+                <button hlmBtn variant="outline" size="sm" type="button" (click)="onMoreLikeThis(c)">
+                  <ng-icon name="lucideScanSearch" class="size-3.5" aria-hidden="true" />
+                  More like this
+                </button>
+              </div>
+              <span id="lb-seed-help" class="text-xs text-muted-foreground">
+                Opens the Prompt Director with this frame's caption as the description.
+              </span>
             </div>
 
             <!-- 7-Dimension Scoring Breakdown -->
@@ -238,10 +309,80 @@ import { CandidateState } from '../../core/models/candidate.model';
 })
 export class LightboxModalComponent {
   readonly curateService = inject(CurateService);
+  readonly chunkInfo = candidateChunkInfo;
   readonly videoService = inject(VideoService);
   readonly candidate = this.curateService.currentLightboxCandidate;
 
+  readonly tagService = inject(TagService);
+
   readonly tagPerson = output<number>();
+
+  readonly rag = inject(PromptRagService);
+  private readonly jobEvents = inject(JobEventService);
+
+  private seedLabel(c: CandidateFrame): string {
+    const name = this.videoService.currentVideo()?.name;
+    return [name, formatTime(c.time_s)].filter(Boolean).join(' · ');
+  }
+
+  async onUseAsSeed(c: CandidateFrame): Promise<void> {
+    // The lightbox is an app-level overlay: close it on success, or it would stay on top of the Prompt Director
+    const error = await this.rag.useFrameAsSeed(c.id, this.seedLabel(c));
+    if (error) {
+      this.jobEvents.showToast('No prompt seed', error, null, true);
+    } else {
+      this.curateService.closeLightbox();
+    }
+  }
+
+  onMoreLikeThis(c: CandidateFrame): void {
+    this.curateService.closeLightbox();
+    this.rag.showSimilarTo(c.id, this.seedLabel(c));
+  }
+
+  /** Marked regions (solid), negative examples (dotted) and suggestions (dashed) of the open frame. */
+  readonly overlayBoxes = computed<OverlayBox[]>(() => {
+    const f = this.tagService.frameTags();
+    const c = this.candidate();
+    if (!f || !c || f.frame_id !== c.id) return [];
+    const boxes: OverlayBox[] = f.regions.map((r) => ({
+      key: `r${r.id}`,
+      tagId: r.tag_id,
+      label: r.name || '',
+      color: r.color ?? null,
+      box: r.box,
+      kind: r.polarity === 'negative' ? 'negative' : 'confirmed',
+    }));
+    for (const s of f.suggestions) {
+      if (s.box) {
+        boxes.push({ key: `s${s.tag_id}`, tagId: s.tag_id, label: s.name, color: s.color, box: s.box, kind: 'suggested', score: s.score });
+      }
+    }
+    return boxes;
+  });
+
+  constructor() {
+    // Load tags for whichever frame the lightbox shows (and reset the marking state on navigation)
+    effect(() => {
+      const c = this.candidate();
+      this.tagService.setCurrentFrame(c ? c.id : null);
+    });
+    this.tagService.loadTags().catch(() => undefined);
+  }
+
+  onBoxDrawn(box: TagBox): void {
+    this.tagService.pendingBox.set(box);
+  }
+
+  /** Mirror the frame's new tags into the curation grid without a refetch. */
+  onTagsChanged(c: CandidateFrame, res: TagLearnResponse): void {
+    const f = res.frame;
+    if (!f) return;
+    this.curateService.setFrameTags(c.id, [
+      ...f.confirmed.map((t) => ({ tag_id: t.tag_id, name: t.name, color: t.color, status: 'confirmed' as const, score: t.score })),
+      ...f.suggestions.map((t) => ({ tag_id: t.tag_id, name: t.name, color: t.color, status: 'suggested' as const, score: t.score })),
+    ]);
+  }
   readonly formatTime = formatTime;
   readonly Math = Math;
 

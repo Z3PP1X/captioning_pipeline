@@ -5,12 +5,12 @@ import {
   ElementRef,
   OnDestroy,
   OnInit,
-  ViewChild,
-  computed,
   effect,
   inject,
   output,
   signal,
+  untracked,
+  viewChild,
 } from '@angular/core';
 import { NgIcon, provideIcons } from '@ng-icons/core';
 import {
@@ -20,10 +20,14 @@ import {
   lucideChevronRight,
   lucideSparkles,
   lucideTag,
+  lucideStepBack,
+  lucideStepForward,
+  lucidePlus,
 } from '@ng-icons/lucide';
 import { HlmButtonImports } from '@spartan-ng/helm/button';
+import { HlmNativeSelectImports } from '@spartan-ng/helm/native-select';
 import { VideoService } from '../../core/services/video.service';
-import { ChunkService } from '../../core/services/chunk.service';
+import { ChunkService, MAX_CHUNKS } from '../../core/services/chunk.service';
 import { HotkeyService } from '../../core/services/hotkey.service';
 import { JobEventService } from '../../core/services/job-event.service';
 import { formatTime, formatShortTime, parseTimestamp } from '../../core/utils/time.utils';
@@ -31,7 +35,7 @@ import { WatermarkRect } from '../../core/models/video.model';
 
 @Component({
   selector: 'app-video-player',
-  imports: [NgIcon, HlmButtonImports],
+  imports: [NgIcon, HlmButtonImports, HlmNativeSelectImports],
   providers: [
     provideIcons({
       lucidePlay,
@@ -40,6 +44,9 @@ import { WatermarkRect } from '../../core/models/video.model';
       lucideChevronRight,
       lucideSparkles,
       lucideTag,
+      lucideStepBack,
+      lucideStepForward,
+      lucidePlus,
     }),
   ],
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -53,10 +60,11 @@ import { WatermarkRect } from '../../core/models/video.model';
         <video
           #videoEl
           class="max-w-full max-h-full object-contain cursor-pointer"
-          (timeupdate)="onTimeUpdate()"
+          (seeked)="onTimeUpdate()"
           (loadedmetadata)="onLoadedMetadata()"
-          (play)="isPlaying.set(true)"
-          (pause)="isPlaying.set(false)"
+          (play)="onPlay()"
+          (pause)="onPause()"
+          (ended)="onPause()"
           (click)="togglePlayPause()"
           preload="metadata"
           playsinline
@@ -187,9 +195,10 @@ import { WatermarkRect } from '../../core/models/video.model';
               size="xs"
               (click)="stepFrame(-1)"
               title="Previous frame (,)"
-              class="h-7 cursor-pointer"
+              class="h-7 cursor-pointer gap-1"
             >
-              ◀ Frame
+              <ng-icon name="lucideStepBack" class="size-3.5" aria-hidden="true" />
+              <span>Frame</span>
             </button>
             <button
               hlmBtn
@@ -197,9 +206,10 @@ import { WatermarkRect } from '../../core/models/video.model';
               size="xs"
               (click)="stepFrame(1)"
               title="Next frame (.)"
-              class="h-7 cursor-pointer"
+              class="h-7 cursor-pointer gap-1"
             >
-              Frame ▶
+              <span>Frame</span>
+              <ng-icon name="lucideStepForward" class="size-3.5" aria-hidden="true" />
             </button>
           </div>
         </div>
@@ -232,9 +242,11 @@ import { WatermarkRect } from '../../core/models/video.model';
             size="sm"
             (click)="addChunk()"
             title="Add Scene Chunk (Enter)"
-            class="cursor-pointer font-semibold"
+            class="cursor-pointer font-semibold gap-1"
           >
-            + Add Chunk <kbd class="ml-1 text-xs opacity-75">↵</kbd>
+            <ng-icon name="lucidePlus" class="size-3.5" aria-hidden="true" />
+            <span>Add Chunk</span>
+            <kbd class="ml-1 rounded border border-border px-1 text-xs font-normal text-muted-foreground">Enter</kbd>
           </button>
         </div>
 
@@ -250,20 +262,18 @@ import { WatermarkRect } from '../../core/models/video.model';
             <span>Snap Cuts <kbd class="text-xs text-muted-foreground">C</kbd></span>
           </label>
 
-          <select
-            [value]="playbackSpeed()"
-            (change)="onSpeedChange(+$any($event.target).value)"
-            class="h-7 rounded border border-input bg-background px-1.5 text-xs text-foreground focus:ring-1 focus:ring-ring"
+          <label for="player-speed" class="sr-only">Playback speed</label>
+          <hlm-native-select
+            size="sm"
+            selectId="player-speed"
+            selectClass="text-xs"
+            [value]="'' + playbackSpeed()"
+            (valueChange)="onSpeedChange(+($event || 1))"
           >
-            <option [value]="0.25">0.25×</option>
-            <option [value]="0.5">0.5×</option>
-            <option [value]="1.0">1.0×</option>
-            <option [value]="1.5">1.5×</option>
-            <option [value]="2.0">2.0×</option>
-            <option [value]="4.0">4.0×</option>
-            <option [value]="8.0">8.0×</option>
-            <option [value]="16.0">16.0×</option>
-          </select>
+            @for (s of speeds; track s) {
+              <option [value]="'' + s">{{ s }}×</option>
+            }
+          </hlm-native-select>
 
           <button
             hlmBtn
@@ -287,9 +297,10 @@ export class VideoPlayerComponent implements OnInit, AfterViewInit, OnDestroy {
   private readonly hotkeys = inject(HotkeyService);
   private readonly jobEvents = inject(JobEventService);
 
-  @ViewChild('videoEl') videoElRef!: ElementRef<HTMLVideoElement>;
-  @ViewChild('watermarkCanvas') canvasRef!: ElementRef<HTMLCanvasElement>;
-  @ViewChild('jumpInput') jumpInputRef?: ElementRef<HTMLInputElement>;
+  // Signal queries: the source-loading effect re-runs once the <video> element exists (zoneless-safe)
+  private readonly videoElRef = viewChild<ElementRef<HTMLVideoElement>>('videoEl');
+  private readonly canvasRef = viewChild<ElementRef<HTMLCanvasElement>>('watermarkCanvas');
+  private readonly jumpInputRef = viewChild<ElementRef<HTMLInputElement>>('jumpInput');
 
   readonly timeChange = output<number>();
 
@@ -300,26 +311,29 @@ export class VideoPlayerComponent implements OnInit, AfterViewInit, OnDestroy {
 
   readonly jumpInputStr = signal<string>('');
   readonly playbackSpeed = signal<number>(1.0);
+  readonly speeds = [0.25, 0.5, 1, 1.5, 2, 4, 8, 16] as const;
 
   private isDragging = false;
   private dragStartX = 0;
   private dragStartY = 0;
   private currentRect: WatermarkRect | null = null;
   private unregisterHotkeys: (() => void)[] = [];
+  private rafId: number | null = null;
 
   readonly formatTime = formatTime;
   readonly formatShortTime = formatShortTime;
 
   constructor() {
-    // When current video changes, reload source
+    // When the current video changes (or the <video> element is first rendered), load the source
     effect(() => {
       const video = this.videoService.currentVideo();
-      if (this.videoElRef && video) {
-        const el = this.videoElRef.nativeElement;
+      const ref = this.videoElRef();
+      if (ref && video) {
+        const el = ref.nativeElement;
         el.src = `/api/videos/${video.id}/stream`;
         el.load();
         this.currentRect = video.watermark_rect || null;
-        this.drawWatermarkCanvas();
+        untracked(() => this.drawWatermarkCanvas());
       }
     });
   }
@@ -327,6 +341,11 @@ export class VideoPlayerComponent implements OnInit, AfterViewInit, OnDestroy {
   ngOnInit(): void {
     this.unregisterHotkeys.push(
       this.hotkeys.register('play_pause', () => this.togglePlayPause()),
+      this.hotkeys.register('pause', () => this.videoElRef()?.nativeElement.pause()),
+      this.hotkeys.register('seek_back_2', () => this.jumpDelta(-2)),
+      this.hotkeys.register('seek_fwd_2', () => this.jumpDelta(2)),
+      this.hotkeys.register('seek_back_300', () => this.jumpDelta(-300)),
+      this.hotkeys.register('seek_fwd_300', () => this.jumpDelta(300)),
       this.hotkeys.register('frame_back', () => this.stepFrame(-1)),
       this.hotkeys.register('frame_fwd', () => this.stepFrame(1)),
       this.hotkeys.register('seek_back_1', () => this.jumpDelta(-1)),
@@ -342,8 +361,8 @@ export class VideoPlayerComponent implements OnInit, AfterViewInit, OnDestroy {
         this.chunkService.snapCuts.set(!this.chunkService.snapCuts())
       ),
       this.hotkeys.register('jump_focus', () => {
-        this.jumpInputRef?.nativeElement?.focus();
-        this.jumpInputRef?.nativeElement?.select();
+        this.jumpInputRef()?.nativeElement?.focus();
+        this.jumpInputRef()?.nativeElement?.select();
       })
     );
   }
@@ -353,20 +372,17 @@ export class VideoPlayerComponent implements OnInit, AfterViewInit, OnDestroy {
       unreg();
     }
     this.unregisterHotkeys = [];
+    this.stopPlayheadLoop();
+    this.resizeObserver?.disconnect();
   }
 
   ngAfterViewInit(): void {
-    const video = this.videoService.currentVideo();
-    if (video && this.videoElRef) {
-      const el = this.videoElRef.nativeElement;
-      el.src = `/api/videos/${video.id}/stream`;
-      el.load();
-    }
+    // The initial source is set by the effect above as soon as the view query resolves
     this.setupCanvasResize();
   }
 
   togglePlayPause(): void {
-    const el = this.videoElRef.nativeElement;
+    const el = this.videoElRef()!.nativeElement;
     if (el.paused) {
       el.play();
     } else {
@@ -374,9 +390,18 @@ export class VideoPlayerComponent implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
+  /** A seek requested before the metadata loaded (duration unknown); applied in onLoadedMetadata. */
+  private pendingSeek: number | null = null;
+
   seek(time: number): void {
-    const el = this.videoElRef.nativeElement;
+    const el = this.videoElRef()!.nativeElement;
     const dur = el.duration || this.duration();
+    if (!dur || !Number.isFinite(dur)) {
+      // Clamping to an unknown duration would jump to 0: remember the target until the metadata arrives
+      this.pendingSeek = Math.max(0, time);
+      this.currentTime.set(this.pendingSeek);
+      return;
+    }
     const clamped = Math.max(0, Math.min(dur, time));
     el.currentTime = clamped;
     this.currentTime.set(clamped);
@@ -390,7 +415,7 @@ export class VideoPlayerComponent implements OnInit, AfterViewInit, OnDestroy {
   stepFrame(dir: number): void {
     const video = this.videoService.currentVideo();
     const fps = video?.fps || 25.0;
-    const el = this.videoElRef.nativeElement;
+    const el = this.videoElRef()!.nativeElement;
     el.pause();
     this.seek(this.currentTime() + dir * (1.0 / fps));
   }
@@ -418,33 +443,75 @@ export class VideoPlayerComponent implements OnInit, AfterViewInit, OnDestroy {
   addChunk(): void {
     const inP = this.chunkService.inPoint();
     const outP = this.chunkService.outPoint();
-    if (inP !== null && outP !== null && outP > inP) {
-      this.chunkService.addChunk(inP, outP);
-    } else {
+    if (inP === null || outP === null) {
+      this.jobEvents.showToast('Mark In and Out first', 'Set an In point ([ or I) and an Out point (] or O).', null, true);
+      return;
+    }
+    // Out may be before In: the service uses min/max
+    const result = this.chunkService.tryAddChunk(inP, outP);
+    if (result === 'max_reached') {
       this.jobEvents.showToast(
-        'Invalid In/Out Points',
-        'Please set both valid In and Out points first (Out > In).',
+        'Chunk limit reached',
+        `A video can have at most ${MAX_CHUNKS} chunks. Delete or merge a chunk first.`,
         null,
         true
       );
+    } else if (result === 'invalid_range') {
+      this.jobEvents.showToast('Empty range', 'In and Out are at the same time. Move one of them first.', null, true);
     }
   }
 
   onTimeUpdate(): void {
-    const el = this.videoElRef.nativeElement;
+    const el = this.videoElRef()!.nativeElement;
+    if (this.currentTime() === el.currentTime) return;
     this.currentTime.set(el.currentTime);
     this.timeChange.emit(el.currentTime);
   }
 
+  onPlay(): void {
+    this.isPlaying.set(true);
+    this.startPlayheadLoop();
+  }
+
+  onPause(): void {
+    this.isPlaying.set(false);
+    this.stopPlayheadLoop();
+    this.onTimeUpdate();
+  }
+
+  /** F12: drive the playhead with requestAnimationFrame while playing (timeupdate fires only ~4 Hz). */
+  private startPlayheadLoop(): void {
+    if (this.rafId !== null || typeof requestAnimationFrame === 'undefined') return;
+    const tick = () => {
+      this.onTimeUpdate();
+      const el = this.videoElRef()?.nativeElement;
+      this.rafId = el && !el.paused && !el.ended ? requestAnimationFrame(tick) : null;
+    };
+    this.rafId = requestAnimationFrame(tick);
+  }
+
+  private stopPlayheadLoop(): void {
+    if (this.rafId !== null) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = null;
+    }
+  }
+
   onLoadedMetadata(): void {
-    const el = this.videoElRef.nativeElement;
+    const el = this.videoElRef()!.nativeElement;
     this.duration.set(el.duration);
+    if (this.pendingSeek !== null) {
+      const target = this.pendingSeek;
+      this.pendingSeek = null;
+      this.seek(target);
+    }
+    this.onTimeUpdate();
     this.drawWatermarkCanvas();
   }
 
   onSpeedChange(speed: number): void {
     this.playbackSpeed.set(speed);
-    this.videoElRef.nativeElement.playbackRate = speed;
+    this.videoElRef()!.nativeElement.playbackRate = speed;
   }
 
   toggleWatermarkMode(): void {
@@ -460,19 +527,21 @@ export class VideoPlayerComponent implements OnInit, AfterViewInit, OnDestroy {
     }
   }
 
+  private resizeObserver: ResizeObserver | null = null;
+
   private setupCanvasResize(): void {
-    const canvas = this.canvasRef.nativeElement;
-    const resizeObserver = new ResizeObserver(() => {
+    const canvas = this.canvasRef()!.nativeElement;
+    this.resizeObserver = new ResizeObserver(() => {
       canvas.width = canvas.clientWidth;
       canvas.height = canvas.clientHeight;
       this.drawWatermarkCanvas();
     });
-    resizeObserver.observe(canvas);
+    this.resizeObserver.observe(canvas);
   }
 
   onCanvasMouseDown(e: MouseEvent): void {
     if (!this.isDrawingWatermark()) return;
-    const rect = this.canvasRef.nativeElement.getBoundingClientRect();
+    const rect = this.canvasRef()!.nativeElement.getBoundingClientRect();
     this.isDragging = true;
     this.dragStartX = (e.clientX - rect.left) / rect.width;
     this.dragStartY = (e.clientY - rect.top) / rect.height;
@@ -480,7 +549,7 @@ export class VideoPlayerComponent implements OnInit, AfterViewInit, OnDestroy {
 
   onCanvasMouseMove(e: MouseEvent): void {
     if (!this.isDragging || !this.isDrawingWatermark()) return;
-    const rect = this.canvasRef.nativeElement.getBoundingClientRect();
+    const rect = this.canvasRef()!.nativeElement.getBoundingClientRect();
     const currentX = (e.clientX - rect.left) / rect.width;
     const currentY = (e.clientY - rect.top) / rect.height;
 
@@ -503,7 +572,7 @@ export class VideoPlayerComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   private drawWatermarkCanvas(): void {
-    const canvas = this.canvasRef?.nativeElement;
+    const canvas = this.canvasRef()?.nativeElement;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
@@ -518,12 +587,16 @@ export class VideoPlayerComponent implements OnInit, AfterViewInit, OnDestroy {
     const pw = r.width * canvas.width;
     const ph = r.height * canvas.height;
 
-    ctx.strokeStyle = '#D73816';
+    // Brand colour from the design token (no hex in code)
+    const primary = getComputedStyle(canvas).getPropertyValue('--primary').trim() || 'currentColor';
+    ctx.strokeStyle = primary;
     ctx.lineWidth = 2;
     ctx.setLineDash([4, 4]);
     ctx.strokeRect(px, py, pw, ph);
 
-    ctx.fillStyle = 'rgba(215, 56, 22, 0.15)';
+    ctx.globalAlpha = 0.15;
+    ctx.fillStyle = primary;
     ctx.fillRect(px, py, pw, ph);
+    ctx.globalAlpha = 1;
   }
 }

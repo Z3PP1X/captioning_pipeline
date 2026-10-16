@@ -172,18 +172,40 @@ class Indexer:
 
         return meta
 
+    def _cut_settings(self) -> dict[str, Any]:
+        from pipeline.config import merged_user_settings
+
+        us = merged_user_settings(self.db.get_setting("user_settings", {}))
+        return {
+            "cut_detector": us.get("cut_detector", "content"),
+            "adaptive_threshold": float(us.get("cut_adaptive_threshold", 3.0)),
+            "min_content_val": float(us.get("cut_min_content_val", 15.0)),
+            "min_scene_s": float(us.get("cut_min_scene_s", 0.5)),
+            "fade_threshold": float(us.get("cut_fade_threshold", 12.0)),
+        }
+
     def get_or_build_filmstrip(self, video_id: str, max_thumbnails: int = 120) -> dict[str, Any]:
-        """Extract keyframe thumbnails and detect scene cut markers."""
+        """Filmstrip thumbnails + scene cut markers, cached in `<filmstrip_dir>/<video>/filmstrip.json`.
+
+        `cut_detector` 'content' (default): frame-accurate cuts from one native-frame-rate pass (`cuts.py`), with
+        `transitions` (fade zones); on any failure it falls back to the legacy keyframe-histogram path, which is
+        also what 'legacy' selects. The cache is rebuilt when the requested detector or its knobs change.
+        """
         video = self.db.one("SELECT * FROM videos WHERE id=?", (video_id,))
         if not video or video.get("broken"):
             return {"thumbnails": [], "cuts": []}
 
+        cut_cfg = self._cut_settings()
         strip_dir = self.settings.filmstrip_dir / video_id
         meta_file = strip_dir / "filmstrip.json"
         if meta_file.exists():
             try:
                 data = json.loads(meta_file.read_text(encoding="utf-8"))
-                return data
+                # Files from before Phase F2 carry no `cut_config`: they were built by the legacy detector
+                stored_cfg = data.get("cut_config") or {"cut_detector": "legacy"}
+                wanted = cut_cfg if cut_cfg["cut_detector"] == "content" else {"cut_detector": "legacy"}
+                if stored_cfg == wanted:
+                    return data
             except Exception:
                 pass
 
@@ -191,7 +213,88 @@ class Indexer:
         vpath = Path(video["path"])
         if not vpath.exists():
             return {"thumbnails": [], "cuts": []}
+        for old in strip_dir.glob("thumb_*.webp"):
+            try:
+                old.unlink()
+            except OSError:
+                pass
 
+        total_duration = float(video.get("duration") or 3600.0)
+        min_interval = max(3.0, total_duration / max_thumbnails)
+        result: dict[str, Any] | None = None
+        if cut_cfg["cut_detector"] == "content":
+            try:
+                result = self._build_content_filmstrip(video_id, vpath, strip_dir, min_interval, cut_cfg)
+            except Exception as e:
+                print(f"Warning: content cut detection failed for video {video_id}, using legacy cuts: {e}")
+                result = None
+        if result is None:
+            result = self._build_legacy_filmstrip(video_id, vpath, strip_dir, min_interval)
+            result["cut_detector"] = "legacy"
+            result["cut_config"] = {"cut_detector": "legacy"} if cut_cfg["cut_detector"] == "legacy" else cut_cfg
+            result.setdefault("transitions", [])
+
+        meta_file.write_text(json.dumps(result), encoding="utf-8")
+        with self.db.write() as conn:
+            conn.execute("UPDATE videos SET filmstrip_ready=1 WHERE id=?", (video_id,))
+
+        return result
+
+    @staticmethod
+    def _write_thumb(strip_dir: Path, video_id: str, idx: int, t: float, img_bgr: np.ndarray) -> dict[str, Any]:
+        thumb_path = strip_dir / f"thumb_{idx:04d}.webp"
+        th_w = 160
+        h, w = img_bgr.shape[:2]
+        if w != th_w:
+            th_h = max(16, int(h * (th_w / w)))
+            img_bgr = cv2.resize(img_bgr, (th_w, th_h), interpolation=cv2.INTER_AREA)
+        cv2.imwrite(str(thumb_path), img_bgr, [cv2.IMWRITE_WEBP_QUALITY, 75])
+        return {
+            "t": round(t, 2),
+            "file": thumb_path.name,
+            "url": f"/api/videos/{video_id}/filmstrip/{thumb_path.name}",
+        }
+
+    def _build_content_filmstrip(
+        self, video_id: str, vpath: Path, strip_dir: Path, min_interval: float, cut_cfg: dict[str, Any]
+    ) -> dict[str, Any]:
+        """One native-frame-rate pass: frame-accurate content cuts + thumbnails from the same decode."""
+        from pipeline.cuts import detect_content_cuts
+
+        thumbnails: list[dict[str, Any]] = []
+        state = {"last_t": -min_interval}
+
+        def on_frame(t: float, frame: Any) -> None:
+            if t - state["last_t"] < min_interval:
+                return
+            state["last_t"] = t
+            w, h = int(frame.width), int(frame.height)
+            th_h = max(16, int(h * (160 / max(1, w))))
+            try:
+                img = frame.reformat(width=160, height=th_h, format="bgr24").to_ndarray()
+            except Exception:
+                img = frame.to_ndarray(format="bgr24")
+            thumbnails.append(self._write_thumb(strip_dir, video_id, len(thumbnails), t, img))
+
+        res = detect_content_cuts(
+            vpath,
+            adaptive_threshold=cut_cfg["adaptive_threshold"],
+            min_content_val=cut_cfg["min_content_val"],
+            min_scene_s=cut_cfg["min_scene_s"],
+            fade_threshold=cut_cfg["fade_threshold"],
+            on_frame=on_frame,
+        )
+        return {
+            "thumbnails": thumbnails,
+            "cuts": res["cuts"],
+            "transitions": res["transitions"],
+            "cut_detector": "content",
+            "cut_config": cut_cfg,
+            "analysed_frames": res["frames"],
+        }
+
+    def _build_legacy_filmstrip(self, video_id: str, vpath: Path, strip_dir: Path, min_interval: float) -> dict[str, Any]:
+        """Keyframes only (NONKEY): histogram correlation < 0.60 between consecutive keyframes is a cut."""
         thumbnails = []
         cuts = []
         prev_hist = None
@@ -202,13 +305,8 @@ class Indexer:
                 stream.codec_context.skip_frame = "NONKEY"
                 stream.thread_type = "AUTO"
                 tb = stream.time_base
-                total_duration = float(video.get("duration") or 3600.0)
-
-                # Sample at most ~100 keyframes across the duration
-                min_interval = max(3.0, total_duration / max_thumbnails)
                 last_t = -min_interval
 
-                thumb_idx = 0
                 for frame in safe_decode_frames(container, stream):
                     if frame.pts is None:
                         continue
@@ -229,25 +327,9 @@ class Indexer:
                     # Timeline thumbnail downscaling
                     if t - last_t >= min_interval:
                         last_t = t
-                        thumb_path = strip_dir / f"thumb_{thumb_idx:04d}.webp"
-                        th_w = 160
-                        h, w = raw_bgr.shape[:2]
-                        th_h = max(16, int(h * (th_w / w)))
-                        small = cv2.resize(raw_bgr, (th_w, th_h), interpolation=cv2.INTER_AREA)
-                        cv2.imwrite(str(thumb_path), small, [cv2.IMWRITE_WEBP_QUALITY, 75])
-                        thumbnails.append({
-                            "t": round(t, 2),
-                            "file": thumb_path.name,
-                            "url": f"/api/videos/{video_id}/filmstrip/{thumb_path.name}",
-                        })
-                        thumb_idx += 1
+                        thumbnails.append(self._write_thumb(strip_dir, video_id, len(thumbnails), t, raw_bgr))
                     del raw_bgr, frame
         except Exception as e:
             print(f"Warning: Filmstrip decoding error for video {video_id}: {e}")
 
-        result = {"thumbnails": thumbnails, "cuts": cuts}
-        meta_file.write_text(json.dumps(result), encoding="utf-8")
-        with self.db.write() as conn:
-            conn.execute("UPDATE videos SET filmstrip_ready=1 WHERE id=?", (video_id,))
-
-        return result
+        return {"thumbnails": thumbnails, "cuts": cuts}

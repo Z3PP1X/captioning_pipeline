@@ -4,11 +4,14 @@ import {
   ChangeDetectionStrategy,
   Component,
   computed,
+  DestroyRef,
+  ElementRef,
   forwardRef,
   inject,
   input,
   linkedSignal,
   output,
+  untracked,
 } from '@angular/core';
 import { NG_VALUE_ACCESSOR, type ControlValueAccessor } from '@angular/forms';
 import { NgIcon, provideIcons } from '@ng-icons/core';
@@ -128,6 +131,28 @@ export class HlmNativeSelect implements ControlValueAccessor {
 
   constructor() {
     classes(() => 'group/native-select relative w-fit has-[select:disabled]:opacity-50');
+
+    // Project adaptation: `[value]` on the <select> is applied once per value change. Options rendered later
+    // (`@for` over async data, or an option whose `[value]` binding resolves after insertion) would leave the
+    // browser on the first option even though the model holds another value. Re-apply the model value whenever
+    // the projected options change, but only when a matching option exists (otherwise keep the native fallback).
+    const host = inject<ElementRef<HTMLElement>>(ElementRef).nativeElement;
+    if (typeof MutationObserver !== 'undefined') {
+      const observer = new MutationObserver(() => {
+        const el = host.querySelector('select');
+        const v = untracked(this.value);
+        if (!el || v == null || el.value === v) return;
+        if (Array.from(el.options).some((o) => o.value === v)) el.value = v;
+      });
+      observer.observe(host, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: ['value'],
+      });
+      inject(DestroyRef).onDestroy(() => observer.disconnect());
+    }
   }
 
   protected _valueChanged(event: Event): void {

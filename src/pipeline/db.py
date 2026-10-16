@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS videos (
     target_person_name TEXT,
     title_hash TEXT,
     autopilot TEXT,
+    profile TEXT NOT NULL DEFAULT 'concept',
     updated_at REAL
 );
 CREATE TABLE IF NOT EXISTS chunks (
@@ -91,9 +92,106 @@ CREATE TABLE IF NOT EXISTS video_persons (
     created_at REAL NOT NULL,
     PRIMARY KEY (video_id, person_id)
 );
+CREATE TABLE IF NOT EXISTS image_tags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL,
+    slug TEXT UNIQUE NOT NULL,
+    category TEXT NOT NULL DEFAULT 'object',
+    prompt TEXT,
+    color TEXT,
+    threshold REAL,
+    accuracy REAL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+-- User-marked regions are the learned exemplars. They outlive their frame (re-extraction deletes frames).
+CREATE TABLE IF NOT EXISTS tag_regions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tag_id INTEGER NOT NULL REFERENCES image_tags(id) ON DELETE CASCADE,
+    frame_id INTEGER REFERENCES frames(id) ON DELETE SET NULL,
+    video_id TEXT,
+    x REAL NOT NULL, y REAL NOT NULL, w REAL NOT NULL, h REAL NOT NULL,
+    polarity TEXT NOT NULL DEFAULT 'positive',
+    source TEXT NOT NULL DEFAULT 'manual',
+    -- 'context' negatives are the rest of the frame around a marked region; they go with that region
+    parent_id INTEGER REFERENCES tag_regions(id) ON DELETE CASCADE,
+    embedding BLOB NOT NULL,
+    crop_path TEXT,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_tag_regions_tag ON tag_regions(tag_id);
+CREATE INDEX IF NOT EXISTS ix_tag_regions_frame ON tag_regions(frame_id);
+CREATE TABLE IF NOT EXISTS frame_tags (
+    frame_id INTEGER NOT NULL REFERENCES frames(id) ON DELETE CASCADE,
+    tag_id INTEGER NOT NULL REFERENCES image_tags(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'suggested',
+    score REAL,
+    box TEXT,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (frame_id, tag_id)
+);
+CREATE INDEX IF NOT EXISTS ix_frame_tags_tag ON frame_tags(tag_id, status);
+-- Caption source of truth (Phase G). The .txt files under finished/ are export artefacts written from it.
+-- source: 'vlm' (caption job), 'imported' (pre-existing .txt adopted by reconcile/exporter), 'stub' (exporter tags)
+CREATE TABLE IF NOT EXISTS captions (
+    frame_id INTEGER PRIMARY KEY REFERENCES frames(id) ON DELETE CASCADE,
+    video_id TEXT,
+    text TEXT NOT NULL,
+    model TEXT,
+    layer TEXT,
+    mode TEXT,
+    prompt_version TEXT,
+    trigger TEXT,
+    word_count INTEGER,
+    cost_usd REAL,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
+    warnings TEXT,
+    finish_reason TEXT,
+    job_id INTEGER,
+    created_at REAL NOT NULL,
+    source TEXT NOT NULL DEFAULT 'vlm'
+);
+CREATE INDEX IF NOT EXISTS ix_captions_video ON captions(video_id);
+-- Phase F: every human curation action, the training signal for learned quality weights (learned_weights.py).
+-- No foreign keys on purpose: re-extraction deletes frames, the events (with their feature snapshot) must stay.
+-- action: keep|reject|star|unstar|swap_in|swap_out|bulk_keep|bulk_reject; features: JSON of the frame's
+-- score components at the time of the action.
+CREATE TABLE IF NOT EXISTS curation_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_id TEXT,
+    frame_id INTEGER,
+    chunk_id INTEGER,
+    action TEXT NOT NULL,
+    features TEXT,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_curation_events_video ON curation_events(video_id);
+CREATE INDEX IF NOT EXISTS ix_curation_events_frame ON curation_events(frame_id);
+-- Phase F2: per sampled timestamp analysis signals (analysis.py). Keyed by (video_id, t), not frame id: rows
+-- outlive re-extraction and are reused by it; the decoded samples and embeddings live in
+-- <cache>/analysis/<video_id>.npz (emb_refs names the arrays). Dropped when the video file changes.
+CREATE TABLE IF NOT EXISTS frame_features (
+    video_id TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+    t REAL NOT NULL,
+    lap_var REAL,
+    motion REAL,
+    mean_luma REAL,
+    luma_std REAL,
+    clipping REAL,
+    dhash TEXT,
+    face_count INTEGER,
+    face_summary TEXT,
+    emb_refs TEXT,
+    gates TEXT,
+    q_components TEXT,
+    updated_at REAL,
+    PRIMARY KEY (video_id, t)
+);
 """
 
-JSON_COLS = {"watermark_rect", "letterbox", "tags", "metrics", "zs_scores", "crop", "autopilot"}
+JSON_COLS = {"watermark_rect", "letterbox", "tags", "metrics", "zs_scores", "crop", "autopilot", "box",
+             "face_summary", "emb_refs", "gates", "q_components"}
 
 
 class DB:
@@ -135,6 +233,11 @@ class DB:
                     pass
             if "autopilot" not in video_cols:
                 c.execute("ALTER TABLE videos ADD COLUMN autopilot TEXT")
+            if "profile" not in video_cols:
+                c.execute("ALTER TABLE videos ADD COLUMN profile TEXT NOT NULL DEFAULT 'concept'")
+            region_cols = [r["name"] for r in c.execute("PRAGMA table_info(tag_regions)").fetchall()]
+            if "parent_id" not in region_cols:
+                c.execute("ALTER TABLE tag_regions ADD COLUMN parent_id INTEGER REFERENCES tag_regions(id) ON DELETE CASCADE")
 
             c.execute("""
             CREATE TABLE IF NOT EXISTS video_persons (

@@ -261,6 +261,8 @@ class FaceEngine:
             face_results.append({
                 "box": face_box,
                 "score": face_score,
+                # YuNet 5-point landmarks (eyes, nose, mouth corners): quality v2 derives a yaw proxy from them
+                "landmarks": f.get("landmarks") if isinstance(f, dict) else None,
                 "sim": round(f_pos_sim, 4),
                 "pos_sim": round(f_pos_sim, 4),
                 "neg_sim": round(f_neg_sim, 4),

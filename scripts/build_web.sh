@@ -2,10 +2,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 echo "Building Angular 22 + Spartan NG frontend..."
-export NG_CLI_ANALYTICS=false
-export NG_DISABLE_VERSION_CHECK=1
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export NODE_OPTIONS="--require $SCRIPT_DIR/patch_os.js --max-old-space-size=2048"
-mkdir -p "$HOME"
-echo '{"version": 1, "cli": {"analytics": false}}' > "$HOME/.angular-config.json"
-./node_modules/.bin/ng build --configuration development --progress=false
+source "$SCRIPT_DIR/ng_env.sh"
+# Production by default (what FastAPI serves); `bash scripts/build_web.sh --dev` for a fast unoptimised build
+CONFIGURATION=production
+if [ "${1:-}" = "--dev" ]; then
+  CONFIGURATION=development
+fi
+./node_modules/.bin/ng build --configuration "$CONFIGURATION" --progress=false

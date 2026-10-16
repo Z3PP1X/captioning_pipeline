@@ -1,78 +1,55 @@
-import { Injectable } from '@angular/core';
+import { HttpClient, HttpHeaders } from '@angular/common/http';
+import { Injectable, inject } from '@angular/core';
+import { firstValueFrom } from 'rxjs';
+import { toApiError } from './api-error.interceptor';
 
-/** Non-2xx response. `detail` is FastAPI's `detail` (a string, or an object such as the 409 re-chunk guard). */
-export class ApiError extends Error {
-  constructor(
-    readonly status: number,
-    readonly detail: unknown,
-    message: string,
-  ) {
-    super(message);
-    this.name = 'ApiError';
-  }
-}
+export { ApiError } from './api-error';
 
+type Method = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+
+/**
+ * Promise-based JSON client over HttpClient. Errors are ApiError (mapped centrally by `apiErrorInterceptor`;
+ * mapped here as well so the service behaves the same when HttpClient is provided without the interceptor).
+ */
 @Injectable({
   providedIn: 'root',
 })
 export class ApiService {
-  async request<T>(path: string, options: RequestInit = {}): Promise<T> {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      ...(options.headers as Record<string, string> || {}),
-    };
+  private readonly http = inject(HttpClient);
+  private readonly headers = new HttpHeaders({ 'Content-Type': 'application/json' });
 
-    const res = await fetch(path, {
-      ...options,
-      headers,
-    });
-
-    if (!res.ok) {
-      let detail: unknown = res.statusText;
-      try {
-        const errJson = await res.json();
-        if (errJson && errJson.detail) {
-          detail = errJson.detail;
-        }
-      } catch {
-        // Fallback to statusText
-      }
-      const message =
-        typeof detail === 'string'
-          ? detail
-          : String((detail as { message?: string } | null)?.message ?? '');
-      throw new ApiError(res.status, detail, message || `API request failed with status ${res.status}`);
+  async request<T>(method: Method, path: string, body?: unknown): Promise<T> {
+    try {
+      return await firstValueFrom(
+        this.http.request<T>(method, path, {
+          // Serialised here (not by HttpClient, which would send a bare string body unquoted)
+          body: body !== undefined ? JSON.stringify(body) : null,
+          headers: this.headers,
+          responseType: 'json',
+        }),
+      );
+    } catch (err) {
+      throw toApiError(err);
     }
-
-    return res.json() as Promise<T>;
   }
 
   get<T>(path: string): Promise<T> {
-    return this.request<T>(path, { method: 'GET' });
+    return this.request<T>('GET', path);
   }
 
   post<T>(path: string, body?: unknown): Promise<T> {
-    return this.request<T>(path, {
-      method: 'POST',
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
+    return this.request<T>('POST', path, body);
   }
 
   put<T>(path: string, body?: unknown): Promise<T> {
-    return this.request<T>(path, {
-      method: 'PUT',
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
+    return this.request<T>('PUT', path, body);
   }
 
   patch<T>(path: string, body?: unknown): Promise<T> {
-    return this.request<T>(path, {
-      method: 'PATCH',
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
+    return this.request<T>('PATCH', path, body);
   }
 
   delete<T>(path: string): Promise<T> {
-    return this.request<T>(path, { method: 'DELETE' });
+    return this.request<T>('DELETE', path);
   }
 }

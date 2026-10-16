@@ -15,19 +15,34 @@ import numpy as np
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from pipeline.autochunk import PRIORITIES, AutoChunker, DestructiveRechunkError
 from pipeline.autopilot import AutopilotConfig
-from pipeline.config import DEFAULT_USER_SETTINGS, Settings, VIDEO_STATUSES, get_settings, merged_user_settings
+from pipeline.config import (
+    DEFAULT_USER_SETTINGS,
+    VIDEO_STATUSES,
+    Settings,
+    get_settings,
+    merged_user_settings,
+    validate_user_settings,
+)
 from pipeline.db import DB
 from pipeline.decode import ensure_native_frame, sample_frames_at
 from pipeline.export import Exporter
 from pipeline.face import person_embedding
 from pipeline.indexer import Indexer
 from pipeline.jobs import JobConflictError, JobManager
+from pipeline.learned_weights import (
+    NotEnoughEvents,
+    active_learned_weights,
+    fit_learned_weights,
+    learned_status,
+    log_curation_events,
+    state_action,
+)
 from pipeline.openrouter import DEFAULT_CAPTION_MAX_TOKENS
 from pipeline.rag import (
     CHARACTERS,
@@ -39,9 +54,11 @@ from pipeline.rag import (
     RagRetriever,
     RagUpstreamError,
 )
+from pipeline.profiles import PROFILES, apply_character_profile, caption_mode_for, video_profile
 from pipeline.reconcile import get_video_scenes_caption_stats, reconcile_captions_and_state
 from pipeline.select import select_diverse_top_k
 from pipeline.streaming import stream_video
+from pipeline.tag_routes import build_tag_router
 
 settings = get_settings()
 db = DB(settings.db_path)
@@ -86,6 +103,10 @@ app.add_middleware(
 )
 
 
+# Learn-as-you-tag image tagging (registered before the SPA catch-all at the end of this module)
+app.include_router(build_tag_router(jobs.image_tags, jobs))
+
+
 @app.exception_handler(JobConflictError)
 def job_conflict_handler(request: Request, exc: JobConflictError):
     return JSONResponse(status_code=409, content={"detail": str(exc)})
@@ -96,6 +117,8 @@ class VideoPatch(BaseModel):
     status: str | None = None
     watermark_rect: dict[str, float] | None = None
     letterbox: dict[str, float] | None = None
+    # LoRA profile (HANDOFF decision 1): 'concept' | 'character' (identity gate + solo crops + character captions)
+    profile: str | None = None
 
 
 class ChunkItem(BaseModel):
@@ -145,6 +168,8 @@ class PickPatch(BaseModel):
     state: str | None = None  # keep, reject, star, candidate
     role: str | None = None   # pick, runner_up
     crop: dict[str, float] | None = None
+    # Demoting a pick to runner_up with rebalance=true promotes the best replacement of its chunk (like swap-frame)
+    rebalance: bool = False
 
 
 class CandidateStateRequest(BaseModel):
@@ -159,11 +184,13 @@ class OpenRouterCaptionRequest(BaseModel):
     # "none" by default: reasoning shares max_tokens with the caption and truncated it (review C3)
     reasoning_effort: str = "none"
     use_chunk_models: bool = True
-    mode: str = "concept"
+    # None = from the video's profile ('character' profile -> 'character', else the openrouter_mode setting)
+    mode: str | None = None
     trigger: str = "restrained_elegance"
     class_noun: str = "woman"
     max_tokens: int = DEFAULT_CAPTION_MAX_TOKENS
-    temperature: float = 0.80
+    # 0.3-0.5 keeps captions consistent across a dataset (Phase G); was 0.80
+    temperature: float = 0.4
     top_p: float = 0.90
 
 
@@ -354,13 +381,30 @@ def patch_video(video_id: str, patch: VideoPatch):
     if patch.letterbox is not None:
         updates.append("letterbox = ?")
         params.append(json.dumps(patch.letterbox))
+    if patch.profile is not None:
+        if patch.profile not in PROFILES:
+            raise HTTPException(status_code=400, detail=f"profile must be one of {list(PROFILES)}")
+        updates.append("profile = ?")
+        params.append(patch.profile)
 
     if updates:
         params.append(video_id)
         with db.write() as conn:
             conn.execute(f"UPDATE videos SET {', '.join(updates)} WHERE id = ?", tuple(params))
 
-    return {"video": db.one("SELECT * FROM videos WHERE id=?", (video_id,))}
+    out: dict[str, Any] = {"video": db.one("SELECT * FROM videos WHERE id=?", (video_id,))}
+    if patch.profile == "character":
+        out["profile_result"] = apply_character_profile(db, video_id)
+    return out
+
+
+@app.post("/api/videos/{video_id}/apply-profile")
+def apply_profile_endpoint(video_id: str):
+    """Re-run the character profile (identity gate + solo crops), e.g. after tagging more faces."""
+    if not db.one("SELECT id FROM videos WHERE id=?", (video_id,)):
+        raise HTTPException(status_code=404, detail="Video not found")
+    jobs._assert_no_active_job(video_id)
+    return {"video_id": video_id, "profile": video_profile(db, video_id), **apply_character_profile(db, video_id)}
 
 
 @app.get("/api/videos/{video_id}/stream")
@@ -550,6 +594,9 @@ def _re_evaluate_video_faces(video_id: str) -> dict[str, Any]:
                     "UPDATE picks SET role='runner_up', state='reject' WHERE frame_id=?",
                     (fid,),
                 )
+
+    if video_profile(db, video_id) == "character":
+        apply_character_profile(db, video_id)
 
     jobs.broadcast_event("faces_re_evaluated", {
         "video_id": video_id,
@@ -1098,7 +1145,11 @@ def trigger_extract_750(video_id: str):
     return {"job_id": job_id, "status": "queued"}
 
 
-def _enrich_frame_dict(f: dict[str, Any], exported_ids: set[int] | None = None) -> dict[str, Any]:
+def _enrich_frame_dict(
+    f: dict[str, Any],
+    exported_ids: set[int] | None = None,
+    tag_map: dict[int, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
     f["preview_url"] = f"/api/frames/{f['id']}/preview"
     f["full_url"] = f"/api/frames/{f['id']}/full"
     f["thumb_url"] = f"/api/frames/{f['id']}/preview"
@@ -1124,6 +1175,8 @@ def _enrich_frame_dict(f: dict[str, Any], exported_ids: set[int] | None = None) 
     f["target_person_matched"] = bool(zs.get("target_person_matched", False))
     f["face_count"] = int(zs.get("face_count", 0))
     f["faces"] = zs.get("faces", [])
+    if tag_map is not None:
+        f["tags"] = tag_map.get(f["id"], [])
     return f
 
 
@@ -1156,8 +1209,9 @@ def get_curation_300(video_id: str):
 
     stats = jobs.scoring_engine.compute_distribution_stats(picks)
     exported_ids = {r["frame_id"] for r in db.all("SELECT e.frame_id FROM exports e JOIN frames f ON e.frame_id=f.id WHERE f.video_id=?", (video_id,))}
+    tag_map = jobs.image_tags.video_tag_map(video_id)
     for f in picks + runners:
-        _enrich_frame_dict(f, exported_ids)
+        _enrich_frame_dict(f, exported_ids, tag_map)
 
     return {
         "video": video,
@@ -1273,6 +1327,7 @@ def swap_frame(video_id: str, req: SwapFrameRequest):
     with db.write() as conn:
         conn.execute("UPDATE picks SET role='runner_up', state='candidate' WHERE frame_id=?", (drop_id,))
         conn.execute("UPDATE picks SET role='pick', state='keep' WHERE frame_id=?", (pick_id,))
+    log_curation_events(db, [(drop_id, "swap_out"), (pick_id, "swap_in")])
 
     # Ensure swapped-in pick has native full-resolution decode (C1/H1)
     ensure_native_frame(db, pick_id)
@@ -1280,8 +1335,9 @@ def swap_frame(video_id: str, req: SwapFrameRequest):
     picks = _fetch_curation_frames(video_id, "pick")
     runners = _fetch_curation_frames(video_id, "runner_up")
     exported_ids = {r["frame_id"] for r in db.all("SELECT e.frame_id FROM exports e JOIN frames f ON e.frame_id=f.id WHERE f.video_id=?", (video_id,))}
+    tag_map = jobs.image_tags.video_tag_map(video_id)
     for f in picks + runners:
-        _enrich_frame_dict(f, exported_ids)
+        _enrich_frame_dict(f, exported_ids, tag_map)
 
     stats = jobs.scoring_engine.compute_distribution_stats(picks)
     return {
@@ -1302,8 +1358,12 @@ def trigger_caption_openrouter(video_id: str, req: OpenRouterCaptionRequest):
     vid = db.one("SELECT id FROM videos WHERE id=?", (video_id,))
     if not vid:
         raise HTTPException(status_code=404, detail="Video not found")
-    job_id = jobs.submit_openrouter_caption_job(video_id, req.model_dump())
-    return {"job_id": job_id, "status": "queued"}
+    options = req.model_dump()
+    if not options.get("mode"):
+        stored = merged_user_settings(db.get_setting("user_settings", {}))
+        options["mode"] = caption_mode_for(db, video_id, fallback=stored.get("openrouter_mode") or "concept")
+    job_id = jobs.submit_openrouter_caption_job(video_id, options)
+    return {"job_id": job_id, "status": "queued", "mode": options["mode"]}
 
 
 @app.post("/api/openrouter/batch_caption")
@@ -1415,8 +1475,9 @@ def get_video_candidates(video_id: str):
     """
     frames = db.all(query, (video_id,))
     exported_ids = {r["frame_id"] for r in db.all("SELECT e.frame_id FROM exports e JOIN frames f ON e.frame_id=f.id WHERE f.video_id=?", (video_id,))}
+    tag_map = jobs.image_tags.video_tag_map(video_id)
     for f in frames:
-        _enrich_frame_dict(f, exported_ids)
+        _enrich_frame_dict(f, exported_ids, tag_map)
 
     picks = [f for f in frames if f["is_pick"]]
     runners = [f for f in frames if not f["is_pick"]]
@@ -1448,6 +1509,7 @@ def set_candidate_state_endpoint(video_id: str, frame_id: int, req: CandidateSta
     if frame["video_id"] != video_id:
         raise HTTPException(status_code=400, detail="Frame does not belong to this video")
 
+    old_pick = db.one("SELECT state FROM picks WHERE frame_id=?", (frame_id,))
     with db.write() as conn:
         cur = conn.execute("UPDATE picks SET state=? WHERE frame_id=?", (req.state, frame_id))
         if cur.rowcount == 0:
@@ -1455,6 +1517,9 @@ def set_candidate_state_endpoint(video_id: str, frame_id: int, req: CandidateSta
                 "INSERT INTO picks (frame_id, chunk_id, role, rank, state) VALUES (?, ?, 'runner_up', 999, ?)",
                 (frame_id, frame["chunk_id"], req.state),
             )
+    action = state_action(old_pick["state"] if old_pick else None, req.state)
+    if action:
+        log_curation_events(db, [(frame_id, action)])
 
     if req.state in ("keep", "star"):
         ensure_native_frame(db, frame_id)
@@ -1464,6 +1529,7 @@ def set_candidate_state_endpoint(video_id: str, frame_id: int, req: CandidateSta
 
 @app.post("/api/videos/{video_id}/curate/keep_all")
 def bulk_keep_all_picks(video_id: str):
+    changed = _bulk_state_changes(video_id, "keep")
     with db.write() as conn:
         conn.execute(
             """
@@ -1472,11 +1538,13 @@ def bulk_keep_all_picks(video_id: str):
             """,
             (video_id,),
         )
+    log_curation_events(db, [(fid, "bulk_keep") for fid in changed])
     return {"status": "ok", "video_id": video_id}
 
 
 @app.post("/api/videos/{video_id}/curate/reject_all")
 def bulk_reject_all_picks(video_id: str):
+    changed = _bulk_state_changes(video_id, "reject")
     with db.write() as conn:
         conn.execute(
             """
@@ -1485,6 +1553,7 @@ def bulk_reject_all_picks(video_id: str):
             """,
             (video_id,),
         )
+    log_curation_events(db, [(fid, "bulk_reject") for fid in changed])
     return {"status": "ok", "video_id": video_id}
 
 
@@ -1509,8 +1578,9 @@ def get_chunk_candidates(chunk_id: int):
     """
     frames = db.all(query, (chunk_id,))
     exported_ids = {r["frame_id"] for r in db.all("SELECT e.frame_id FROM exports e JOIN frames f ON e.frame_id=f.id WHERE f.chunk_id=?", (chunk_id,))}
+    tag_map = jobs.image_tags.video_tag_map(frames[0]["video_id"]) if frames else {}
     for f in frames:
-        _enrich_frame_dict(f, exported_ids)
+        _enrich_frame_dict(f, exported_ids, tag_map)
     return {"frames": frames}
 
 
@@ -1519,6 +1589,18 @@ def update_pick(frame_id: int, patch: PickPatch):
     existing = db.one("SELECT * FROM picks WHERE frame_id=?", (frame_id,))
     if not existing:
         raise HTTPException(status_code=404, detail="Pick not found")
+    if patch.state is not None and patch.state not in ("keep", "reject", "star", "candidate"):
+        raise HTTPException(status_code=400, detail="state must be keep, reject, star or candidate")
+    if patch.role is not None and patch.role not in ("pick", "runner_up"):
+        raise HTTPException(status_code=400, detail="role must be pick or runner_up")
+
+    if patch.rebalance and patch.role == "runner_up" and existing["role"] == "pick":
+        # Keep the chunk quota: the swap demotes this frame and promotes the best runner-up of the chunk
+        frame = db.one("SELECT video_id FROM frames WHERE id=?", (frame_id,))
+        swapped = swap_frame(frame["video_id"], SwapFrameRequest(drop_frame_id=frame_id))
+        if patch.state is not None or patch.crop is not None:
+            update_pick(frame_id, PickPatch(state=patch.state, crop=patch.crop))
+        return {"pick": db.one("SELECT * FROM picks WHERE frame_id=?", (frame_id,)), "rebalanced": swapped}
 
     updates = []
     params = []
@@ -1537,6 +1619,7 @@ def update_pick(frame_id: int, patch: PickPatch):
         with db.write() as conn:
             conn.execute(f"UPDATE picks SET {', '.join(updates)} WHERE frame_id = ?", tuple(params))
 
+    _log_pick_patch(frame_id, existing, patch)
     return {"pick": db.one("SELECT * FROM picks WHERE frame_id=?", (frame_id,))}
 
 
@@ -1605,6 +1688,125 @@ def get_dataset_summary():
     }
 
 
+# ----------------------------------------------------------------------------- Captions (Phase G)
+from pipeline.captions import caption_stats as _caption_stats, get_caption as _get_caption  # noqa: E402
+from pipeline.prompts import MODES as _CAPTION_MODES, prompt_version as _prompt_version  # noqa: E402
+
+
+@app.get("/api/captions/stats")
+def get_caption_stats(video_id: str | None = None, job_id: int | None = None):
+    """Caption totals from the captions table: by source, by model/layer, by prompt version, tokens and cost."""
+    stats = _caption_stats(db, video_id=video_id, job_id=job_id)
+    stats["current_prompt_versions"] = {m: _prompt_version(m) for m in _CAPTION_MODES}
+    return stats
+
+
+@app.get("/api/frames/{frame_id}/caption")
+def get_frame_caption(frame_id: int):
+    """The frame's caption row (source of truth), or `caption: null` when it has none yet."""
+    if not db.one("SELECT id FROM frames WHERE id=?", (frame_id,)):
+        raise HTTPException(status_code=404, detail="Frame not found")
+    return {"frame_id": frame_id, "caption": _get_caption(db, frame_id)}
+
+
+# ----------------------------------------------------------------------------- Phase F: curation log, learned weights, reselect
+from pipeline.reselect import ReselectError, reselect_video  # noqa: E402
+
+
+def _bulk_state_changes(video_id: str, target_state: str) -> list[int]:
+    """Pick frames of a video whose state a bulk keep/reject would change (only those are logged)."""
+    rows = db.all(
+        """
+        SELECT p.frame_id FROM picks p JOIN frames f ON f.id = p.frame_id
+        WHERE f.video_id = ? AND p.role = 'pick' AND p.state IS NOT ?
+        """,
+        (video_id, target_state),
+    )
+    return [int(r["frame_id"]) for r in rows]
+
+
+def _log_pick_patch(frame_id: int, existing: dict[str, Any], patch: PickPatch) -> None:
+    """Curation events for a PATCH /api/picks change: role pick <-> runner_up is a swap, state a keep/reject/star."""
+    events: list[tuple[int, str]] = []
+    if patch.role is not None and patch.role != existing.get("role"):
+        events.append((frame_id, "swap_in" if patch.role == "pick" else "swap_out"))
+    if patch.state is not None:
+        action = state_action(existing.get("state"), patch.state)
+        if action:
+            events.append((frame_id, action))
+    if events:
+        log_curation_events(db, events)
+
+
+class ReselectRequest(BaseModel):
+    target_count: int | None = Field(default=None, ge=1, le=5000)
+    per_chunk_floor: int | None = Field(default=None, ge=0, le=5000)
+    per_chunk_cap: int | None = Field(default=None, ge=0, le=5000)
+    # 0 = pure quality ranking, 1 = pure coverage (facility location); default: setting reselect_diversity
+    diversity: float | None = Field(default=None, ge=0.0, le=1.0)
+    # Budget strictness when floor/cap are not given: floor = (1-e)*quota, cap = (1+e)*quota
+    elasticity: float | None = Field(default=None, ge=0.0, le=1.0)
+    # Phase F2: max share of the picks per axis (multi_person|solo|equipment|face, 0..1); default: setting
+    # reselect_axis_caps ({} = none). An empty object here disables the stored caps for this call.
+    axis_caps: dict[str, float] | None = None
+    # Skip candidates near-duplicating frames already exported from other videos; default: setting
+    cross_dataset_dedup: bool | None = None
+
+
+@app.post("/api/videos/{video_id}/reselect")
+def reselect_endpoint(video_id: str, req: ReselectRequest | None = None):
+    """Re-run only the pick/runner selection over stored frames (no decode). Same shape as curation-300 + `reselect`."""
+    if not db.one("SELECT id FROM videos WHERE id=?", (video_id,)):
+        raise HTTPException(status_code=404, detail="Video not found")
+    req = req or ReselectRequest()
+    jobs._assert_no_active_job(video_id)  # JobConflictError -> 409
+    user_settings = merged_user_settings(db.get_setting("user_settings", {}))
+    diversity = req.diversity if req.diversity is not None else float(user_settings.get("reselect_diversity", 0.5))
+    elasticity = req.elasticity if req.elasticity is not None else float(user_settings.get("reselect_elasticity", 0.2))
+    axis_caps = req.axis_caps if req.axis_caps is not None else (user_settings.get("reselect_axis_caps") or {})
+    cross_dedup = (
+        req.cross_dataset_dedup if req.cross_dataset_dedup is not None
+        else bool(user_settings.get("reselect_cross_dataset_dedup", False))
+    )
+    try:
+        report = reselect_video(
+            db,
+            video_id,
+            target_count=req.target_count,
+            per_chunk_floor=req.per_chunk_floor,
+            per_chunk_cap=req.per_chunk_cap,
+            diversity=diversity,
+            elasticity=elasticity,
+            dup_threshold=float(user_settings.get("similarity_dedup_threshold", 0.95)),
+            learned_weights=active_learned_weights(db, user_settings),
+            learned_blend=float(user_settings.get("learned_weights_blend", 0.5)),
+            before_write=lambda: jobs._assert_no_active_job(video_id),
+            axis_caps=axis_caps,
+            cross_dataset_dedup=cross_dedup,
+            embed_rows=jobs.selection_embed_rows(video_id, user_settings),
+        )
+    except ReselectError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    payload = get_curation_300(video_id)
+    payload["reselect"] = report
+    return payload
+
+
+@app.get("/api/scoring/learned-weights")
+def get_learned_weights():
+    return learned_status(db, merged_user_settings(db.get_setting("user_settings", {})))
+
+
+@app.post("/api/scoring/learned-weights/fit")
+def fit_learned_weights_endpoint():
+    user_settings = merged_user_settings(db.get_setting("user_settings", {}))
+    try:
+        fit_learned_weights(db, min_events=int(user_settings.get("learned_weights_min_events", 50)))
+    except NotEnoughEvents as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return learned_status(db, user_settings)
+
+
 # ----------------------------------------------------------------------------- Settings
 SECRET_SETTINGS = ("openrouter_api_key",)
 
@@ -1632,16 +1834,65 @@ def update_user_settings(payload: dict[str, Any]):
         # A client that never saw the secret sends it back empty; that must not wipe the stored one
         if key in payload and not str(payload[key] or "").strip():
             payload.pop(key)
-    merged.update(payload)
+    clean, errors, ignored = validate_user_settings(payload)
+    if errors:
+        raise HTTPException(status_code=400, detail={"message": "Invalid settings: " + "; ".join(errors), "errors": errors})
+    merged.update(clean)
+    if merged.get("target_curated_min", 0) > merged.get("target_curated_max", 10**9):
+        raise HTTPException(status_code=400, detail="target_curated_min must not exceed target_curated_max")
     db.set_setting("user_settings", merged)
-    return {"settings": _redact_settings(merged)}
+    return {"settings": _redact_settings(merged), "ignored_keys": ignored}
 
 
 # ----------------------------------------------------------------------------- RAG Prompt Director
+import asyncio  # noqa: E402  (RAG-only imports kept in this section)
+import logging  # noqa: E402
+import uuid  # noqa: E402
+from typing import Literal  # noqa: E402
+
+from fastapi import Query  # noqa: E402
+
+from pipeline.rag import auto_reindex as rag_auto_reindex  # noqa: E402
+from pipeline.rag.evaluation import evaluate_retrieval  # noqa: E402
+from pipeline.rag.generator import MAX_VARIATIONS, exemplar_subsets, variation_temperature  # noqa: E402
+from pipeline.rag.history import ARCHETYPE_LINT_MODES, RagHistory  # noqa: E402
+from pipeline.rag.image_embedder import embedder_for_index, load_image_bgr  # noqa: E402
+from pipeline.rag.linter import lint_prompt, token_counter_name  # noqa: E402
+from pipeline.rag.retriever import DENSE_MODES  # noqa: E402
+
+rag_logger = logging.getLogger("pipeline.api.rag")
+# History + favourites live in the main state DB (survive index rebuilds); see pipeline/rag/history.py
+rag_history = RagHistory(settings.db_path)
+RAG_BATCH_CONCURRENCY = 3
+RAG_PROMPT_MAX_CHARS = 8000
+RAG_PREVIEW_MEDIA = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
+# R1: None = server default (per-domain when the index has domain vectors, else whole caption)
+RagDenseMode = Literal["whole", "domain"]
+
+
+def _rag_auto_reindex_enabled() -> bool:
+    return bool(merged_user_settings(db.get_setting("user_settings", {})).get("rag_auto_reindex", True))
+
+
+def _rag_after_caption_job(*, job_id: int, video_id: str, captioned: int = 0) -> None:
+    """R6 hook: queue an incremental index update after a successful caption job (setting rag_auto_reindex).
+
+    ``rag_index_job`` is looked up at call time; its on_finished callback invalidates the retriever.
+    """
+    if not _rag_auto_reindex_enabled():
+        return
+    rag_index_job.request_incremental()
+    rag_logger.info("RAG incremental reindex queued after caption job %s (%s, %d captions)", job_id, video_id, captioned)
+
+
+rag_auto_reindex.register(jobs, _rag_after_caption_job)
+
+
 class RagRetrieveRequest(BaseModel):
     selected_tags: dict[str, list[str]] = Field(default_factory=dict)
     user_description: str = ""
     top_k: int = Field(default=4, ge=1, le=12)
+    dense_mode: RagDenseMode | None = None
 
 
 class RagGenerateRequest(BaseModel):
@@ -1653,18 +1904,55 @@ class RagGenerateRequest(BaseModel):
     trigger: str = "restrained_elegance"
     local_url: str | None = None
     api_key: str | None = None
+    # Batch "Generate N": variations use different exemplar subsets and jittered temperature
+    n: int = Field(default=1, ge=1, le=MAX_VARIATIONS)
+    dense_mode: RagDenseMode | None = None
 
 
 class RagIndexRequest(BaseModel):
     limit: int | None = None
+    # R6: embed only new/changed captions (full build when there is no compatible index)
+    incremental: bool = False
 
 
-def _rag_retrieve_or_empty(selected_tags: dict[str, list[str]], user_description: str, top_k: int) -> list[dict[str, Any]]:
+class RagLintRequest(BaseModel):
+    prompt: str = Field(max_length=RAG_PROMPT_MAX_CHARS)
+    # a/b/c (archetype keys) or the linter's own modes
+    archetype: Literal["a", "b", "c", "tags", "short", "dense"] = "b"
+    trigger: str = "restrained_elegance"
+    character: str | None = None
+
+
+class RagHistoryPrompts(BaseModel):
+    a: str | None = Field(default=None, max_length=RAG_PROMPT_MAX_CHARS)
+    b: str | None = Field(default=None, max_length=RAG_PROMPT_MAX_CHARS)
+    c: str | None = Field(default=None, max_length=RAG_PROMPT_MAX_CHARS)
+
+
+class RagHistoryPatch(BaseModel):
+    favorite: bool | None = None
+    # Inline edits: replaced prompts are re-linted server-side and flagged `edited`
+    prompts: RagHistoryPrompts | None = None
+
+
+def _rag_retrieve_or_empty(
+    selected_tags: dict[str, list[str]], user_description: str, top_k: int, dense_mode: str | None = None
+) -> list[dict[str, Any]]:
     """Retrieve exemplars; a missing index yields [] (the UI shows a build prompt instead of an error)."""
     try:
-        return rag_retriever.retrieve(selected_tags, user_description, top_k)
+        return rag_retriever.retrieve(selected_tags, user_description, top_k, dense_mode=dense_mode)
     except RagIndexNotReady:
         return []
+
+
+def _rag_image_index_enabled() -> bool:
+    return bool(merged_user_settings(db.get_setting("user_settings", {})).get("rag_image_index", True))
+
+
+def _rag_image_embedder_name() -> str:
+    """'siglip' | 'clip': the embedder a new image index would use (before one exists)."""
+    name = getattr(rag_index_job.image_embedder, "name", None)
+    return name if name in ("siglip", "clip") else "clip"
 
 
 def _openrouter_key(explicit: str | None) -> str:
@@ -1694,26 +1982,111 @@ def get_rag_characters():
 def get_rag_status():
     status = rag_index_job.status()
     status["openrouter_key_configured"] = bool(_openrouter_key(None))
+    if status["ready"]:
+        # Opening the Prompt Director polls this first: load the index + CLIP text model in the background
+        rag_retriever.warm_async()
+    domain_vectors = rag_retriever.has_domain_embeddings() if status["ready"] else False
+    image_index = rag_retriever.image_index_status() if status["ready"] else {
+        "ready": False, "count": 0, "embedder": None, "model": None,
+    }
+    status["retrieval"] = {
+        "fusion": "rrf",
+        "bm25": rag_retriever.lexical_ready,
+        "token_counter": token_counter_name(),
+        # R1: dense mode used when a request does not choose one ('whole' for an index without domain vectors)
+        "dense_mode": rag_retriever.effective_dense_mode(None) if status["ready"] else "whole",
+        "dense_modes": list(DENSE_MODES),
+        "domain_embeddings": domain_vectors,
+        # R3: "more like this frame" (GET /api/rag/similar)
+        "image_index": {
+            **image_index,
+            "embedder": image_index["embedder"] or _rag_image_embedder_name(),
+            "enabled": _rag_image_index_enabled(),
+        },
+    }
+    status["auto_reindex"] = _rag_auto_reindex_enabled()
     return status
 
 
 @app.post("/api/rag/index")
 def build_rag_index(req: RagIndexRequest | None = None):
-    started = rag_index_job.start(limit=req.limit if req else None)
+    req = req or RagIndexRequest()
+    started = rag_index_job.start(limit=req.limit, incremental=req.incremental)
     if not started:
         raise HTTPException(status_code=409, detail="RAG index build already running")
     return rag_index_job.status()
 
 
+@app.get("/api/rag/eval")
+def eval_rag_retrieval(
+    k: int = Query(default=4, ge=1, le=50),
+    max_queries: int = Query(default=200, ge=1, le=5000),
+    fusion: Literal["rrf", "linear"] = "rrf",
+    query_words: int = Query(default=40, ge=0, le=500),
+    dense_mode: RagDenseMode | None = None,
+):
+    """R10 retrieval metrics on the held-out val split (definitions: pipeline/rag/evaluation.py)."""
+    try:
+        result = evaluate_retrieval(
+            rag_retriever, k=k, max_queries=max_queries, fusion=fusion, query_words=query_words, dense_mode=dense_mode
+        )
+    except RagIndexNotReady:
+        raise HTTPException(status_code=404, detail="RAG index not built yet")
+    return {**result, "index": rag_index_job.index_meta() or None}
+
+
 @app.post("/api/rag/retrieve")
 def retrieve_rag_context(req: RagRetrieveRequest):
-    results = _rag_retrieve_or_empty(req.selected_tags, req.user_description, req.top_k)
-    return {"results": results, "index_ready": rag_retriever.is_ready()}
+    results = _rag_retrieve_or_empty(req.selected_tags, req.user_description, req.top_k, req.dense_mode)
+    ready = rag_retriever.is_ready()
+    return {
+        "results": results,
+        "index_ready": ready,
+        "dense_mode": rag_retriever.effective_dense_mode(req.dense_mode) if ready else req.dense_mode or "whole",
+    }
+
+
+@app.get("/api/rag/similar")
+def similar_rag_frames(frame_id: int, top_k: int = Query(default=8, ge=1, le=50)):
+    """R3 "more like this frame": indexed captions whose image is closest to the frame's image.
+
+    The frame image (``frames.full_path``, else ``preview_path``) is embedded with the embedder that built the
+    image index (SigLIP, else CLIP); the frame's own caption is excluded. 404 unknown frame or no readable image;
+    ``index_ready: false`` and no results when there is no image index.
+    """
+    frame = db.one("SELECT full_path, preview_path FROM frames WHERE id=?", (frame_id,))
+    if not frame:
+        raise HTTPException(status_code=404, detail="Frame not found")
+    image = next(
+        (img for p in (frame.get("full_path"), frame.get("preview_path"))
+         if p and (img := load_image_bgr(Path(p))) is not None),
+        None,
+    )
+    if image is None:
+        raise HTTPException(status_code=404, detail="Frame image not found on disk")
+    image_index = rag_retriever.image_index_status()
+    if not image_index["ready"]:
+        return {"results": [], "index_ready": False, "embedder": image_index["embedder"] or _rag_image_embedder_name()}
+    try:
+        embedder = embedder_for_index(rag_index_job.image_embedder, image_index["embedder"])
+        query = embedder.embed_images([image])[0]
+        results = rag_retriever.similar(query, top_k=top_k, exclude_frame_id=frame_id)
+    except RagIndexNotReady:
+        return {"results": [], "index_ready": False, "embedder": _rag_image_embedder_name()}
+    except Exception as err:  # the index's embedder cannot be loaded, or its vectors do not match
+        rag_logger.warning("RAG similar-frame search failed: %s", err)
+        raise HTTPException(status_code=503, detail=f"Image search unavailable: {err}. Rebuild the RAG index.")
+    return {"results": results, "index_ready": True, "embedder": image_index["embedder"]}
 
 
 @app.post("/api/rag/generate")
 async def generate_rag_prompts(req: RagGenerateRequest):
-    retrieved = _rag_retrieve_or_empty(req.selected_tags, req.user_description, req.top_k)
+    n = req.n
+    # Batches retrieve a larger pool so variations can draw on different exemplars
+    pool_k = min(12, req.top_k * 2) if n > 1 else req.top_k
+    pool = await asyncio.to_thread(
+        _rag_retrieve_or_empty, req.selected_tags, req.user_description, pool_k, req.dense_mode
+    )
     use_local = req.model == "local" or bool(req.local_url and req.local_url.strip())
     api_key = None if use_local else _openrouter_key(req.api_key)
     if not use_local and not api_key:
@@ -1721,20 +2094,96 @@ async def generate_rag_prompts(req: RagGenerateRequest):
             status_code=400,
             detail="OpenRouter API key missing: set OPENROUTER_API_KEY in .env, save it in the caption dialog, or use the local model.",
         )
-    try:
-        result = await rag_generator.generate(
-            retrieved_items=retrieved,
-            selected_tags=req.selected_tags,
-            user_description=req.user_description,
-            character=req.character,
-            model=req.model,
-            trigger=req.trigger,
-            api_key=api_key,
-            local_url=req.local_url if use_local else None,
-        )
-    except RagUpstreamError as err:
-        raise HTTPException(status_code=502, detail=str(err)) from err
-    return result
+
+    subsets = exemplar_subsets(len(pool), req.top_k, n)
+    semaphore = asyncio.Semaphore(RAG_BATCH_CONCURRENCY)
+
+    async def one(index: int) -> dict[str, Any]:
+        async with semaphore:
+            return await rag_generator.generate(
+                retrieved_items=[pool[j] for j in subsets[index]],
+                selected_tags=req.selected_tags,
+                user_description=req.user_description,
+                character=req.character,
+                model=req.model,
+                trigger=req.trigger,
+                api_key=api_key,
+                local_url=req.local_url if use_local else None,
+                temperature=variation_temperature(index, n),
+            )
+
+    outcomes = await asyncio.gather(*(one(i) for i in range(n)), return_exceptions=True)
+    results: list[tuple[int, dict[str, Any]]] = []
+    errors: list[str] = []
+    for index, outcome in enumerate(outcomes):
+        if isinstance(outcome, RagUpstreamError):
+            errors.append(str(outcome))
+        elif isinstance(outcome, BaseException):
+            raise outcome
+        else:
+            results.append((index, outcome))
+    if not results:
+        raise HTTPException(status_code=502, detail=errors[0])
+
+    inputs = {
+        "selected_tags": req.selected_tags,
+        "user_description": req.user_description,
+        "character": req.character,
+        "model": req.model,
+        "trigger": req.trigger,
+        "top_k": req.top_k,
+        "n": n,
+        "local_url": req.local_url if use_local else None,
+        "dense_mode": req.dense_mode,
+    }
+    batch_id = uuid.uuid4().hex
+    entries: list[dict[str, Any]] = []
+    for index, result in results:
+        try:
+            entries.append(rag_history.add(inputs, result, batch_id=batch_id, batch_index=index))
+        except sqlite3.Error as err:  # history is a convenience; never lose the generated prompts over it
+            rag_logger.warning("Could not store RAG history entry: %s", err)
+            entries.append({
+                "id": None, "created_at": time.time(), "favorite": False, "batch_id": batch_id,
+                "batch_index": index, "inputs": inputs, "result": result,
+            })
+
+    first = dict(entries[0]["result"])
+    if errors:
+        first["notices"] = [*first.get("notices", []), f"{len(errors)} of {n} variations failed: {errors[0]}"]
+    return {**first, "history_id": entries[0]["id"], "batch_id": batch_id, "variations": entries}
+
+
+@app.post("/api/rag/lint")
+def lint_rag_prompt(req: RagLintRequest):
+    mode = ARCHETYPE_LINT_MODES.get(req.archetype, req.archetype)
+    result = lint_prompt(req.prompt, archetype=mode, trigger=req.trigger, character=req.character)
+    return {**result, "archetype": mode, "token_counter": token_counter_name()}
+
+
+@app.get("/api/rag/history")
+def list_rag_history(
+    favorites: bool = False,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    return rag_history.list(favorites=favorites, limit=limit, offset=offset)
+
+
+@app.patch("/api/rag/history/{entry_id}")
+def patch_rag_history(entry_id: int, req: RagHistoryPatch):
+    prompts = {k: v for k, v in (req.prompts.model_dump() if req.prompts else {}).items() if v is not None}
+    entry = rag_history.update(entry_id, favorite=req.favorite, prompts=prompts or None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="History entry not found")
+    return entry
+
+
+@app.delete("/api/rag/history/{entry_id}")
+def delete_rag_history(entry_id: int):
+    if not rag_history.delete(entry_id):
+        raise HTTPException(status_code=404, detail="History entry not found")
+    return {"deleted": entry_id}
 
 
 @app.get("/api/rag/preview/{caption_id}")
@@ -1747,22 +2196,46 @@ def get_rag_preview(caption_id: int):
         r = conn.execute("SELECT img_rel_path FROM rag_captions WHERE id=?", (caption_id,)).fetchone()
         if not r or not r["img_rel_path"]:
             raise HTTPException(status_code=404, detail="Preview not found")
+        # Relative to the project root (exports under data/finished), or absolute (cache frames of table rows)
         full_path = settings.project_root / r["img_rel_path"]
         if not full_path.is_file():
             raise HTTPException(status_code=404, detail="Image file not found on disk")
-        return FileResponse(full_path, media_type="image/png")
+        return FileResponse(full_path, media_type=RAG_PREVIEW_MEDIA.get(full_path.suffix.lower(), "image/png"))
 
 
 # ----------------------------------------------------------------------------- Static Web
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
-DIST_DIR = WEB_DIR / "dist" / "browser"
-if not DIST_DIR.exists():
-    DIST_DIR = WEB_DIR / "dist"
+# CP_WEB_DIST points at a build elsewhere (a Docker layer, or a private build while `ng build` rewrites src/web/dist)
+DIST_CANDIDATES = tuple(
+    Path(p) for p in (os.environ.get("CP_WEB_DIST"),) if p
+) + (WEB_DIR / "dist" / "browser", WEB_DIR / "dist")
+FRONTEND_MISSING_HTML = (
+    "<!doctype html><title>Frontend not built</title>"
+    "<h1>Frontend not built</h1><p>The Angular build (<code>src/web/dist</code>) is missing or being rebuilt. "
+    "Run <code>bash scripts/build_web.sh</code> (or <code>npm run build</code>) and reload.</p>"
+)
 
-STATIC_DIR = DIST_DIR if (DIST_DIR / "index.html").exists() else WEB_DIR
 
-if STATIC_DIR.exists():
-    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+def _dist_dir() -> Path | None:
+    """The built Angular app. Resolved per request, so a rebuild is picked up without restarting the server.
+
+    The raw sources in `src/web` are never served: without a build the browser would get TypeScript and a
+    blank page (GAP report section 5).
+    """
+    for d in DIST_CANDIDATES:
+        if (d / "index.html").is_file():
+            return d
+    return None
+
+
+if _dist_dir() is None:
+    import logging
+
+    logging.getLogger("uvicorn.error").warning(
+        "Frontend build missing (%s): the UI answers 503 until `bash scripts/build_web.sh` has run", DIST_CANDIDATES[0]
+    )
+
+app.mount("/static", StaticFiles(directory=str(DIST_CANDIDATES[0]), check_dir=False), name="static")
 
 
 @app.get("/{full_path:path}")
@@ -1770,12 +2243,12 @@ def serve_spa(full_path: str):
     # Unknown API routes must 404 as JSON, not fall through to index.html (200 HTML breaks res.json())
     if full_path == "api" or full_path.startswith("api/"):
         raise HTTPException(status_code=404, detail=f"Unknown API route: /{full_path}")
+    dist = _dist_dir()
+    if dist is None:
+        return HTMLResponse(FRONTEND_MISSING_HTML, status_code=503)
     # Path params are not normalised: `..` segments (raw or %2e%2e) must not escape the web root
-    static_root = STATIC_DIR.resolve()
+    static_root = dist.resolve()
     file_path = (static_root / full_path).resolve()
     if full_path and file_path.is_relative_to(static_root) and file_path.is_file():
         return FileResponse(file_path)
-    index_file = STATIC_DIR / "index.html"
-    if index_file.exists():
-        return FileResponse(index_file)
-    return JSONResponse({"status": "API running", "web": "frontend not yet mounted"})
+    return FileResponse(dist / "index.html")

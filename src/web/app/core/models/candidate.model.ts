@@ -1,3 +1,5 @@
+import { CandidateTag } from './tag.model';
+
 export interface ScoringMetrics {
   blur_laplacian?: number;
   color_entropy?: number;
@@ -47,6 +49,8 @@ export interface CandidateFrame {
   target_person_matched?: boolean;
   face_count?: number;
   faces?: Array<{ box: [number, number, number, number]; score: number; sim: number; matched: boolean }>;
+  /** Learned image tags of the frame (confirmed by the user, or suggested by the model). */
+  tags?: CandidateTag[];
 }
 
 export interface DistributionStat {

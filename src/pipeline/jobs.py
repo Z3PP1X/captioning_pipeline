@@ -26,17 +26,42 @@ from pipeline.export import (
     link_or_copy,
     render_export_image,
     snap_to_multiple_of_16,
+    write_caption_files,
 )
-from pipeline.metrics import compute_tier1_metrics, filter_and_rank_tier1, hard_filter_check, phash_hamming_distance
+from pipeline.metrics import (
+    compute_dhash,
+    compute_tier1_metrics,
+    dhash_dedup_consecutive,
+    filter_and_rank_tier1,
+    hard_filter_check,
+    phash_hamming_distance,
+)
 from pipeline.openrouter import (
+    CASCADE_ERRORS,
     DEFAULT_CAPTION_MAX_TOKENS,
+    DEFAULT_CAPTION_TEMPERATURE,
+    DEFAULT_CAPTION_TOP_P,
     ModelRefusalError,
     OpenRouterCaptioner,
+    empty_usage,
     looks_truncated,
     normalize_reasoning_effort,
 )
+from pipeline.captions import get_accepted_caption, import_caption, record_caption
+from pipeline.prompts import normalize_mode as normalize_caption_mode, prompt_version as caption_prompt_version
 from pipeline.autopilot import Autopilot, JobContext
 from pipeline.face import FaceEngine, person_embedding
+from pipeline.image_tags import ImageTagEngine
+from pipeline.learned_weights import active_learned_weights
+from pipeline.analysis import (
+    AnalysisCache,
+    crop_signature,
+    face_summary,
+    open_analysis_cache,
+    write_frame_features,
+)
+from pipeline.embedders import Dinov2Embedder
+from pipeline.quality import IqaScorer, gate_metrics, quality_gates, raw_components
 from pipeline.scoring import ScoringEngine
 from pipeline.select import select_diverse_top_k
 from pipeline.tagger import LocalTagger
@@ -63,6 +88,11 @@ SETTLE_VIDEO_STATUS_SQL = """
 """
 
 
+def user_settings_for_mode(db: DB) -> str:
+    """The default caption mode from the user settings (`openrouter_mode`)."""
+    return merged_user_settings(db.get_setting("user_settings", {})).get("openrouter_mode") or "concept"
+
+
 class JobCancelled(Exception):
     """Raised at a job checkpoint after the user cancelled it; the job must not mutate the DB further."""
 
@@ -80,6 +110,11 @@ class JobManager:
         self.scoring_engine = ScoringEngine(self.classifier)
         self.captioner = OpenRouterCaptioner(self.settings)
         self.face_engine = FaceEngine(self.settings)
+        self.image_tags = ImageTagEngine(self.db, self.settings, self.classifier)
+        # Phase F2: optional DINOv2 selection embedder and IQA component (models load lazily, CLIP fallback)
+        self.dino = Dinov2Embedder(self.settings)
+        self.iqa = IqaScorer(self.settings)
+        self._score_lock = threading.Lock()
         self.autopilot = Autopilot(self.db, self.settings, self)
         # Dedicated decode executor (1-2 workers) and caption executor (4 workers) (C3/H4)
         self.decode_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="decode_worker")
@@ -292,6 +327,16 @@ class JobManager:
         The video keeps its status; the autopilot state tracks the stage. `ctx.then(fn)` callbacks run after
         the job row is finished, so they may queue the next job for the same video.
         """
+        return self.submit_video_task(job_type, video_id, runner, notify_autopilot=True)
+
+    def submit_video_task(
+        self,
+        job_type: str,
+        video_id: str,
+        runner: Callable[[JobContext], dict[str, Any]],
+        notify_autopilot: bool = False,
+    ) -> int:
+        """Queue a per-video job whose body is `runner(ctx)`; the video keeps its status. Holds the video lock."""
         now = time.time()
         vid = self.db.one("SELECT name FROM videos WHERE id=?", (video_id,))
         video_name = vid["name"] if vid else "Video"
@@ -305,18 +350,21 @@ class JobManager:
             job_id = cursor.lastrowid
 
         self.broadcast_event("job_queued", {"job_id": job_id, "video_id": video_id, "video_name": video_name, "chunk_id": None})
-        self.decode_executor.submit(self._run_autopilot_job, job_id, video_id, video_name, runner)
+        self.decode_executor.submit(self._run_video_task, job_id, video_id, video_name, runner, notify_autopilot)
         return job_id
 
-    def _run_autopilot_job(
+    def _run_video_task(
         self,
         job_id: int,
         video_id: str,
         video_name: str,
         runner: Callable[[JobContext], dict[str, Any]],
+        notify_autopilot: bool = False,
     ) -> None:
+        on_cancelled = self.autopilot.on_job_cancelled if notify_autopilot else (lambda _vid: None)
+        on_failed = self.autopilot.on_job_failed if notify_autopilot else (lambda _vid, _err: None)
         if not self._start_job(job_id, video_id, video_name):
-            self.autopilot.on_job_cancelled(video_id)
+            on_cancelled(video_id)
             return
 
         def progress(p: float, step: str) -> None:
@@ -341,13 +389,13 @@ class JobManager:
             })
         except JobCancelled:
             self._finish_cancelled(job_id, video_id, video_name)
-            self.autopilot.on_job_cancelled(video_id)
+            on_cancelled(video_id)
             return
         except Exception as ex:
             with self.db.write() as conn:
                 conn.execute("UPDATE jobs SET status='error', error=?, finished_at=? WHERE id=?", (str(ex), time.time(), job_id))
             self.broadcast_event("job_error", {"job_id": job_id, "video_id": video_id, "video_name": video_name, "error": str(ex)})
-            self.autopilot.on_job_failed(video_id, str(ex))
+            on_failed(video_id, str(ex))
             return
         finally:
             self._cancel_flags.discard(job_id)
@@ -356,7 +404,333 @@ class JobManager:
             try:
                 callback()
             except Exception as ex:  # a failed follow-up must not turn the finished job into an error
-                self.autopilot.on_job_failed(video_id, str(ex))
+                on_failed(video_id, str(ex))
+
+    def _sample_candidates(
+        self,
+        vpath: Path,
+        start_s: float,
+        end_s: float,
+        sample_fps: float,
+        max_samples: int,
+        user_settings: dict[str, Any],
+        sampling_stats: dict[str, Any],
+        analysis: AnalysisCache | None = None,
+    ) -> tuple[list[tuple[float, np.ndarray]], dict[float, float]]:
+        """Phase F sampling: window-peak decode (setting `window_peak_sampling`), then dHash pre-dedup of
+        consecutive near-identical samples (`dhash_dedup_max_distance`), before any metrics/faces/CLIP.
+
+        With an `analysis` cache (Phase F2, setting `reuse_analysis_cache`) only the parts of the range the cache
+        does not cover are decoded; the rest is served from `<cache>/analysis/<video>.npz`.
+
+        Accumulates `{raw_samples, dhash_dropped, window_peak, subsamples}` into `sampling_stats` and returns
+        (samples, motion energy by t; empty without window-peak sampling).
+        """
+        window_peak = bool(user_settings.get("window_peak_sampling", True))
+        oversample = int(user_settings.get("window_peak_oversample", 3)) if window_peak else 0
+        decode_stats: dict[str, Any] = {}
+        kwargs: dict[str, Any] = {"sample_fps": sample_fps, "max_samples": max_samples, "max_dim": 512}
+        if window_peak:
+            kwargs.update(window_peak=oversample, stats_out=decode_stats)
+        if analysis is not None and analysis.enabled:
+            kwargs["stats_out"] = decode_stats
+            raw = analysis.sample(sample_chunk_frames, vpath, start_s, end_s, **kwargs)
+            sampling_stats["analysis_cache"] = dict(analysis.stats)
+        else:
+            raw = sample_chunk_frames(vpath, start_s, end_s, **kwargs)
+        max_dist = int(user_settings.get("dhash_dedup_max_distance", 4))
+        kept, dropped = dhash_dedup_consecutive(list(raw), max_dist)
+        sampling_stats["raw_samples"] = sampling_stats.get("raw_samples", 0) + len(raw)
+        sampling_stats["dhash_dropped"] = sampling_stats.get("dhash_dropped", 0) + dropped
+        sampling_stats["dhash_max_distance"] = max_dist
+        sampling_stats["window_peak"] = window_peak
+        sampling_stats["subsamples"] = sampling_stats.get("subsamples", 0) + int(decode_stats.get("subsamples", len(raw)))
+        motion = decode_stats.get("motion") or {}
+        return kept, (motion if isinstance(motion, dict) else {})
+
+    def _configure_learned_scoring(self, user_settings: dict[str, Any]) -> bool:
+        """Blend fitted weights into the composite when `use_learned_weights` is on (else the default path)."""
+        try:
+            weights = active_learned_weights(self.db, user_settings)
+        except Exception:
+            weights = None
+        self.scoring_engine.configure_learned(weights, float(user_settings.get("learned_weights_blend", 0.5)))
+        return weights is not None
+
+    # ------------------------------------------------------------------ Phase F2: analysis cache / quality v2
+    def _open_analysis(self, video: dict[str, Any], user_settings: dict[str, Any]) -> AnalysisCache | None:
+        """The video's analysis cache (setting `reuse_analysis_cache`; None when off or the file is missing)."""
+        if not user_settings.get("reuse_analysis_cache", True):
+            return None
+        try:
+            cache = open_analysis_cache(self.db, self.settings.cache_dir, video["id"], video.get("path"))
+        except Exception:
+            return None
+        return cache if cache.enabled else None
+
+    @staticmethod
+    def _native_scale(video: dict[str, Any], sample_max_dim: int = 512) -> float:
+        native = max(int(video.get("width") or 0), int(video.get("height") or 0))
+        return max(1.0, native / float(sample_max_dim)) if native else 1.0
+
+    def _gate_samples(
+        self,
+        raw_samples: list[tuple[float, np.ndarray]],
+        motion_by_t: dict[float, float],
+        letterbox: Any,
+        watermark_rect: Any,
+        user_settings: dict[str, Any],
+        gate_stats: dict[str, int],
+        features: dict[float, dict[str, Any]],
+    ) -> list[tuple[float, np.ndarray, dict[str, Any]]]:
+        """Crop, tier-1 metrics and gates for one chunk's samples -> [(t, cropped image, metrics)] that pass.
+
+        Quality v2 (`quality_v2`): `quality.quality_gates` (dark / blown / clipping / letterbox-black / blur
+        relative to the chunk); otherwise the legacy absolute `hard_filter_check`. Every sample's signals and
+        gate reasons go to `features` (-> frame_features).
+        """
+        v2 = bool(user_settings.get("quality_v2", True))
+        prepared: list[tuple[float, np.ndarray, dict[str, Any]]] = []
+        for t, img_bgr in raw_samples:
+            t_val = round(float(t), 3)
+            # Pre-crop letterbox and watermark before metrics & CLIP (C5/H8/H9)
+            img_cropped = apply_letterbox_crop(img_bgr, letterbox)
+            img_cropped = apply_watermark_crop(img_cropped, watermark_rect)
+            metrics = compute_tier1_metrics(img_cropped)
+            if t_val in motion_by_t:
+                metrics["motion_energy"] = motion_by_t[t_val]
+            if v2:
+                metrics.update(gate_metrics(img_cropped))
+            prepared.append((t_val, img_cropped, metrics))
+        if v2:
+            reasons = quality_gates([m for _, _, m in prepared])
+        else:
+            reasons = []
+            for _, _, m in prepared:
+                ok, why = hard_filter_check(m, sharpness_floor=15.0)
+                reasons.append([] if ok else [why or "hard_filter"])
+        passed: list[tuple[float, np.ndarray, dict[str, Any]]] = []
+        for (t_val, img, m), why in zip(prepared, reasons):
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            features[t_val] = {
+                "t": t_val,
+                "lap_var": round(float(cv2.Laplacian(gray, cv2.CV_32F).var()), 3),
+                "motion": m.get("motion_energy"),
+                "mean_luma": m.get("mean_luma"),
+                "luma_std": m.get("contrast"),
+                "clipping": m.get("clipping"),
+                "dhash": compute_dhash(gray),
+                "gates": list(why),
+            }
+            if why:
+                for r in why:
+                    key = r if v2 else "hard_filter"
+                    gate_stats[key] = gate_stats.get(key, 0) + 1
+                continue
+            passed.append((t_val, img, m))
+        return passed
+
+    def _attach_quality_raw(
+        self,
+        cands: list[dict[str, Any]],
+        user_settings: dict[str, Any],
+        native_scale: float,
+        features: dict[float, dict[str, Any]],
+    ) -> None:
+        """Face summary for every candidate; quality-v2 raw components (`metrics.q_raw`) when v2 is on."""
+        v2 = bool(user_settings.get("quality_v2", True))
+        for c in cands:
+            m = c["metrics"]
+            feat = features.setdefault(c["t"], {"t": c["t"]})
+            feat["face_count"] = int(m.get("face_count") or 0)
+            feat["face_summary"] = face_summary(m.get("faces"), c["img_bgr"].shape, native_scale)
+            if v2:
+                m["q_raw"] = raw_components(c["img_bgr"], m, m.get("faces"), native_scale)
+
+    def _clip_model_id(self) -> str:
+        repo = getattr(self.classifier, "repo", None)
+        return repo if isinstance(repo, str) else "clip"
+
+    def _clip_embeddings(
+        self,
+        cands: list[dict[str, Any]],
+        analysis: AnalysisCache | None,
+        crop: str,
+        stats: dict[str, Any],
+    ) -> np.ndarray:
+        """CLIP embeddings, reusing the analysis cache for timestamps embedded before with the same crop."""
+        imgs = [c["img_bgr"] for c in cands]
+        ts = [c["t"] for c in cands]
+        model = self._clip_model_id()
+        cached = analysis.get_embeddings("clip", model, crop, ts) if analysis is not None else {}
+        missing = [i for i in range(len(cands)) if i not in cached]
+        emb: np.ndarray | None = None
+        if cached:
+            try:
+                rows: list[Any] = [None] * len(cands)
+                for i, v in cached.items():
+                    rows[i] = v
+                if missing:
+                    fresh = self.classifier.embed_images([imgs[i] for i in missing], batch_size=32)
+                    for i, v in zip(missing, fresh):
+                        rows[i] = v
+                emb = np.stack([np.asarray(r, dtype=np.float32) for r in rows])
+            except Exception:
+                emb = None
+        if emb is None:
+            emb = self.classifier.embed_images(imgs, batch_size=32)
+            missing = list(range(len(cands)))
+            cached = {}
+        if analysis is not None and missing:
+            try:
+                analysis.put_embeddings("clip", model, crop, [ts[i] for i in missing], np.asarray(emb)[missing])
+            except Exception:
+                pass
+        stats["clip_embeddings"] = {"computed": len(missing), "cached": len(cached)}
+        return emb
+
+    def _attach_iqa(
+        self, cands: list[dict[str, Any]], embeddings: np.ndarray, user_settings: dict[str, Any], stats: dict[str, Any]
+    ) -> None:
+        """Optional IQA component (`iqa_model`, quality v2 only) into `metrics.q_raw.iqa`."""
+        mode = str(user_settings.get("iqa_model", "off"))
+        if mode == "off" or not user_settings.get("quality_v2", True) or not cands:
+            return
+        try:
+            scores = self.iqa.score(mode, [c["img_bgr"] for c in cands], embeddings, classifier=self.classifier)
+        except Exception as exc:
+            scores, self.iqa.error = None, str(exc)
+        if scores is None:
+            stats["iqa"] = {"model": mode, "active": False, "error": self.iqa.error}
+            return
+        for c, s in zip(cands, scores):
+            c["metrics"].setdefault("q_raw", {})["iqa"] = round(float(s), 4)
+        stats["iqa"] = {"model": mode, "active": True}
+
+    def _quality_reference(self, video_id: str, exclude: tuple[float, float]) -> dict[str, list[float]]:
+        """Raw v2 components of the video's frames outside `exclude` (video-level percentiles for one chunk)."""
+        ref: dict[str, list[float]] = {}
+        for r in self.db.all(
+            "SELECT t, q_components FROM frame_features WHERE video_id=? AND q_components IS NOT NULL", (video_id,)
+        ):
+            if exclude[0] <= float(r["t"]) <= exclude[1]:
+                continue
+            raw = (r.get("q_components") or {}).get("raw") or {}
+            for k, v in raw.items():
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    ref.setdefault(k, []).append(float(v))
+        return ref
+
+    def _score_batch(
+        self,
+        cands: list[dict[str, Any]],
+        embeddings: np.ndarray,
+        target_person_emb: Any,
+        user_settings: dict[str, Any],
+        reference: dict[str, list[float]] | None = None,
+    ) -> bool:
+        """Configure learned weights + quality v2 and score, under one lock (the engine is shared by workers)."""
+        with self._score_lock:
+            learned_active = self._configure_learned_scoring(user_settings)
+            self.scoring_engine.configure_quality(bool(user_settings.get("quality_v2", True)), reference)
+            self.scoring_engine.score_candidates_batch(cands, embeddings, target_person_embedding=target_person_emb)
+        return learned_active
+
+    def _selection_embeddings(
+        self,
+        items: list[dict[str, Any]],
+        analysis: AnalysisCache | None,
+        crop: str,
+        user_settings: dict[str, Any],
+        features: dict[float, dict[str, Any]],
+        stats: dict[str, Any],
+    ) -> None:
+        """DINOv2 embeddings of the stored frames into the analysis cache (setting `selection_embedder`)."""
+        if user_settings.get("selection_embedder", "clip") != "dinov2":
+            return
+        if analysis is None:
+            stats["selection_embedder"] = {"embedder": "clip", "fallback": "analysis cache disabled"}
+            return
+        ts = [round(float(it["t"]), 3) for it in items]
+        try:
+            cached = analysis.get_embeddings("dinov2", self.dino.model_id, crop, ts)
+            missing = [i for i in range(len(items)) if i not in cached]
+            if missing:
+                if not self.dino.available():
+                    stats["selection_embedder"] = {"embedder": "clip", "fallback": self.dino.error}
+                    return
+                vecs = self.dino.embed_images([items[i]["img_bgr"] for i in missing])
+                analysis.put_embeddings("dinov2", self.dino.model_id, crop, [ts[i] for i in missing], vecs)
+        except Exception as exc:
+            stats["selection_embedder"] = {"embedder": "clip", "fallback": str(exc)}
+            return
+        for t in ts:
+            refs = features.setdefault(t, {"t": t}).setdefault("emb_refs", {})
+            refs["dinov2"] = f"analysis/{analysis.video_id}.npz#emb_dinov2"
+        stats["selection_embedder"] = {"embedder": "dinov2", "computed": len(missing), "cached": len(cached)}
+
+    def selection_embed_rows(self, video_id: str, user_settings: dict[str, Any]) -> Callable[[list[dict]], Any] | None:
+        """For reselect: a callable mapping frame rows to DINOv2 vectors (analysis cache first, then the stored
+        previews), or None when `selection_embedder` is 'clip'."""
+        if user_settings.get("selection_embedder", "clip") != "dinov2":
+            return None
+        from pipeline.embedders import selection_embeddings_for_rows
+
+        video = self.db.one("SELECT * FROM videos WHERE id=?", (video_id,)) or {"id": video_id}
+
+        def embed(rows: list[dict]) -> Any:
+            cache = self._open_analysis(video, {"reuse_analysis_cache": True})
+            crop = crop_signature(video.get("letterbox"), video.get("watermark_rect"))
+            return selection_embeddings_for_rows(rows, embedder=self.dino, cache=cache, crop=crop)
+
+        return embed
+
+    def _persist_analysis(
+        self,
+        video_id: str,
+        analysis: AnalysisCache | None,
+        features: dict[float, dict[str, Any]],
+        cands: list[dict[str, Any]],
+        stats: dict[str, Any],
+    ) -> None:
+        """Save the npz and upsert frame_features (never fails the job)."""
+        try:
+            for c in cands:
+                feat = features.setdefault(c["t"], {"t": c["t"]})
+                if analysis is not None:
+                    feat.setdefault("emb_refs", {})["clip"] = f"analysis/{video_id}.npz#emb_clip"
+                q_raw = (c.get("metrics") or {}).get("q_raw")
+                if q_raw is not None:
+                    feat["q_components"] = {"raw": q_raw, "norm": (c.get("scores") or {}).get("q_components")}
+            if analysis is not None:
+                analysis.save()
+            stats["frame_features"] = write_frame_features(self.db, video_id, list(features.values()))
+        except Exception as exc:  # pragma: no cover - defensive
+            stats["analysis_error"] = str(exc)
+
+    def _maybe_auto_suggest_tags(self, video_id: str) -> None:
+        """After an extraction: pre-tag the new frames when learned tags exist (setting `auto_suggest_tags`).
+
+        Skipped when another job (an autopilot follow-up) already holds the video; the user can run it later.
+        """
+        stored = merged_user_settings(self.db.get_setting("user_settings", {}))
+        if not stored.get("auto_suggest_tags", True):
+            return
+        if not self.db.one("SELECT 1 FROM tag_regions WHERE polarity='positive' LIMIT 1"):
+            return
+        try:
+            self.submit_tag_suggest_job(video_id)
+        except JobConflictError:
+            pass
+
+    def submit_tag_suggest_job(self, video_id: str) -> int:
+        """Embed every frame of the video as region windows and store tag suggestions (job `tag_suggest`)."""
+        def runner(ctx: JobContext) -> dict[str, Any]:
+            res = self.image_tags.suggest_for_video(video_id, on_progress=ctx.progress, check_cancel=ctx.check_cancel)
+            self.broadcast_event("tags_updated", {"video_id": video_id, **res})
+            return res
+
+        return self.submit_video_task("tag_suggest", video_id, runner)
 
     def submit_extract_750_job(self, video_id: str, options: dict[str, Any] | None = None) -> int:
         now = time.time()
@@ -452,6 +826,13 @@ class JobManager:
         # 1. Sample candidate frames per chunk (streamed at 512px with pre-crop & gates)
         all_candidates: list[dict[str, Any]] = []
         seen_cand_ts: set[float] = set()
+        sampling_stats: dict[str, Any] = {}
+        # Phase F2: analysis cache (decode once, reuse), gates and per-timestamp features
+        analysis = self._open_analysis(video, user_settings)
+        crop_sig = crop_signature(letterbox, watermark_rect)
+        gate_stats: dict[str, int] = {}
+        features: dict[float, dict[str, Any]] = {}
+        native_scale = self._native_scale(video)
 
         for idx, ch in enumerate(chunks):
             if check_cancel:
@@ -462,30 +843,25 @@ class JobManager:
             dur = max(1.0, float(ch["end_s"]) - float(ch["start_s"]))
             needed_fps = max(1.0, (chunk_n * 1.5) / dur)
 
-            raw_samples = sample_chunk_frames(
+            # Streamed at 512px to keep RAM minimal (C4/H5); window-peak + dHash pre-dedup (Phase F)
+            raw_samples, motion_by_t = self._sample_candidates(
                 vpath,
                 float(ch["start_s"]),
                 float(ch["end_s"]),
-                sample_fps=needed_fps,
-                max_samples=chunk_n * 2,
-                max_dim=512,  # Stream at 512px to keep RAM minimal (C4/H5)
+                needed_fps,
+                chunk_n * 2,
+                user_settings,
+                sampling_stats,
+                analysis,
             )
+            raw_samples = [(t, img) for t, img in raw_samples if round(float(t), 3) not in seen_cand_ts]
 
             chunk_cands: list[dict[str, Any]] = []
-            for t, img_bgr in raw_samples:
-                t_val = round(float(t), 3)
+            # Crop + metrics + hard gates (quality v2: chunk-relative) before faces/CLIP (C5/H8, Phase F2)
+            for t_val, img_cropped, metrics in self._gate_samples(
+                raw_samples, motion_by_t, letterbox, watermark_rect, user_settings, gate_stats, features
+            ):
                 if t_val in seen_cand_ts:
-                    continue
-
-                # Pre-crop letterbox and watermark before metrics & CLIP (C5/H8/H9)
-                img_cropped = apply_letterbox_crop(img_bgr, letterbox)
-                img_cropped = apply_watermark_crop(img_cropped, watermark_rect)
-
-                metrics = compute_tier1_metrics(img_cropped)
-
-                # Hard filter check (C5/H8)
-                ok, _ = hard_filter_check(metrics, sharpness_floor=15.0)
-                if not ok:
                     continue
 
                 # Intra-chunk pHash deduplication <= 4 (C5/H8)
@@ -514,7 +890,9 @@ class JobManager:
                     metrics["target_person_matched"] = False
                     metrics["negative_person_matched"] = False
                     metrics["face_count"] = len(detected_faces)
-                    metrics["faces"] = [{"box": f["box"], "score": f["score"]} for f in detected_faces]
+                    metrics["faces"] = [
+                        {"box": f["box"], "score": f["score"], "landmarks": f.get("landmarks")} for f in detected_faces
+                    ]
 
                 cand_dict = {
                     "chunk_id": ch["id"],
@@ -541,8 +919,11 @@ class JobManager:
             check_cancel()
         if on_progress:
             on_progress(0.50, f"Computing CLIP embeddings on {len(all_candidates)} filtered frames...")
+        f2_stats: dict[str, Any] = {}
+        self._attach_quality_raw(all_candidates, user_settings, native_scale, features)
         images_to_embed = [c["img_bgr"] for c in all_candidates]
-        embeddings = self.classifier.embed_images(images_to_embed, batch_size=32)
+        embeddings = self._clip_embeddings(all_candidates, analysis, crop_sig, f2_stats)
+        self._attach_iqa(all_candidates, embeddings, user_settings, f2_stats)
 
         if check_cancel:
             check_cancel()
@@ -552,9 +933,7 @@ class JobManager:
         )
         if on_progress:
             on_progress(0.68, step_desc)
-        self.scoring_engine.score_candidates_batch(
-            all_candidates, embeddings, target_person_embedding=target_person_emb
-        )
+        learned_active = self._score_batch(all_candidates, embeddings, target_person_emb, user_settings)
 
         # 3. Multi-objective reduction
         if on_progress:
@@ -594,6 +973,9 @@ class JobManager:
                 pick_path = cand_dir / f"full_c{cid}_{int(target_t * 1000)}.png"
                 cv2.imwrite(str(pick_path), native_img)
             decode_exact_frames(vpath, ts, on_frame=write_pick)
+
+        # Phase F2: DINOv2 selection embeddings of the stored frames (setting selection_embedder, cached in the npz)
+        self._selection_embeddings(all_to_store, analysis, crop_sig, user_settings, features, f2_stats)
 
         # Last cancel point: commit replaces the current frames, picks and exports.
         if check_cancel:
@@ -664,6 +1046,7 @@ class JobManager:
                     """,
                     (frame_id, item["chunk_id"], item.get("role", "pick"), item.get("rank", 0), item.get("state", "keep")),
                 )
+        self._persist_analysis(video_id, analysis, features, all_candidates, f2_stats)
 
         # 6. Local postprocessing: Deduplicate >= 95% similar images & trim to target budget (150-200)
         dedup_report = {}
@@ -700,6 +1083,12 @@ class JobManager:
             else len(picks_300)
         )
         stats["dedup_similarity"] = dedup_report
+        stats["sampling"] = sampling_stats
+        stats["dhash_dropped"] = int(sampling_stats.get("dhash_dropped", 0))
+        stats["learned_weights_active"] = learned_active
+        stats["quality_v2"] = bool(user_settings.get("quality_v2", True))
+        stats["quality_gates"] = gate_stats
+        stats.update(f2_stats)
 
         runners_count = len(runners_450)
         del all_candidates, images_to_embed, embeddings, picks_300, runners_450, saved_records
@@ -752,8 +1141,16 @@ class JobManager:
                 "stats": res.get("stats", {}),
             })
 
+            # Character profile: identity gate + solo crops on the fresh picks (no-op for 'concept')
+            try:
+                from pipeline.profiles import apply_character_profile
+
+                apply_character_profile(self.db, video_id)
+            except Exception:
+                pass  # the gate is a refinement; a failure must not turn a finished extraction into an error
             # An autopilot run continues with the similarity pass (no-op for manual extractions)
             self.autopilot.on_extract_finished(video_id)
+            self._maybe_auto_suggest_tags(video_id)
 
         except JobCancelled:
             self._finish_cancelled(job_id, video_id, video_name)
@@ -1002,29 +1399,33 @@ class JobManager:
         if check_cancel:
             check_cancel()
 
-        raw_samples = sample_chunk_frames(
+        user_settings = merged_user_settings(self.db.get_setting("user_settings", {}))
+        sampling_stats: dict[str, Any] = {}
+        # Phase F2: analysis cache, gates, per-timestamp features
+        analysis = self._open_analysis(video, user_settings)
+        crop_sig = crop_signature(letterbox, watermark_rect)
+        gate_stats: dict[str, int] = {}
+        features: dict[float, dict[str, Any]] = {}
+        native_scale = self._native_scale(video)
+        f2_stats: dict[str, Any] = {}
+        raw_samples, motion_by_t = self._sample_candidates(
             vpath,
             float(chunk["start_s"]),
             float(chunk["end_s"]),
-            sample_fps=needed_fps,
-            max_samples=target_samples * 2,
-            max_dim=512,
+            needed_fps,
+            target_samples * 2,
+            user_settings,
+            sampling_stats,
+            analysis,
         )
 
         chunk_cands: list[dict[str, Any]] = []
         seen_cand_ts: set[float] = set()
 
-        for t, img_bgr in raw_samples:
-            t_val = round(float(t), 3)
+        for t_val, img_cropped, metrics in self._gate_samples(
+            raw_samples, motion_by_t, letterbox, watermark_rect, user_settings, gate_stats, features
+        ):
             if t_val in seen_cand_ts:
-                continue
-
-            img_cropped = apply_letterbox_crop(img_bgr, letterbox)
-            img_cropped = apply_watermark_crop(img_cropped, watermark_rect)
-            metrics = compute_tier1_metrics(img_cropped)
-
-            ok, _ = hard_filter_check(metrics, sharpness_floor=15.0)
-            if not ok:
                 continue
 
             if any(phash_hamming_distance(metrics["phash"], kept["metrics"]["phash"]) <= 4 for kept in chunk_cands):
@@ -1049,7 +1450,9 @@ class JobManager:
                 metrics["target_person_matched"] = False
                 metrics["negative_person_matched"] = False
                 metrics["face_count"] = len(detected_faces)
-                metrics["faces"] = [{"box": f["box"], "score": f["score"]} for f in detected_faces]
+                metrics["faces"] = [
+                    {"box": f["box"], "score": f["score"], "landmarks": f.get("landmarks")} for f in detected_faces
+                ]
 
             cand_dict = {
                 "chunk_id": chunk_id,
@@ -1071,8 +1474,14 @@ class JobManager:
         if on_progress:
             on_progress(0.50, f"Evaluating CLIP embeddings on {len(chunk_cands)} frames...")
 
-        embeddings = self.classifier.embed_images([c["img_bgr"] for c in chunk_cands], batch_size=32)
-        self.scoring_engine.score_candidates_batch(chunk_cands, embeddings, target_person_embedding=target_person_emb)
+        self._attach_quality_raw(chunk_cands, user_settings, native_scale, features)
+        embeddings = self._clip_embeddings(chunk_cands, analysis, crop_sig, f2_stats)
+        self._attach_iqa(chunk_cands, embeddings, user_settings, f2_stats)
+        reference = (
+            self._quality_reference(video_id, (float(chunk["start_s"]), float(chunk["end_s"])))
+            if user_settings.get("quality_v2", True) else None
+        )
+        learned_active = self._score_batch(chunk_cands, embeddings, target_person_emb, user_settings, reference)
 
         if check_cancel:
             check_cancel()
@@ -1120,6 +1529,7 @@ class JobManager:
         decode_exact_frames(vpath, pick_ts, on_frame=write_pick)
 
         all_to_store = picks + runners
+        self._selection_embeddings(all_to_store, analysis, crop_sig, user_settings, features, f2_stats)
         saved_records = []
         seen_store_ts: set[float] = set()
 
@@ -1185,12 +1595,21 @@ class JobManager:
                 )
             conn.execute("UPDATE chunks SET dirty=0 WHERE id=?", (chunk_id,))
             conn.execute("UPDATE videos SET status='curating_300' WHERE id=?", (video_id,))
+        self._persist_analysis(video_id, analysis, features, chunk_cands, f2_stats)
 
         return {
             "chunk_id": chunk_id,
             "video_id": video_id,
             "picks_count": len(picks),
             "runners_count": len(runners),
+            "stats": {
+                "sampling": sampling_stats,
+                "dhash_dropped": int(sampling_stats.get("dhash_dropped", 0)),
+                "learned_weights_active": learned_active,
+                "quality_v2": bool(user_settings.get("quality_v2", True)),
+                "quality_gates": gate_stats,
+                **f2_stats,
+            },
         }
 
     def _run_extract_chunk_job(
@@ -1236,6 +1655,7 @@ class JobManager:
                 "chunk_id": chunk_id,
                 "picks_count": res.get("picks_count", 0),
                 "runners_count": res.get("runners_count", 0),
+                "stats": res.get("stats", {}),
             })
             self.broadcast_event("chunk_extracted", {
                 "video_id": video_id,
@@ -1318,27 +1738,32 @@ class JobManager:
             # Reasoning is off by default: with effort "high" OpenRouter spends most of max_tokens on reasoning
             # and the visible caption gets cut off. When enabled, build_request_payload raises the budget.
             reasoning_effort = normalize_reasoning_effort(options.get("reasoning_effort"))
-            mode = options.get("mode", "concept")
-            trigger = options.get("trigger", "restrained_elegance")
+            if not options.get("mode"):
+                from pipeline.profiles import caption_mode_for
+
+                options["mode"] = caption_mode_for(self.db, video_id, fallback=user_settings_for_mode(self.db))
+            mode = normalize_caption_mode(options["mode"])
+            trigger = str(options.get("trigger") or "restrained_elegance").strip() or "restrained_elegance"
             class_noun = options.get("class_noun", "woman")
             max_tokens = int(options.get("max_tokens") or DEFAULT_CAPTION_MAX_TOKENS)
-            temperature = float(options.get("temperature", 0.80))
-            top_p = float(options.get("top_p", 0.90))
+            temperature = float(options.get("temperature", DEFAULT_CAPTION_TEMPERATURE))
+            top_p = float(options.get("top_p", DEFAULT_CAPTION_TOP_P))
             gemma_temp = float(options.get("gemma_temperature", options.get("primary_temperature", temperature)))
             deepseek_temp = float(options.get("deepseek_temperature", options.get("fallback_temperature", temperature)))
             grok_temp = float(options.get("grok_temperature", options.get("fallback_layer3_temperature", temperature)))
+            p_version = caption_prompt_version(mode)
 
-            l1_success_count = 0
-            l2_success_count = 0
-            l3_success_count = 0
-            l1_refusals = 0
-            l2_refusals = 0
+            # Captions accepted per layer ('reused' = kept from the captions table / disk without a new call)
+            accepted = {"layer1": 0, "layer2": 0, "layer3": 0, "reused": 0}
+            # Replies that sent a frame on to the next layer (refusal, cut-off or failed validation gate)
+            rejected = {"layer1": 0, "layer2": 0, "layer3": 0}
+            job_usage = empty_usage()
             completed_count = 0
             failures: list[str] = []
 
             query = """
                 SELECT f.id, f.chunk_id, f.t, f.full_path, f.metrics, f.zs_scores,
-                       c.position as chunk_pos, c.caption_model
+                       c.position as chunk_pos, c.caption_model, p.crop
                 FROM frames f
                 JOIN picks p ON f.id = p.frame_id
                 JOIN chunks c ON f.chunk_id = c.id
@@ -1375,20 +1800,72 @@ class JobManager:
                     "step": step,
                 })
 
+            def progress_step() -> str:
+                return (
+                    f"Captioned {completed_count}/{total_frames} [L1: {accepted['layer1']} | "
+                    f"L2: {accepted['layer2']} | L3: {accepted['layer3']} | reused: {accepted['reused']}] "
+                    f"cost ${job_usage['cost_usd']:.4f}"
+                )
+
             update_prog(0, f"Starting 3-Layer Cascade ({primary_model} ➜ {layer2_model} ➜ {layer3_model}) for {total_frames} frames...")
 
             user_settings = merged_user_settings(self.db.get_setting("user_settings", {}))
             concurrency = int(options.get("concurrency") or user_settings.get("openrouter_concurrency", 4))
             openrouter_max_dim = int(options.get("max_dim") or user_settings.get("openrouter_max_dim", 512))
+            max_edge = int(user_settings.get("max_edge", 2048))
+
+            def record_export(conn, frame_id: int, png: Path, merged_png: Path) -> None:
+                conn.execute(
+                    """
+                    INSERT INTO exports (frame_id, per_video_path, merged_path, exported_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(frame_id) DO UPDATE SET
+                        per_video_path=excluded.per_video_path,
+                        merged_path=excluded.merged_path,
+                        exported_at=excluded.exported_at
+                    """,
+                    (frame_id, str(png), str(merged_png), time.time()),
+                )
+
+            def render_frame(item: dict[str, Any]) -> np.ndarray | None:
+                full_path = Path(item["full_path"] or "")
+                if not full_path.is_file():
+                    return None
+                raw_img = cv2.imread(str(full_path))
+                if raw_img is None:
+                    return None
+                # Same renderer as the exporter: crop, letterbox, watermark, max_edge, multiples of 16
+                return render_export_image(
+                    raw_img,
+                    crop=item.get("crop"),
+                    letterbox=video.get("letterbox"),
+                    watermark_rect=video.get("watermark_rect"),
+                    max_edge=max_edge,
+                )
+
+            def reusable_caption(item: dict[str, Any], out_txt: Path) -> str:
+                """An accepted caption row, else a VLM .txt on disk (adopted as 'imported'); '' when none or cut off."""
+                row = get_accepted_caption(self.db, item["id"])
+                if row and not looks_truncated(row["text"]):
+                    return row["text"]
+                if existing_caption_kind(out_txt) != "caption":
+                    return ""
+                text = out_txt.read_text(encoding="utf-8").strip()
+                if not text or looks_truncated(text):
+                    return ""
+                with self.db.write() as conn:
+                    import_caption(conn, item["id"], video_id, text, source="imported",
+                                   created_at=out_txt.stat().st_mtime, job_id=job_id)
+                return text
 
             async def process_all_async():
-                nonlocal l1_success_count, l2_success_count, l3_success_count, l1_refusals, l2_refusals, completed_count
+                nonlocal completed_count
                 sem = asyncio.Semaphore(concurrency)
                 file_lock = asyncio.Lock()
 
                 async with httpx.AsyncClient() as client:
                     async def process_single_item(item: dict[str, Any]) -> dict[str, Any] | None:
-                        # One frame's timeout, upstream error or triple refusal must not fail the whole batch
+                        # One frame's timeout, upstream error or exhausted cascade must not fail the whole batch
                         try:
                             return await caption_item(item)
                         except Exception as ex:
@@ -1396,45 +1873,40 @@ class JobManager:
                             return None
 
                     async def caption_item(item: dict[str, Any]) -> dict[str, Any] | None:
-                        nonlocal l1_success_count, l2_success_count, l3_success_count, l1_refusals, l2_refusals, completed_count
+                        nonlocal completed_count
                         if job_id in self._cancel_flags:
                             return None
 
                         fname_stem = f"{vslug}_c{item['chunk_pos'] + 1:02d}_{int(item['t'] * 1000):07d}"
                         out_png = per_video_dir / f"{fname_stem}.png"
                         out_txt = per_video_dir / f"{fname_stem}.txt"
+                        merged_png = merged_dir / f"{fname_stem}.png"
+                        merged_txt = merged_dir / f"{fname_stem}.txt"
+                        stale_sidecars = (per_video_dir / f"{fname_stem}.json", merged_dir / f"{fname_stem}.json")
 
                         # Per-chunk model dispatch: if use_chunk_models is True, use chunk's assigned model
                         use_chunk_models = options.get("use_chunk_models", True)
                         item_cap_model = (item.get("caption_model") or "").strip()
                         l1_model = item_cap_model if (use_chunk_models and item_cap_model) else primary_model
 
-                        # Resume support: if already captioned, keep existing caption without re-billing.
-                        # Exporter stubs and captions cut off by the old 300-token cap get replaced.
-                        caption_text = (
-                            out_txt.read_text(encoding="utf-8").strip()
-                            if existing_caption_kind(out_txt) == "caption" else ""
-                        )
-                        if caption_text and not looks_truncated(caption_text) and out_png.is_file():
-                            l1_success_count += 1
+                        # Resume support: a caption already in the captions table (or a VLM .txt on disk) is
+                        # kept without re-billing. Exporter stubs and captions cut off mid-sentence get replaced.
+                        caption_text = reusable_caption(item, out_txt)
+                        if caption_text:
+                            if not out_png.is_file():
+                                img = render_frame(item)
+                                if img is None:
+                                    return None
+                                cv2.imwrite(str(out_png), img)
+                                link_or_copy(out_png, merged_png)
+                            write_caption_files(caption_text, out_txt, merged_txt, stale_sidecars=stale_sidecars)
+                            if not merged_png.exists():
+                                link_or_copy(out_png, merged_png)
+                            accepted["reused"] += 1
                             completed_count += 1
-                            # Ensure recorded in DB exports table
                             with self.db.write() as conn:
-                                conn.execute(
-                                    """
-                                    INSERT INTO exports (frame_id, per_video_path, merged_path, exported_at)
-                                    VALUES (?, ?, ?, ?)
-                                    ON CONFLICT(frame_id) DO UPDATE SET
-                                        per_video_path=excluded.per_video_path,
-                                        merged_path=excluded.merged_path,
-                                        exported_at=excluded.exported_at
-                                    """,
-                                    (item["id"], str(out_png), str(merged_dir / out_png.name), time.time()),
-                                )
-                            update_prog(
-                                completed_count,
-                                f"Captioned {completed_count}/{total_frames} [L1: {l1_success_count} | L2 DeepSeek: {l2_success_count} | L3 Grok: {l3_success_count}]"
-                            )
+                                record_export(conn, item["id"], out_png, merged_png)
+                            update_prog(completed_count, progress_step())
                             return {
                                 "source_video": video["name"],
                                 "video_id": video_id,
@@ -1445,113 +1917,82 @@ class JobManager:
                                 "layer": "layer1_cached",
                             }
 
-                        full_path = Path(item["full_path"])
-                        if not full_path.is_file():
+                        if not Path(item["full_path"] or "").is_file():
                             return None
 
                         async with sem:
                             if job_id in self._cancel_flags:
                                 return None
 
-                            raw_img = cv2.imread(str(full_path))
-                            if raw_img is None:
-                                return None
-
-                            # Render export image with crop, letterbox, watermark, max_edge, and multiples of 16
-                            img_snapped = render_export_image(
-                                raw_img,
-                                crop=item.get("crop"),
-                                letterbox=video.get("letterbox"),
-                                watermark_rect=video.get("watermark_rect"),
-                                max_edge=int(user_settings.get("max_edge", 2048)),
-                            )
+                            img_snapped = render_frame(item)
                             if img_snapped is None:
                                 return None
                             h, w = img_snapped.shape[:2]
-                            cv2.imwrite(str(out_png), img_snapped)
-
-                            caption_model_used = l1_model
-                            layer_used = "layer1"
-                            warnings: list[str] = []
 
                             # -------------------------------------------------------------
-                            # 3-Layer Cascade: Only send refused images to the next layer!
+                            # 3-Layer Cascade: a refused, cut-off or gate-rejected caption goes to the next
+                            # layer; other errors (network, upstream 5xx) fail the frame at once.
                             # -------------------------------------------------------------
+                            cascade = [
+                                ("layer1", l1_model, gemma_temp, reasoning_effort if "gemma" in l1_model.lower() else None),
+                                ("layer2", layer2_model, deepseek_temp, None),
+                                ("layer3", layer3_model, grok_temp, None),
+                            ]
+                            frame_usage = empty_usage()
+                            caption_text, warnings, layer_used, model_used = "", [], "", ""
+                            rejections: list[str] = []
                             try:
-                                # Layer 1: Chunk-specific Model (Default: Google Gemma 4 31B)
-                                l1_reasoning = reasoning_effort if "gemma" in l1_model.lower() else None
-                                caption_text, warnings = await self.captioner.caption_single_frame(
-                                    client=client,
-                                    img_bgr=img_snapped,
-                                    api_key=api_key,
-                                    model=l1_model,
-                                    mode=mode,
-                                    trigger=trigger,
-                                    class_noun=class_noun,
-                                    max_tokens=max_tokens,
-                                    temperature=gemma_temp,
-                                    top_p=top_p,
-                                    reasoning_effort=l1_reasoning,
-                                    max_dim=openrouter_max_dim,
-                                    video_hash=video_title_hash,
-                                )
-                                l1_success_count += 1
-                            except ModelRefusalError:
-                                l1_refusals += 1
-                                # Layer 1 Refused -> Send ONLY this refused image to Layer 2 (DeepSeek V4.1 Flash)
-                                try:
-                                    caption_text, warnings = await self.captioner.caption_single_frame(
-                                        client=client,
-                                        img_bgr=img_snapped,
-                                        api_key=api_key,
-                                        model=layer2_model,
-                                        mode=mode,
-                                        trigger=trigger,
-                                        class_noun=class_noun,
-                                        max_tokens=max_tokens,
-                                        temperature=deepseek_temp,
-                                        top_p=top_p,
-                                        reasoning_effort=None,
-                                        max_dim=openrouter_max_dim,
-                                        video_hash=video_title_hash,
-                                    )
-                                    l2_success_count += 1
-                                    caption_model_used = f"{layer2_model} (fallback from {primary_model})"
-                                    layer_used = "layer2"
-                                    warnings.append(f"Recovered from {primary_model} refusal via Layer 2 ({layer2_model})")
-                                except ModelRefusalError:
-                                    l2_refusals += 1
-                                    # Layer 2 also Refused -> Send this refused image to Layer 3 (Grok 4.7)
-                                    caption_text, warnings = await self.captioner.caption_single_frame(
-                                        client=client,
-                                        img_bgr=img_snapped,
-                                        api_key=api_key,
-                                        model=layer3_model,
-                                        mode=mode,
-                                        trigger=trigger,
-                                        class_noun=class_noun,
-                                        max_tokens=max_tokens,
-                                        temperature=grok_temp,
-                                        top_p=top_p,
-                                        reasoning_effort=None,
-                                        max_dim=openrouter_max_dim,
-                                        video_hash=video_title_hash,
-                                    )
-                                    l3_success_count += 1
-                                    caption_model_used = f"{layer3_model} (fallback from {layer2_model} & {primary_model})"
-                                    layer_used = "layer3"
-                                    warnings.append(f"Recovered from {primary_model} & {layer2_model} refusals via Layer 3 ({layer3_model})")
+                                for layer, layer_model, layer_temp, layer_reasoning in cascade:
+                                    try:
+                                        caption_text, warnings = await self.captioner.caption_single_frame(
+                                            client=client,
+                                            img_bgr=img_snapped,
+                                            api_key=api_key,
+                                            model=layer_model,
+                                            mode=mode,
+                                            trigger=trigger,
+                                            class_noun=class_noun,
+                                            max_tokens=max_tokens,
+                                            temperature=layer_temp,
+                                            top_p=top_p,
+                                            reasoning_effort=layer_reasoning,
+                                            max_dim=openrouter_max_dim,
+                                            video_hash=video_title_hash,
+                                            usage=frame_usage,
+                                            tag_hints=self.image_tags.confirmed_tag_names(item["id"]),
+                                        )
+                                    except CASCADE_ERRORS as ex:
+                                        rejected[layer] += 1
+                                        rejections.append(f"{layer} {layer_model}: {type(ex).__name__}: {ex}")
+                                        continue
+                                    layer_used, model_used = layer, layer_model
+                                    break
+                            finally:
+                                # Every billed attempt counts, including refusals and failed frames
+                                for key in ("prompt_tokens", "completion_tokens", "cost_usd", "calls"):
+                                    job_usage[key] += frame_usage.get(key) or 0
+                                job_usage["cost_reported"] = job_usage["cost_reported"] or bool(frame_usage.get("cost_reported"))
 
+                            if not layer_used:
+                                raise RuntimeError("all 3 cascade layers rejected the frame: " + " | ".join(rejections))
+                            accepted[layer_used] += 1
+                            warnings = list(warnings or [])
+                            caption_model_used = model_used
+                            if layer_used != "layer1":
+                                caption_model_used = f"{model_used} (fallback from {l1_model})"
+                                warnings.append(f"Recovered via {layer_used} ({model_used}) after: " + " | ".join(rejections))
+
+                            # Files are written only after the caption succeeded
+                            cv2.imwrite(str(out_png), img_snapped)
                             out_txt.write_text(caption_text, encoding="utf-8")
                             # A stub sidecar would mark this real caption as a stub again
-                            for stale in (per_video_dir / f"{fname_stem}.json", merged_dir / f"{fname_stem}.json"):
+                            for stale in stale_sidecars:
                                 stale.unlink(missing_ok=True)
-
-                            merged_png = merged_dir / f"{fname_stem}.png"
-                            merged_txt = merged_dir / f"{fname_stem}.txt"
                             for src, dst in [(out_png, merged_png), (out_txt, merged_txt)]:
                                 link_or_copy(src, dst)
 
+                            billed = frame_usage["calls"] > 0
+                            frame_cost = round(frame_usage["cost_usd"], 8) if frame_usage["cost_reported"] else None
                             manifest_entry = {
                                 "source_video": video["name"],
                                 "video_id": video_id,
@@ -1563,12 +2004,17 @@ class JobManager:
                                 "caption": caption_text,
                                 "model": caption_model_used,
                                 "layer": layer_used,
+                                "mode": mode,
+                                "prompt_version": p_version,
+                                "cost_usd": frame_cost,
+                                "prompt_tokens": frame_usage["prompt_tokens"] if billed else None,
+                                "completion_tokens": frame_usage["completion_tokens"] if billed else None,
                                 "cascade_stats": {
-                                    "layer1_gemma_success": l1_success_count,
-                                    "layer2_deepseek_success": l2_success_count,
-                                    "layer3_grok_success": l3_success_count,
-                                    "layer1_refusals": l1_refusals,
-                                    "layer2_refusals": l2_refusals,
+                                    "layer1_gemma_success": accepted["layer1"],
+                                    "layer2_deepseek_success": accepted["layer2"],
+                                    "layer3_grok_success": accepted["layer3"],
+                                    "layer1_refusals": rejected["layer1"],
+                                    "layer2_refusals": rejected["layer2"],
                                 },
                                 "metrics": item.get("metrics"),
                                 "scores": item.get("zs_scores"),
@@ -1578,38 +2024,43 @@ class JobManager:
                             async with file_lock:
                                 append_manifest_record(manifest_path, manifest_entry)
                                 with self.db.write() as conn:
-                                    conn.execute(
-                                        """
-                                        INSERT INTO exports (frame_id, per_video_path, merged_path, exported_at)
-                                        VALUES (?, ?, ?, ?)
-                                        ON CONFLICT(frame_id) DO UPDATE SET
-                                            per_video_path=excluded.per_video_path,
-                                            merged_path=excluded.merged_path,
-                                            exported_at=excluded.exported_at
-                                        """,
-                                        (item["id"], str(out_png), str(merged_png), time.time()),
+                                    record_caption(
+                                        conn, item["id"], video_id, caption_text,
+                                        model=model_used, layer=layer_used, mode=mode, prompt_version=p_version,
+                                        trigger=trigger, cost_usd=frame_cost,
+                                        prompt_tokens=manifest_entry["prompt_tokens"],
+                                        completion_tokens=manifest_entry["completion_tokens"],
+                                        warnings=warnings, finish_reason=frame_usage.get("finish_reason"),
+                                        job_id=job_id,
                                     )
+                                    record_export(conn, item["id"], out_png, merged_png)
                                 completed_count += 1
-                                update_prog(
-                                    completed_count,
-                                    f"Captioned {completed_count}/{total_frames} [L1 Gemma: {l1_success_count} | L2 DeepSeek: {l2_success_count} | L3 Grok: {l3_success_count}]"
-                                )
+                                update_prog(completed_count, progress_step())
                             return manifest_entry
 
                     raw_results = await asyncio.gather(*(process_single_item(item) for item in kept_frames))
                     return [r for r in raw_results if r is not None]
 
-
             captioned_results = asyncio.run(process_all_async())
 
             # Frames captioned before the cancel keep their files and export rows (each one is complete)
             self._check_cancel(job_id)
+            cost_summary = {
+                "cost_usd": round(job_usage["cost_usd"], 6) if job_usage["cost_reported"] else None,
+                "prompt_tokens": job_usage["prompt_tokens"],
+                "completion_tokens": job_usage["completion_tokens"],
+                "api_calls": job_usage["calls"],
+            }
+            cost_note = (
+                f"Cost ${job_usage['cost_usd']:.4f}, {job_usage['prompt_tokens']} prompt + "
+                f"{job_usage['completion_tokens']} completion tokens over {job_usage['calls']} calls."
+            )
             if failures and not captioned_results:
-                raise RuntimeError(f"All {len(failures)} frames failed. First error: {failures[0]}")
+                raise RuntimeError(f"All {len(failures)} frames failed. First error: {failures[0]} {cost_note}")
 
             failure_note = (
                 f"{len(failures)} of {total_frames} frames failed and stay uncaptioned (re-run to retry). "
-                f"First error: {failures[0]}"
+                f"First error: {failures[0]} {cost_note}"
                 if failures else None
             )
             with self.db.write() as conn:
@@ -1627,7 +2078,14 @@ class JobManager:
                 "chunk_id": None,
                 "exported": len(captioned_results),
                 "failed": len(failures),
+                "layers": dict(accepted),
+                "rejected": dict(rejected),
+                "prompt_version": p_version,
+                **cost_summary,
             })
+            # R6: incremental RAG reindex (background, never raises; only the API's manager has a handler)
+            from pipeline.rag.auto_reindex import notify_caption_job_finished
+            notify_caption_job_finished(self, job_id=job_id, video_id=video_id, captioned=len(captioned_results))
 
         except JobCancelled:
             self._finish_cancelled(job_id, video_id, video_name)

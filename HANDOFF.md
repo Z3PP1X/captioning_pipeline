@@ -1,8 +1,15 @@
 # Handoff - design overhaul, pipeline review, Prompt Director fix, Phases A-E, Database Reset, Dockerization, Face Recognition & Multi-Person Roles / 95% Dedup / Video Hash
 
-Date: 2026-10-15. Branch `main`.
-**Database Reset, Dockerization, Phases A-E, Phase 1.6, and Phase 1.7 (Multi-Person Roles, 95% Dedup Budget 150-200, Video Hash Captions) are DONE** (§1.3, §1.4, §1.5, §1.6, §1.7). Next: Phase F (Extraction v2) & Phase G (Captioning v2).
-All verification completed inside WSL 2 (142 Python tests pass across 15 test suites, 49 Vitest specs pass, clean Angular production build).
+Date: 2026-10-16 (session 5). Branch `session5-image-tagging-and-handoff` (not merged, not pushed).
+**Session 5 (§1.9):**
+- learn-as-you-tag image tagging (new feature)
+- Phases F, G and H complete
+- product decisions 1, 3 and 4 implemented as proposed
+- every GAP_REPORT item closed
+- tooling and the skills mirror
+
+Earlier phases (A-E, 1.5-1.8) are unchanged and DONE. Session 5 ran on **macOS** (scratch venv, temp `CP_*` dirs,
+headless Chrome against the real CLIP model). Nothing has run in WSL yet: §5 is the next step.
 
 ## 0. Read first
 
@@ -140,33 +147,40 @@ All work executed directly inside Ubuntu WSL 2 using Python 3.12 (`uv`), Node, a
 
 ## 2. Repository state
 
-- **Committed and pushed in session 3**, as four commits: skills + `GAP_REPORT.md`; the Prompt Director fix + tests;
-  Phase A + tests; `docs/reviews/` + this file. A git stash `skills-wip` still exists as a backup of the old skills;
-  drop it after reviewing the skills.
-- **Build artefacts:** `node_modules/` and `src/web/dist/` were built on macOS (gitignored). Do not copy them
-  to WSL; run `npm install` / `npm run build` there.
-- **Duplicate skill tree:** `.agents/skills/{design-system,styling}` duplicates `.claude/skills/*` and has
-  drifted. Pick one canonical tree.
-- Nothing has run in WSL yet; §5 is still the first thing to do.
+- **Session 5 is uncommitted** (about 100 changed/new files). Suggested commits: (1) image tagging, (2) Phase F,
+  (3) Phase G, (4) Phase H, (5) frontend gap + styling pass, (6) tooling/docs. 13 ad-hoc one-off scripts were
+  deleted from `scripts/` (person-specific extract/caption/repair scripts, requeue/check helpers).
+- **Skills:** `.claude/skills` is canonical; `.agents/skills` is a mirror. Run `bash scripts/sync_skills.sh`
+  after editing a skill (`--check` reports drift). The `skills-wip` stash no longer exists.
+- **Build artefacts:** `node_modules/` and `src/web/dist/` were built on macOS (gitignored). Do not copy them to
+  WSL; run `npm install` / `bash scripts/build_web.sh` there.
+- **Tests:** `bash scripts/test.sh` collects `tests/` only; `test_phase1::test_api_routes` now skips without the
+  real library. `npx ng test --watch=false` runs the Vitest specs.
 
 ## 3. Decisions needed from the product owner
 
 These block or shape the items listed in brackets.
 
-1. **Character vs concept LoRA profile** [pipeline Phase 3-5, C-profile].
+1. ~~Character vs concept LoRA profile~~ **Implemented (session 5) as proposed:** per-video `profile`
+   (`concept|character`, workflow-bar toggle), the target person is the character, identity gate + solo portrait crops
+   (`pipeline/profiles.py`), character caption mode by default. Original notes:
    - The current defaults (`openrouter_mode="concept"`, a single trigger, a 50% multi-person target) suit a
      concept LoRA, but the stated goal is a character LoRA.
    - Proposal: a per-video or per-chunk `profile` + `character_id`, an identity gate, and solo or cropped frames.
-2. **Angular Router vs tabs** [W1, F9]. The design plan proposes `/board`, `/v/:id/:step`, `/dataset` and
-   `/tools/prompt-director`.
-3. **Status UI** [F3, W3]: replace the status `<select>` with a derived status plus an overflow menu
-   (Skip / Restore / advanced)?
-4. **Tokens** [Q2, 6.5 in the design plan]: a new `info` badge variant, plus optional `--success-strong` and
-   `--warning-strong` tokens.
+2. ~~Angular Router vs tabs~~ **Decided (session 5):** hash deep links without the Router
+   (`#/curate?video=<id>`, `core/utils/hash-route.utils.ts`); back/forward work. Revisit only if real routes are needed.
+3. ~~**Status UI** [F3, W3]: replace the status `<select>` with a derived status plus an overflow menu
+   (Skip / Restore / advanced)?~~ **Implemented (2026-10-16):** `features/studio/video-status-menu.component.ts`
+   (badge + dropdown-menu: Skip, Restore to `derivedVideoStatus`, Advanced submenu with confirm for non-derived jumps).
+4. ~~**Tokens** [Q2, 6.5 in the design plan]: a new `info` badge variant, plus optional `--success-strong` and
+   `--warning-strong` tokens.~~ **Implemented (2026-10-16):** `info` variant, `--success-strong #15803D` /
+   `--warning-strong #8A5A00` in `styles.css`, documented in `design-system/references/colors.md`.
 5. **Export semantics** [W9]: does the caption job count as export ("Done" right after "Caption"), or is
-   export a separate step?
-6. **API key persistence** [F7, H7]: `localStorage` vs server-only. Never return the key from `GET /settings`.
-7. **Prompt Director guardrail wording** [R8]:
+   export a separate step? (Session 5 added an explicit "Export this video" action in the Curate toolbar; the
+   workflow state machine is unchanged.)
+6. ~~API key persistence~~ **Decided (session 5): server-only.** The UI saves a typed key via `PUT /api/settings`
+   and migrates an old `localStorage` key once; nothing reads `localStorage` any more.
+7. ~~Prompt Director guardrail wording~~ **Done (Phase H, session 4):**
    - The generator system prompt says "adults 25+", while both character profiles specify age 21.
    - Make the rule consistent: a clear adult-only rule, with each character's adult age stated explicitly.
    - Replace the `CHARACTERS["lene"]["avatar"]` emoji, which no longer renders, or drop the field.
@@ -372,7 +386,161 @@ High-performance, CPU-friendly facial recognition (<10ms inference per frame on 
    - All tests passing across the test suite.
    - Clean production build: `src/web/dist` (0 errors).
 
-### Phase F - Extraction / quality / selection v2 (about 8-14 days; needs decision 1)
+### Phase 1.9 - Session 5: learn-as-you-tag image tagging, Phases F/G/H, GAP closure - **DONE (macOS-verified)**
+
+**1. Learn-as-you-tag image tagging (new feature).** Like persons for faces, tags are global and learned from the user.
+- **Teach:** Curate lightbox → press `T` (or "Mark region") → drag a box → name it (autocomplete; new tags get a
+  category). The crop and its mirror are CLIP-embedded (the ONNX model already used for scoring) into `tag_regions`.
+  The other windows of the same frame become hidden `context` counter-examples (`parent_id`, cascade). Without them a
+  single example also matched its own background: real-CLIP test, empty frames went from 0.69 to no suggestion.
+- **Suggest with location:** each frame is embedded as 19 multi-scale windows, cached per video
+  (`<cache>/tag_windows/*.npz`, fp16, in-memory copy). Per-tag score = noisy-OR of the exemplar term (top-3 cosine vs
+  a calibrated threshold) and a fading CLIP text prior, suppressed near negatives. The best window, refined by a
+  score-weighted union, is the suggested box (dashed on the image, with the score).
+- **Learn:** confirm = positive example at the box; reject = counter-example and frame `rejected`; un-tag drops the
+  frame's examples. Each step recalibrates the tag (threshold, leave-one-out accuracy, shrunk to the default while few
+  examples exist), instantly re-scores the video's cached frames (SSE `tags_updated` → grid chips update), and the
+  first teach on a video queues a `tag_suggest` job for the unembedded frames. `auto_suggest_tags` also pre-tags
+  every new extraction.
+- **UI:** lightbox tag panel and box overlay (`features/tags/*`); grid chips (solid = confirmed, dashed = suggested);
+  Curate toolbar tag filter (confirmed only / + suggested), "Tags" library and "Auto-tag"; the Tag library modal
+  (examples, counter-examples, learned accuracy, rename, category, zero-shot description, merge, delete, per-video
+  counts).
+- **Downstream:** confirmed tags lead stub captions and the export sidecar (`image_tags`), and reach the VLM as
+  "verified visible elements" hints.
+- Files: `src/pipeline/image_tags.py`, `src/pipeline/tag_routes.py`, schema in `db.py`, hooks in `jobs.py`
+  (`submit_tag_suggest_job`, `_maybe_auto_suggest_tags`, generic `submit_video_task`), `export.py`, `openrouter.py`
+  (`tag_hint_text`); `core/{models/tag.model.ts,services/tag.service.ts}`, `features/tags/*`,
+  `features/modals/tag-manager-modal.component.ts`, lightbox, grid, toolbar. Tests: `tests/test_image_tags.py` (15).
+- Verified in headless Chrome against the real CLIP model on synthetic scenes: draw → name → suggestion with the
+  right box on the next frame → confirm → background pass tags the remaining chair frames → reject teaches.
+
+**2. Phase G - Captioning v2:** versioned prompts in `src/pipeline/prompts/` (no runtime `~/.gemini` read), temperature
+0.4, a validation gate (word range, preambles/refusals, truncation, token-0 trigger, adult-only wording) that sends
+failures down the L1→L2→L3 cascade, per-mode trigger profiles, a `captions` table as the source of truth
+(`captions.py`; reconcile imports `.txt` idempotently; the exporter writes from it), per-frame token and cost logging
+(`usage: {include: true}`), `GET /api/captions/stats` and `GET /api/frames/{id}/caption`. Tests: `test_captioning_v2.py` (25).
+
+**3. Phase H - Prompt Director v2:**
+- **Retrieval:** R7 (query-embedding LRU and warm-up), R2 (word-boundary tag matching, FTS5 BM25 fused with dense
+  and tag scores via RRF).
+- **R9:** the Qwen tokenizer is used only when it is available offline.
+- **UX:** history and favourites (`rag_history` in `state.db`), Generate N (1-10), `POST /api/rag/lint` with inline
+  edit and re-lint, `.txt`/`.jsonl` export, and 1/2/3 copy keys.
+- **Captions table:** the RAG index now reads the `captions` table first (`vlm` and `imported` rows only; never stubs
+  or rejected frames). The curated and merged file scan is the fallback.
+- **R6:** incremental reindex runs after every caption job (`rag_auto_reindex`; `POST /api/rag/index
+  {incremental}`; `index_rag.py --incremental`).
+- **R10:** a deterministic 10% val split, plus `GET /api/rag/eval` and `scripts/eval_rag.py`
+  (sibling recall@k / MRR, tag recall and precision, with chance baselines).
+
+**4. Phase F - scoped, CPU-only:**
+- **Extraction:** dHash pre-dedup of consecutive samples (`dhash_dedup_max_distance`) and window-peak sampling
+  (sharpest and stillest sample per interval).
+- **Learning from curation:** a `curation_events` log of keep/reject/star/swap/bulk actions, and logistic-regression
+  learned quality weights (`learned_weights.py`, `GET/POST /api/scoring/learned-weights[/fit]`, opt-in
+  `use_learned_weights`).
+- **Selection:** `POST /api/videos/{id}/reselect` runs quality-weighted facility location with per-chunk floor/cap.
+  It never demotes starred or exported frames. Tests: `test_phase_f.py` (15).
+
+**5. GAP_REPORT closure:**
+- **Frontend:** F1 (full key table, J/L, Alt/Ctrl arrows, shortcuts suppressed while a modal is open via
+  `UiStateService`), F4, F5/F6 (shared `ConfirmService` + `hlm-alert-dialog`), F7 (server-only key), F8 (settings
+  validation), F9 (hash deep links), F10, F12 (rAF playhead), F13 (Export this video), B3 (`chunk-fields.utils.ts`).
+- **Backend:** B4 (`PUT /api/settings` validated by `config.validate_user_settings`: 400 with `errors`, unknown keys
+  reported in `ignored_keys`) and B5 (`PATCH /api/picks` with `rebalance: true` runs the swap logic).
+- **Styling:** no emoji icons, raw palette, hex, `text-[Npx]` or `font-mono` left; filename as h2.
+- **Tooling:**
+  - The server resolves the build per request, never serves raw `src/web`, and answers 503 "Frontend not built"
+    instead (`CP_WEB_DIST` overrides the path).
+  - `build_web.sh` builds production (`--dev` optional).
+  - `setup.sh` installs Node 22 via nvm into `$HOME` when needed, and `env.sh` loads it.
+  - `sync_skills.sh` mirrors the skills.
+
+**6. Frontend platform:**
+- **Change detection:** zoneless (`provideZonelessChangeDetection`, zone.js removed).
+- **HTTP:** `ApiService` on `HttpClient` with `apiErrorInterceptor`, keeping `ApiError` semantics.
+- **Dialogs:** `hlm-dialog` for the settings, caption, person and tag-library dialogs; Signal Forms for settings.
+- **Fixes found while verifying:**
+  - "Seek" from Curate now reaches the Studio player. The request waits for the player, and a seek that arrives
+    before the metadata is queued.
+  - `<select>`s with `@for` options showed their first option until reselected (the studio status showed "New"
+    for a curating video). Options now bind `[selected]`.
+
+**Verification (macOS):**
+- `t.sh -q` (pytest with temp `CP_*` dirs): **226 passed, 4 skipped**.
+- `npx ng test --watch=false`: **132 passed (17 files)**.
+- `npm run build` (production): clean.
+- Headless Chrome against the real CLIP model, no console errors:
+  - tagging and auto-suggest
+  - deep-link reload and back/forward
+  - confirm dialog and Escape
+  - settings dialog open/close
+  - seek to chunk 2 (an H.264 test video: Chrome cannot decode MPEG-4 Part 2)
+  - studio status select
+
+**Session 5 continuation (after the stop-hook review), all macOS-verified:**
+- **Decision 1:** per-video LoRA profile `concept|character`.
+  - Character mode adds the identity gate, solo portrait crops and character caption mode.
+  - Code: `pipeline/profiles.py`, `PATCH /api/videos/{id} {profile}`, `POST /api/videos/{id}/apply-profile`, the
+    workflow-bar toggle. Tests: `test_profiles.py`.
+- **Decision 3:** derived status badge plus an overflow menu (Skip / Restore / Advanced set-status with a confirm),
+  in `video-status-menu.component.ts`.
+- **Decision 4:** `--success-strong` (#15803D, 5.0:1) and `--warning-strong` (#8A5A00, 5.9:1), used for green and
+  yellow text, icons and borders. Documented in `design-system/references/colors.md`.
+- **GAP leftovers:**
+  - Toasts use Spartan sonner (`hlm-toaster`); the `JobEventService` API is unchanged.
+  - No raw `<select>` is left: all are `hlm-native-select`, and the primitive re-applies its value when options
+    arrive late.
+- **Phase H:**
+  - **R1:** per-domain CLIP embeddings (40-word chunks per taxonomy domain, `dense_mode: domain` by default). On a
+    synthetic eval with long-caption queries, sibling recall@4 went from 0.56 to 0.98 for dense-only scoring and
+    from 0.36 to 0.52 with fusion.
+  - **R3:** `GET /api/rag/similar?frame_id=`, a SigLIP image index with CLIP fallback.
+  - UI: "Use as prompt seed" and "More like this frame" from the lightbox and Dataset frames, and the K4 Prompt
+    Director design pass.
+- **Phase F UI:** a Reselect dialog in the Curate toolbar (all knobs, including the axis caps and cross-dataset dedup),
+  plus learned-weights status, Fit now and an on/off toggle. A "Pipeline and learning" section in Settings covers
+  the tag threshold, dHash distance, cut detector, selection embedder, IQA model, quality v2, window-peak sampling,
+  the analysis cache, auto-tagging and RAG auto-reindex.
+- **Phase F2 (backend):**
+  - **Analysis cache:** one analysis decode per video, cached in `<cache>/analysis/<video>.npz` plus a
+    `frame_features` table. A second extraction of a chunk decodes nothing.
+  - **Cuts:** a frame-accurate content cut detector (`cuts.py`, PySceneDetect-style adaptive and fade handling, no
+    new dependency), used by the filmstrip, autochunk and autopilot.
+  - **Quality v2:** `quality.py` applies hard gates, then chunk and video percentile-normalised subject sharpness,
+    noise, exposure, face size/pose and motion. IQA is optional (`clip_iqa`, or `topiq_nr` via ONNX). MUSIQ: no
+    usable single-file ONNX export found, so TOPIQ is offered instead.
+  - **Selection:** optional DINOv2-S embeddings (`embedders.py`, `selection_embedder: dinov2`), and reselect axis caps
+    and cross-dataset dedup. Tests: `test_phase_f2.py`.
+- **Decoder fix:** `decode.safe_decode_frames` skipped PyAV's flush packet and lost the last buffered frames of every
+  video. It now drains the decoder (regression test in `test_phase_f2.py`).
+- **Phase I:**
+  - `scripts/ng_env.sh` keeps `.angular` on ext4 for `/mnt/*` checkouts.
+  - `patch_os.js` now only falls back when `os.networkInterfaces()` throws, and documents the cause.
+
+**Final verification (macOS):**
+- `t.sh -q`: **261 passed, 4 skipped**.
+- `npx ng test --watch=false`: **192 passed (30 files)**.
+- `npm run build` (production): clean.
+- Headless Chrome, 16 steps, no console errors:
+  - mark region → suggestion box → confirm; ball frame not suggested; 4 tagged cards after the background pass
+  - Tag library dialog; Reselect submits with a toast
+  - deep link and back/forward; reject-all confirm with Escape
+  - profile toggle to `character` persisted; seek to chunk 2
+  - status badge and menu; Settings pipeline section; Prompt Director
+
+**Remaining before relying on it (needs your machine):**
+- Run §5 in WSL.
+- Tune on real footage: tag thresholds, cut detector sensitivity (`cut_*` settings), quality-v2 gates, and
+  per-domain RAG retrieval (`/api/rag/eval`). All of these were tuned only on synthetic data.
+- The first DINOv2, TOPIQ or SigLIP use downloads its model (24 MB, 177 MB and 99 MB).
+- Known limits:
+  - Cross-dissolves without a single-frame spike are not detected as cuts.
+  - Learned-weights accuracy is measured on the training data.
+  - An auto-dismissed toast skips its exit animation.
+
+### Phase F - Extraction / quality / selection v2 - **DONE (session 5, §1.9; MUSIQ replaced by optional TOPIQ)**
 
 Pipeline review §4-6 and roadmap Phases 2-4:
 - **Extraction v2:**
@@ -391,7 +559,7 @@ Pipeline review §4-6 and roadmap Phases 2-4:
   - `POST /videos/{id}/reselect`, with the knobs exposed in the Curate toolbar
   - pseudocode in §6.3
 
-### Phase G - Captioning v2 (about 2-3 days)
+### Phase G - Captioning v2 - **DONE (session 5, §1.9)**
 
 Pipeline review §7:
 - a `captions` table as the source of truth (the exporter and RAG read from it)
@@ -402,7 +570,7 @@ Pipeline review §7:
 - one shared `render_export_image()`
 - cost logging
 
-### Phase H - Prompt Director v2 (about 3-5 days)
+### Phase H - Prompt Director v2 - **DONE (sessions 4-5, §1.9)**
 
 Clicker review §4-5.
 
@@ -432,12 +600,14 @@ Clicker review §4-5.
 
 - **DONE**: Deleted `src/web/app.js` and `src/web/shared/components/**`.
 - **DONE**: Synchronized `angular-migration/SKILL.md` and `api-contract/SKILL.md` across `.agents/skills` and `.claude/skills`.
-- Tooling: ext4 Node/cache, Node in `setup.sh`, production build in `start_all.sh`, and fail loudly if `src/web/dist` is missing.
-- **Update the skills as items close:**
-  - `api-contract`: Phase A is done (session 3). Still to add: the new RAG routes (`/rag/status`, `/rag/index`), plus `/retrieve` `index_ready`,
-    `/generate` `grounded`/`notices`/`api_key` and the 400/502 codes. Also the `/api/*` JSON 404.
-  - `studio-ui-spec`: the Prompt Director section, then the port status.
-  - `angular-migration`: remaining work.
+- **DONE (session 5)**: Node 22 via nvm in `setup.sh`/`env.sh`, production build in `build_web.sh` and `start_all.sh`, the
+  server never serves raw sources (503 "Frontend not built"), `.claude/skills` canonical + `scripts/sync_skills.sh`
+  mirror, skills updated for every route added in session 5 (`api-contract`, `pipeline-overview`, `studio-ui-spec`,
+  `angular-migration`), 13 ad-hoc scripts deleted.
+- **DONE (session 5)**: `scripts/ng_env.sh` (sourced by `build_web.sh`, `start_web.sh`, `start_all.sh`) links `.angular` to
+  `<cache>/angular` on ext4 when the checkout is on `/mnt/*`. `patch_os.js` now only falls back when
+  `os.networkInterfaces()` throws. The cause is a libuv `uv_interface_addresses` failure on some WSL 2 network setups,
+  and the file shows how to check it. Not reproduced here: no WSL on this machine.
 
 **Dependencies:**
 - A1 → A2; A2 → E (Dataset)
@@ -457,7 +627,8 @@ bash scripts/setup.sh
 npm install
 bash scripts/test.sh tests/test_rag.py tests/test_rag_api.py tests/test_phase_a.py tests/test_openrouter.py
 bash scripts/test.sh                # full suite; test_phase1::test_api_routes needs the real library
-bash scripts/start_all.sh           # builds the UI, serves :8000
+bash scripts/start_all.sh           # builds the UI (production), serves :8000
+npx ng test --watch=false           # Vitest specs
 curl -s localhost:8000/api/rag/status | python3 -m json.tool
 uv run python scripts/audit_captions.py --list   # read-only: truncated captions and stubs from earlier runs
 ```
@@ -476,10 +647,21 @@ uv run python scripts/audit_captions.py --list   # read-only: truncated captions
    - With no key you get a readable 400. Set `OPENROUTER_API_KEY` in `.env`, or use Local Ollama with a URL.
 2. **Golden path:** select a video → suggest → save → extract → curate → caption → export.
    - A1-A5 have landed but have not run against real data. Use a copied video for the first pass.
+3. **Image tagging (session 5):** in Curate open a frame → `T` → drag a box → name it → Enter.
+   - The next similar frames should show a dashed suggestion box with a score, and grid chips appear after the
+     background `tag_suggest` job (jobs ticker).
+   - Confirm/reject a few, then open **Tags**: examples, counter-examples and the learned accuracy should update.
+   - Real-footage thresholds are untested: if suggestions are too eager or too shy, tune
+     `tag_suggest_min_score` (Settings) before changing constants in `image_tags.py` (`DEFAULT_THRESHOLD`,
+     `TEXT_CENTER`, `CONTEXT_NEGATIVES`).
+4. **Captioning v2 / Phase F:** caption a copied video and check `GET /api/captions/stats` (cost, prompt version);
+   try `POST /api/videos/{id}/reselect` and the dHash/window-peak stats in the extract `job_finished` event.
 
 ## 6. Unverified - confirm before relying on it
 
-- **Not run in WSL:** nothing from sessions 2 and 3.
+- **Not run in WSL:** nothing from sessions 2, 3 and 5 (session 5 ran on macOS with temp `CP_*` dirs and headless Chrome).
+- **Session 5 on real footage:** tag thresholds were tuned on the real CLIP model but with synthetic scenes only;
+  the learned-weights accuracy is measured on training data; window-peak sampling timing on 1080p is unmeasured.
 - **Phase A assumptions:** WSL 2 forwards `127.0.0.1` binds to Windows `localhost`. The OpenRouter `finish_reason`
   values match the mocked ones. The hand-edited `uv.lock` is accepted.
 - **Runtime behaviour, inferred from source:**

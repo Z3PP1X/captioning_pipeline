@@ -17,6 +17,9 @@ const DEFAULT_MODELS: OpenRouterModelOption[] = [
   { id: 'mistralai/pixtral-12b', name: 'Pixtral 12B', recommended: false },
 ];
 
+/** Browser cache of the OpenRouter key used by older builds; migrated to the server and removed (F7). */
+export const LEGACY_OPENROUTER_KEY_STORAGE = 'cp_openrouter_api_key';
+
 @Injectable({
   providedIn: 'root',
 })
@@ -42,12 +45,36 @@ export class SettingsService {
       ]);
       if (settingsRes.settings) {
         this.settings.set(settingsRes.settings);
-        return settingsRes.settings;
+        await this.migrateLegacyOpenRouterKey();
+        return this.settings();
       }
     } catch (err) {
       console.error('Failed to load settings:', err);
     }
     return this.settings();
+  }
+
+  /**
+   * F7 (decided: the key lives on the server only). A key cached in localStorage by an older build is moved to
+   * the server once (unless one is stored there already) and then deleted from the browser.
+   */
+  async migrateLegacyOpenRouterKey(): Promise<void> {
+    let storage: Storage | undefined;
+    try {
+      storage = globalThis.localStorage;
+    } catch {
+      return;
+    }
+    const legacy = storage?.getItem(LEGACY_OPENROUTER_KEY_STORAGE)?.trim();
+    if (!storage || !legacy) return;
+    try {
+      if (!this.settings().openrouter_api_key_set) {
+        await this.saveOpenRouterKey(legacy);
+      }
+      storage.removeItem(LEGACY_OPENROUTER_KEY_STORAGE);
+    } catch (err) {
+      console.warn('Could not move the cached OpenRouter key to the server; keeping it for now:', err);
+    }
   }
 
   async loadOpenRouterModels(): Promise<OpenRouterModelOption[]> {
@@ -63,12 +90,29 @@ export class SettingsService {
     return this.openRouterModels();
   }
 
+  /**
+   * Stores the OpenRouter key on the server only (product decision: no browser persistence). The response is
+   * redacted, so the secret never lands in the settings signal; only `openrouter_api_key_set` does.
+   */
+  async saveOpenRouterKey(key: string): Promise<void> {
+    const trimmed = key.trim();
+    if (!trimmed) return;
+    const res = await this.api.put<{ settings?: PipelineSettings }>('/api/settings', { openrouter_api_key: trimmed });
+    if (res?.settings) {
+      this.settings.set(res.settings);
+    } else {
+      this.settings.update((s) => ({ ...s, openrouter_api_key_set: true }));
+    }
+  }
+
   async saveSettings(updated: Partial<PipelineSettings>): Promise<void> {
     try {
-      const current = this.settings();
+      // Read-only / secret fields are not round-tripped
+      const { openrouter_api_key_set, openrouter_api_key, ...current } = this.settings();
       const payload = { ...current, ...updated };
-      await this.api.put('/api/settings', payload);
-      this.settings.set(payload);
+      delete payload.openrouter_api_key_set;
+      const res = await this.api.put<{ settings?: PipelineSettings }>('/api/settings', payload);
+      this.settings.set(res?.settings ?? { ...payload, openrouter_api_key_set, openrouter_api_key: undefined });
     } catch (err) {
       console.error('Failed to save settings:', err);
       throw err;

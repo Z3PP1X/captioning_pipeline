@@ -1,8 +1,16 @@
 """Krea 2 prompt linter and validator enforcing clean natural language, adult 25+ subjects, and token budgets."""
 from __future__ import annotations
 
+import logging
+import os
 import re
+from functools import lru_cache
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Krea 2 encodes prompts with Qwen3-VL; any of these share the Qwen tokenizer vocabulary.
+QWEN_TOKENIZER_REPOS = ("Qwen/Qwen3-VL-8B-Instruct", "Qwen/Qwen3-VL-4B-Instruct", "Qwen/Qwen3-VL-2B-Instruct")
 
 BANNED_SLUDGE = [
     "masterpiece", "best quality", "high quality", "8k", "4k", "photorealistic",
@@ -20,8 +28,54 @@ BRACKET_WEIGHT_REGEX = re.compile(r"(\([^\)]+:\d+(\.\d+)?\)|\[[^\]]+:\d+(\.\d+)?
 PREAMBLE_REGEX = re.compile(r"^(here is (a |the )?(prompt|description)?:|in this (image|photo|photograph),?|prompt:)\s*", re.IGNORECASE)
 
 
+@lru_cache(maxsize=1)
+def qwen_tokenizer() -> Any | None:
+    """Qwen3-VL tokenizer if available **offline**, else None (never downloads).
+
+    Looks at ``CP_QWEN_TOKENIZER`` (path to a ``tokenizer.json``), then the local Hugging Face cache
+    (``local_files_only``). Pre-fetch once with e.g.
+    ``huggingface-cli download Qwen/Qwen3-VL-8B-Instruct tokenizer.json``.
+    """
+    try:
+        from tokenizers import Tokenizer
+    except ImportError:
+        return None
+    path = os.environ.get("CP_QWEN_TOKENIZER", "").strip()
+    if not path:
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError:
+            return None
+        for repo in QWEN_TOKENIZER_REPOS:
+            try:
+                path = hf_hub_download(repo, "tokenizer.json", local_files_only=True)
+                break
+            except Exception:
+                continue
+    if not path:
+        return None
+    try:
+        return Tokenizer.from_file(path)
+    except Exception as err:
+        logger.warning("Cannot load Qwen tokenizer from %s: %s", path, err)
+        return None
+
+
+def token_counter_name() -> str:
+    """``qwen`` when the exact tokenizer is used, else ``heuristic``."""
+    return "qwen" if qwen_tokenizer() is not None else "heuristic"
+
+
 def estimate_token_count(text: str) -> int:
-    """Estimates Qwen3-VL token count using words and punctuation heuristic (~1.25 tokens/word)."""
+    """Qwen3-VL token count: exact with the offline Qwen tokenizer, else a words + punctuation heuristic."""
+    tok = qwen_tokenizer()
+    if tok is not None:
+        return len(tok.encode(text.strip(), add_special_tokens=False).ids) if text.strip() else 0
+    return heuristic_token_count(text)
+
+
+def heuristic_token_count(text: str) -> int:
+    """Word + punctuation heuristic (~1.15 tokens/word + 0.25 per punctuation mark)."""
     words = text.strip().split()
     if not words:
         return 0

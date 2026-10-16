@@ -1,19 +1,35 @@
-"""OpenRouter API client for VLM batch captioning with 512px token saving and krea2 linter."""
+"""OpenRouter API client for VLM batch captioning with 512px token saving and krea2 linter.
+
+Prompts are versioned in `pipeline.prompts` (no runtime reads outside the repo). Every reply passes a
+validation gate (`validate_caption_gate`); a rejected caption raises `CaptionValidationError`, which the
+caption job treats like a refusal and sends to the next cascade layer. Token usage and cost (OpenRouter
+`usage: {include: true}`) are accumulated into the caller's `usage` dict.
+"""
 from __future__ import annotations
 
 import asyncio
 import base64
-import json
-import os
 import re
-from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import cv2
 import httpx
 import numpy as np
 
 from pipeline.config import Settings, get_settings
+from pipeline.prompts import (
+    MODE_WORD_RANGES,
+    get_profile,
+    normalize_mode,
+    primary_class_noun,
+    prompt_version,
+    render_system_prompt,
+    render_user_prompt,
+)
+
+# Captions want consistency, not creativity (review §7.2: 0.3-0.5)
+DEFAULT_CAPTION_TEMPERATURE = 0.4
+DEFAULT_CAPTION_TOP_P = 0.90
 
 # Banned Danbooru buzzwords and quality filler
 BANNED_SLUDGE = [
@@ -31,8 +47,7 @@ MAX_CAPTION_MAX_TOKENS = 4000
 # Extra attempts when a caption comes back cut off or far too short
 TRUNCATION_RETRIES = 2
 
-# Target word range per mode (must match the ranges stated in load_system_prompt)
-MODE_WORD_RANGES = {"concept": (120, 180), "character": (80, 140), "style": (75, 130)}
+# Target word range per mode: MODE_WORD_RANGES comes from pipeline.prompts (the prompts state the same ranges)
 TERMINAL_PUNCTUATION = ('.', '!', '?', '"', "'", ')', '…', '»', '”', '’')
 
 
@@ -52,6 +67,16 @@ def looks_truncated(text: str) -> bool:
 
 class CaptionTruncatedError(RuntimeError):
     """The model kept returning a cut-off caption (finish_reason 'length' or no closing sentence)."""
+
+
+class CaptionValidationError(RuntimeError):
+    """The caption failed the validation gate (word range, preamble/refusal residue, trigger, adult rule)."""
+
+    def __init__(self, message: str, reasons: list[str] | None = None, text: str = "", model: str = ""):
+        super().__init__(message)
+        self.reasons = list(reasons or [])
+        self.text = text
+        self.model = model
 
 
 class ModelRefusalError(Exception):
@@ -104,6 +129,113 @@ def is_refusal_response(raw_text: str, choice_data: dict | None = None) -> bool:
     return False
 
 
+# ----------------------------------------------------------------------------- Validation gate
+# Chatty openers: the caption must start with the trigger, not with talk about the task
+PREAMBLE_REGEX = re.compile(
+    r"^(?:here(?:'s|’s| is| are)\b|sure\b|certainly\b|of course\b|okay\b|ok\b|absolutely\b|"
+    r"(?:this|the) (?:image|photo|photograph|picture|frame|scene) (?:shows|depicts|features|captures|presents)\b|"
+    r"in this (?:image|photo|photograph|picture)\b|caption\s*:|description\s*:)",
+    re.IGNORECASE,
+)
+# Refusal residue / meta talk anywhere in an otherwise complete reply
+RESIDUE_REGEX = re.compile(
+    r"\bI (?:can(?:'|’)t|cannot|can not|won(?:'|’)t|am unable|(?:'|’)m unable|am not able|apologi[sz]e)\b|"
+    r"\bI(?:'|’)m sorry\b|\bI am sorry\b|\bas an ai\b|\blanguage model\b|"
+    r"\b(?:this|the) (?:image|photo|photograph|picture) (?:shows|depicts)\b|\bhere is (?:a|the) (?:caption|description)\b",
+    re.IGNORECASE,
+)
+# Adult-only rule: minor-coded descriptors reject the caption (plain "girl" is rewritten to "adult woman")
+MINOR_CODED_REGEX = re.compile(
+    r"\b(?:teen(?:age|ager)?s?|pre-?teens?|school ?girls?|(?:young|little) girls?|child(?:ren)?|"
+    r"juveniles?|underage|barely legal)\b",
+    re.IGNORECASE,
+)
+GIRL_REGEX = re.compile(r"\bgirl(s)?\b", re.IGNORECASE)
+
+# Errors that move a frame to the next cascade layer (L1 -> L2 -> L3) instead of failing it at once
+CASCADE_ERRORS: tuple[type[BaseException], ...] = (ModelRefusalError, CaptionTruncatedError, CaptionValidationError)
+
+
+def _strip_lead_tokens(text: str, trigger: str, video_hash: str | None) -> str:
+    """Drop leading quotes/markdown and a leading trigger/hash so the preamble check sees the model's own opening."""
+    words = text.strip().lstrip("\"'*#>`- ").split()
+    for token in (trigger, video_hash):
+        if token and words and words[0].strip(",.:;\"'").lower() == token.lower():
+            words = words[1:]
+    return " ".join(words).lstrip("\"'*#>`-:, ")
+
+
+def validate_caption_gate(
+    raw_text: str,
+    cleaned: str,
+    mode: str = "concept",
+    trigger: str = "restrained_elegance",
+    video_hash: str | None = None,
+) -> list[str]:
+    """Hard checks before a caption is accepted. Returns the reasons it is rejected (empty list = accepted)."""
+    reasons: list[str] = []
+    profile = get_profile(mode)
+    words = cleaned.split()
+
+    if not words or words[0].strip(",.:;").lower() != (trigger or "").strip().lower():
+        reasons.append(f"trigger '{trigger}' is not at token 0")
+
+    lo, hi = profile.hard_word_limits
+    n = len(words)
+    if n < lo:
+        reasons.append(f"too short ({n} words, minimum {lo} for {profile.mode})")
+    elif n > hi:
+        reasons.append(f"too long ({n} words, maximum {hi} for {profile.mode})")
+
+    opening = _strip_lead_tokens(raw_text, trigger, video_hash)
+    if PREAMBLE_REGEX.match(opening):
+        reasons.append(f"preamble instead of a caption: '{' '.join(opening.split()[:6])}'")
+    residue = RESIDUE_REGEX.search(raw_text)
+    if residue:
+        reasons.append(f"refusal or meta residue: '{residue.group(0)}'")
+
+    if looks_truncated(cleaned):
+        reasons.append("does not end with a complete sentence")
+
+    minor = MINOR_CODED_REGEX.search(raw_text)
+    if minor:
+        reasons.append(f"minor-coded descriptor '{minor.group(0)}' (adults-only rule)")
+    return reasons
+
+
+def empty_usage() -> dict[str, Any]:
+    return {"prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0, "calls": 0, "cost_reported": False}
+
+
+def accumulate_usage(usage: dict[str, Any] | None, body: dict[str, Any] | None) -> None:
+    """Adds one OpenRouter response's `usage` (tokens + `cost` in USD credits) to the running totals."""
+    if usage is None:
+        return
+    for key, val in empty_usage().items():
+        usage.setdefault(key, val)
+    usage["calls"] += 1
+    u = (body or {}).get("usage") or {}
+    try:
+        usage["prompt_tokens"] += int(u.get("prompt_tokens") or 0)
+        usage["completion_tokens"] += int(u.get("completion_tokens") or 0)
+        if u.get("cost") is not None:
+            usage["cost_usd"] += float(u["cost"])
+            usage["cost_reported"] = True
+    except (TypeError, ValueError):
+        pass
+
+
+def tag_hint_text(tags: list[str] | None) -> str:
+    """User-message suffix with human-verified image tags (learn-as-you-tag). Empty when there are none."""
+    names = [t.strip() for t in (tags or []) if t and t.strip()]
+    if not names:
+        return ""
+    return (
+        "\n\nVerified visible elements (confirmed by a human; describe them naturally where they appear, "
+        "do not list them): " + ", ".join(dict.fromkeys(names)) + "."
+    )
+
+
 class OpenRouterCaptioner:
     """Dispatches 512px token-saving image payloads to OpenRouter (deepseek/deepseek-v4.1-flash & x-ai/grok-4.7)."""
 
@@ -129,82 +261,14 @@ class OpenRouterCaptioner:
         return base64.b64encode(encoded).decode("utf-8")
 
     @staticmethod
-    def _read_skill_reference(mode: str) -> str:
-        """Loads skill reference files from disk to provide full role and taxonomy context to the OpenRouter model."""
-        skill_roots = [
-            Path("/mnt/c/Users/Patri/.gemini/config/skills"),
-            Path("C:/Users/Patri/.gemini/config/skills"),
-            Path.home() / ".gemini" / "config" / "skills",
-        ]
-        base_dir = next((p for p in skill_roots if p.is_dir()), None)
-        if not base_dir:
-            return ""
-
-        snippets: list[str] = []
-        char_concept_dir = base_dir / "krea2-character-concept-captioner"
-        taxonomy_file = base_dir / "shibari-bondage-taxonomy" / "SKILL.md"
-
-        try:
-            if mode == "character":
-                guide = char_concept_dir / "references" / "character_captioning_guide.md"
-                if guide.is_file():
-                    snippets.append(guide.read_text(encoding="utf-8")[:2500])
-            elif mode == "style":
-                guide = char_concept_dir / "references" / "concept_captioning_guide.md"
-                if guide.is_file():
-                    snippets.append(guide.read_text(encoding="utf-8")[:2000])
-            else:
-                guide = char_concept_dir / "references" / "concept_captioning_guide.md"
-                if guide.is_file():
-                    snippets.append(guide.read_text(encoding="utf-8")[:2200])
-                if taxonomy_file.is_file():
-                    snippets.append(taxonomy_file.read_text(encoding="utf-8")[:2800])
-        except Exception:
-            pass
-
-        if not snippets:
-            return ""
-        return "\n\n--- SKILL & TAXONOMY REFERENCE CONTEXT ---\n" + "\n\n".join(snippets)
+    def load_system_prompt(mode: str = "concept", trigger_word: str = "restrained_elegance", class_noun: str = "woman") -> str:
+        """Renders the versioned system prompt for the mode (`pipeline/prompts/<mode>.md`, see `prompt_version`)."""
+        return render_system_prompt(mode, trigger_word, class_noun)
 
     @staticmethod
-    def load_system_prompt(mode: str = "concept", trigger_word: str = "restrained_elegance", class_noun: str = "woman") -> str:
-        """Returns the expert VLM system prompt with loaded skill context and strict equipment/tie priority."""
-        trigger = trigger_word.strip() or "restrained_elegance"
-        noun = class_noun.strip() or "woman"
-        skill_context = OpenRouterCaptioner._read_skill_reference(mode)
-
-        if mode == "character":
-            base_prompt = (
-                f"You are an expert visual director annotating a character training dataset for the Krea 2 foundation model.\n"
-                f"Describe this image adhering to these strict rules:\n"
-                f"1. Refer to the human subject at Token 0 as: '{trigger} Photograph of a {noun}...'\n"
-                f"2. DO NOT describe permanent, immutable facial geometry (never mention eye shape, facial bone structure, nose shape, or ethnicity).\n"
-                f"3. PRIMARY FOCUS: Thoroughly describe all ties, restraints, equipment, hardware, clothing, fabrics, and accessories.\n"
-                f"4. SECONDARY (Keep Brief): Briefly note posture, expression, background, and lighting in 1-2 short clauses.\n"
-                f"DO NOT include quality buzzwords ('masterpiece', '8k', 'photorealistic'). Output a single cohesive paragraph between 80 and 140 words (strictly under 300 tokens)."
-            )
-        elif mode == "style":
-            base_prompt = (
-                f"You are an objective visual annotator creating dataset descriptions for a style model.\n"
-                f"Describe this image following the Content Inversion rule:\n"
-                f"1. Begin with: '{trigger} Photograph of...'\n"
-                f"2. Describe all objects, equipment, ties, people, clothing, and actions in plain, objective detail.\n"
-                f"3. DO NOT describe the artistic style, color grading, film grain, vintage look, lighting aesthetics, or artistic technique.\n"
-                f"Avoid quality praise. Output a single cohesive paragraph between 75 and 130 words (strictly under 300 tokens)."
-            )
-        else:  # Concept / Restraint default
-            base_prompt = (
-                f"You are an expert visual director and restraint taxonomist annotating a concept dataset for the Krea 2 foundation model (MMDiT architecture with Qwen3-VL text encoder).\n"
-                f"Describe this scene in a single cohesive, photographic paragraph adhering to these Krea 2 training principles:\n"
-                f"1. Token 0 Anchor: Start Line 1 with '{trigger} Photograph of...'\n"
-                f"2. Subject Decoupling: State the adult subject's demographic, build, and skin tone to avoid baking identity into the concept trigger.\n"
-                f"3. Posture & Anatomical Tension: Describe body stance, limb angles, joint positions, and muscle tension as they interact with the restraints.\n"
-                f"4. Ties, Bondage, Hardware & Materials Focus: Thoroughly describe the knots, rigging patterns (e.g. takate-kote box tie, hishime harness, frog tie, suspension lines), cordage/chain materials (e.g. 6mm unbleached Japanese hemp rope, welded steel chains, chrome shackles, leather cuffs/collars, spreader bars, steel cages), and visible skin indentation/compression lines.\n"
-                f"5. Spatial Setting & Optics: Ground the scene with the immediate environment, floor reflections, chiaroscuro directional lighting, and shallow depth of field to ensure Qwen3-VL learns cohesive 3D geometry and realistic surface textures without token bleeding.\n"
-                f"6. Formatting: Avoid Danbooru tags and bracket weights. DO NOT include quality buzzwords ('masterpiece', '8k', 'photorealistic'). Output flowing natural prose between 120 and 180 words (strictly under 300 tokens)."
-            )
-
-        return base_prompt + skill_context
+    def load_user_prompt(mode: str = "concept", trigger_word: str = "restrained_elegance", class_noun: str = "woman") -> str:
+        """Mode-specific user message whose word range matches the system prompt."""
+        return render_user_prompt(mode, trigger_word, class_noun)
 
     @staticmethod
     def build_request_payload(
@@ -212,9 +276,10 @@ class OpenRouterCaptioner:
         system_prompt: str,
         model: str = "google/gemma-4-31b-it",
         max_tokens: int = DEFAULT_CAPTION_MAX_TOKENS,
-        temperature: float = 0.80,
-        top_p: float = 0.90,
+        temperature: float = DEFAULT_CAPTION_TEMPERATURE,
+        top_p: float = DEFAULT_CAPTION_TOP_P,
         reasoning_effort: str | None = None,
+        user_text: str | None = None,
     ) -> dict[str, Any]:
         """Builds the OpenRouter payload. Enabling reasoning raises max_tokens so the visible caption fits."""
         reasoning_effort = normalize_reasoning_effort(reasoning_effort)
@@ -228,14 +293,7 @@ class OpenRouterCaptioner:
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                "Describe this image for Krea 2 LoRA dataset training following the system instructions and skill context. "
-                                "Focus on the specific ties, bondage mechanics, and equipment while maintaining cohesive scene context (posture, tension, setting, chiaroscuro lighting). "
-                                "Output a single flowing paragraph between 120 and 180 words, strictly under 300 tokens."
-                            ),
-                        },
+                        {"type": "text", "text": user_text or render_user_prompt("concept")},
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_jpeg}"}},
                     ],
                 },
@@ -243,6 +301,8 @@ class OpenRouterCaptioner:
             "max_tokens": max_tokens,
             "temperature": temperature,
             "top_p": top_p,
+            # OpenRouter returns token counts and the billed cost in `usage` when asked to
+            "usage": {"include": True},
         }
         if reasoning_effort:
             payload["reasoning"] = {
@@ -251,22 +311,23 @@ class OpenRouterCaptioner:
             }
         return payload
 
-
-
     @staticmethod
     def sanitize_and_validate_caption(
         raw_caption: str,
         mode: str = "concept",
         trigger: str = "restrained_elegance",
         video_hash: str | None = None,
+        class_noun: str | None = None,
     ) -> tuple[str, list[str]]:
         """Cleans caption and audits against krea2-character-concept-captioner linter standards.
-        
+
         Guarantees that `trigger` is placed at Token 0, and `video_hash` (if provided) is
         placed immediately adjacent at Token 1 for LoRA scene identification and disambiguation.
+        Per-mode trigger profile checks (`pipeline.prompts.TRIGGER_PROFILES`) only add warnings.
         """
         cleaned = raw_caption.strip()
         warnings: list[str] = []
+        profile = get_profile(mode)
 
         # 1. Strip WebUI-style bracket weights
         cleaned = BRACKET_WEIGHT_REGEX.sub("", cleaned).strip()
@@ -277,6 +338,11 @@ class OpenRouterCaptioner:
             if pattern.search(cleaned):
                 cleaned = pattern.sub("", cleaned)
                 warnings.append(f"Stripped sludge token: '{s}'")
+
+        # Adults only: a bare "girl" becomes "adult woman" (minor-coded phrases are rejected by the gate)
+        if GIRL_REGEX.search(cleaned):
+            cleaned = GIRL_REGEX.sub(lambda m: "adult women" if m.group(1) else "adult woman", cleaned)
+            warnings.append("Replaced 'girl' with 'adult woman'")
 
         # Normalize redundant spaces/commas
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
@@ -306,13 +372,27 @@ class OpenRouterCaptioner:
 
         # 4. Length audit against the mode's requested word range
         n_words = len(cleaned.split())
-        lo, hi = MODE_WORD_RANGES.get(mode, MODE_WORD_RANGES["concept"])
+        lo, hi = profile.word_range
         if n_words < lo:
             warnings.append(f"Caption is short ({n_words} words, expected {lo}-{hi})")
         elif n_words > hi:
             warnings.append(f"Caption is long ({n_words} words, expected {lo}-{hi})")
         if looks_truncated(cleaned):
             warnings.append("Caption does not end with a complete sentence")
+
+        # 5. Trigger profile: the trigger is used exactly once; character captions name the class noun early
+        trig_re = re.compile(r"(?<![\w-])" + re.escape(trigger) + r"(?![\w-])", re.IGNORECASE) if trigger else None
+        if trig_re and len(trig_re.findall(cleaned)) > 1:
+            warnings.append(f"Trigger '{trigger}' appears more than once")
+        if profile.class_noun_in_opening and class_noun:
+            noun = primary_class_noun(class_noun)
+            opening = " ".join(cleaned.split()[:12]).lower()
+            if not re.search(r"\b" + re.escape(noun.lower()) + r"s?\b", opening):
+                warnings.append(f"Class noun '{noun}' missing from the opening (expected '{trigger} ... {noun}')")
+        for pattern in profile.discouraged:
+            hit = re.search(pattern, cleaned, re.IGNORECASE)
+            if hit:
+                warnings.append(f"Discouraged in {profile.mode} mode: '{hit.group(0)}'")
 
         return cleaned, warnings
 
@@ -326,14 +406,22 @@ class OpenRouterCaptioner:
         trigger: str = "restrained_elegance",
         class_noun: str = "woman",
         max_tokens: int = DEFAULT_CAPTION_MAX_TOKENS,
-        temperature: float = 0.80,
-        top_p: float = 0.90,
+        temperature: float = DEFAULT_CAPTION_TEMPERATURE,
+        top_p: float = DEFAULT_CAPTION_TOP_P,
         reasoning_effort: str | None = None,
         max_dim: int = 512,
         video_hash: str | None = None,
+        usage: dict[str, Any] | None = None,
+        tag_hints: list[str] | None = None,
     ) -> tuple[str, list[str]]:
+        """Sends single frame to OpenRouter and returns sanitized caption + validation warnings.
 
-        """Sends single frame to OpenRouter and returns sanitized caption + validation warnings."""
+        `tag_hints` are image tags a human confirmed on this frame; the model is asked to name them if visible.
+
+        Raises ModelRefusalError / CaptionTruncatedError / CaptionValidationError (the cascade errors)
+        when the reply is unusable. Every billed response is added to `usage` (see accumulate_usage).
+        """
+        mode = normalize_mode(mode)
         base64_img = self.prepare_512px_payload(img_bgr, max_dim=max_dim)
         sys_prompt = self.load_system_prompt(mode, trigger, class_noun)
         payload = self.build_request_payload(
@@ -344,7 +432,10 @@ class OpenRouterCaptioner:
             temperature=temperature,
             top_p=top_p,
             reasoning_effort=reasoning_effort,
+            user_text=self.load_user_prompt(mode, trigger, class_noun) + tag_hint_text(tag_hints),
         )
+        if usage is not None:
+            usage.setdefault("prompt_version", prompt_version(mode))
 
         headers = {
             "Authorization": f"Bearer {api_key.strip()}",
@@ -358,7 +449,7 @@ class OpenRouterCaptioner:
         backoff = 2.0
         retry_attempts = 0
         truncation_retries = 0
-        min_words = MODE_WORD_RANGES.get(mode, MODE_WORD_RANGES["concept"])[0]
+        min_words = MODE_WORD_RANGES[mode][0]
 
         while True:
             try:
@@ -378,9 +469,12 @@ class OpenRouterCaptioner:
 
             if resp.status_code == 200:
                 data = resp.json()
+                accumulate_usage(usage, data)
                 choice = data["choices"][0]
                 raw_text = choice["message"].get("content") or ""
                 hit_limit = choice.get("finish_reason") == "length"
+                if usage is not None:
+                    usage["finish_reason"] = choice.get("finish_reason")
 
                 # Refusals are short and complete; detect them before the too-short retry re-bills them.
                 # (Empty content with finish_reason 'length' is a reasoning-starved reply, not a refusal.)
@@ -405,11 +499,20 @@ class OpenRouterCaptioner:
                             f"Model '{model}' returned a cut-off caption after {truncation_retries + 1} attempts "
                             f"(finish_reason={choice.get('finish_reason')}, {len(raw_text.split())} words)"
                         )
-                    # Complete but short after retries: accept, sanitize_and_validate_caption warns
+                    # Complete but still short after retries: the validation gate below decides
 
-                return self.sanitize_and_validate_caption(
-                    raw_text, mode=mode, trigger=trigger, video_hash=video_hash
+                cleaned, warnings = self.sanitize_and_validate_caption(
+                    raw_text, mode=mode, trigger=trigger, video_hash=video_hash, class_noun=class_noun
                 )
+                reasons = validate_caption_gate(raw_text, cleaned, mode=mode, trigger=trigger, video_hash=video_hash)
+                if reasons:
+                    raise CaptionValidationError(
+                        f"Model '{model}' caption rejected: {'; '.join(reasons)}",
+                        reasons=reasons,
+                        text=cleaned,
+                        model=model,
+                    )
+                return cleaned, warnings
 
             elif resp.status_code in (400, 403):
                 err_text = resp.text

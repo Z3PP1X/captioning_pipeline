@@ -24,9 +24,34 @@ All values live in `src/web/styles.css` and are used via Tailwind token classes 
 | `--primary` / `--primary-foreground` | `#D73816` / `#FFFFFF` | Primary button, active tab/nav, progress |
 | `--ring` | `#D73816` | Focus ring — always solid (`ring-ring`) |
 | `--destructive` | `#D70015` | Errors, destructive actions |
-| `--success` / `--warning` / `--info` | `#22C55E` / `#FFBC1F` / `#1658C7` | Status tints + icons (never as text color on white) |
+| `--success` / `--warning` / `--info` | `#22C55E` / `#FFBC1F` / `#1658C7` | Tints and fills only (success 2.28:1 / warning 1.68:1 on white fail); `--info` may also be used as icon/text (6.45:1 on white) |
+| `--success-strong` / `text-success-strong` | `#15803D` | Success state as **text, icon, border or dot on white**: 5.02:1 on white, 4.59 on muted, 4.60 on `success/10` |
+| `--warning-strong` / `text-warning-strong` | `#8A5A00` | Warning state as **text, icon, border or dot on white**: 5.93:1 on white, 5.43 on muted, 5.46 on `warning/15` |
 | `--sidebar*` | Ink family | Dark navigation |
 | `--chart-1…5` | Primary, Ink, Grey, Info, Warning | Charts: primary = highlighted series only |
+
+### Strong state tokens (decision 4, 2026-10-16)
+
+`--success` (2.28:1 on white) and `--warning` (1.68:1) fail even the 3:1 non-text minimum, so they stay **tints and fills only** (`bg-success/10`, `bg-warning/15`, progress fills, the bright In/Out range on the ink timeline). Whenever the colour itself has to be read on a light surface use the strong shade:
+
+- text: `text-success-strong` / `text-warning-strong` (workflow-bar step labels and summaries, kept counts on the board);
+- icons: `hlmBadge` `success` / `warning` colour their icon with the strong token (text stays ink); check / star icons in buttons and cards;
+- borders / rings / dots: `border-success-strong ring-success-strong` (kept card), `border-warning-strong ring-warning-strong` (starred card, lightbox Star), `bg-success-strong` / `bg-warning-strong` (SSE connection dot).
+
+Never use the strong tokens as large fills. On canvas (`#E9EBEE`) success-strong is 4.20:1: fine for icons and bold/large text, avoid for small body text there.
+
+### Badge variants (`hlmBadge`)
+
+| Variant | Use | Text / icon |
+| --- | --- | --- |
+| `success` | done (exported, budget 100%, captioned) | ink on `success/10` (15.96:1), icon `success-strong` |
+| `warning` | running / needs attention (extracting, captioning, unsaved) | ink on `warning/15` (16.04:1), icon `warning-strong` |
+| `info` | in review (curating) | ink on `info/10` (14.94:1), icon `info` (5.54:1 on its tint) |
+| `danger` | broken, invalid budget | ink on `destructive/10`, icon `destructive` |
+| `muted` | new, chunked, skipped, ignored | muted-foreground on muted (5.06:1) |
+| `outline` | neutral counters | ink |
+
+Status mapping lives in one place (`src/web/app/core/ui/status.ts`); badges always carry an icon plus text.
 
 Note: `--primary` (red) and `--destructive` (red) are close in hue. Destructive actions therefore always use the soft `destructive` button variant + a confirmation, and status uses icons — never rely on the red alone.
 

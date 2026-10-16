@@ -2,6 +2,18 @@ import { Injectable, computed, inject, signal } from '@angular/core';
 import { ApiService } from './api.service';
 import { CandidateFrame, CandidateState, CurationDistribution } from '../models/candidate.model';
 import { ChunkItem } from '../models/chunk.model';
+import { ReselectReport, ReselectRequest } from '../models/scoring.model';
+
+/** `POST /api/videos/{id}/reselect`: curation-300 shape plus the report. */
+interface ReselectResponse {
+  picks?: CandidateFrame[];
+  runners?: CandidateFrame[];
+  candidates?: CandidateFrame[];
+  chunks?: ChunkItem[];
+  distribution?: any;
+  stats?: any;
+  reselect: ReselectReport;
+}
 
 @Injectable({
   providedIn: 'root',
@@ -16,6 +28,9 @@ export class CurateService {
   readonly curateRoleFilter = signal<'all' | 'pick' | 'runner_up'>('all');
   readonly curateStateFilter = signal<'all' | 'keep' | 'reject' | 'star'>('all');
   readonly targetPersonOnly = signal<boolean>(false);
+  /** Image tag filter: frames carrying the tag (confirmed only, or confirmed + suggested). */
+  readonly tagFilter = signal<number | null>(null);
+  readonly tagFilterIncludeSuggested = signal<boolean>(true);
   readonly showRunnerUps = signal<boolean>(false);
   readonly lightboxIndex = signal<number | null>(null);
   readonly isLoading = signal<boolean>(false);
@@ -27,6 +42,8 @@ export class CurateService {
     const stateFilter = this.curateStateFilter();
     const showRunners = this.showRunnerUps();
     const targetOnly = this.targetPersonOnly();
+    const tagFilter = this.tagFilter();
+    const tagIncludeSuggested = this.tagFilterIncludeSuggested();
 
     // Unless explicitly viewing runner ups, show only picks by default if not filtered by role
     if (!showRunners && roleFilter === 'all') {
@@ -51,6 +68,12 @@ export class CurateService {
 
     if (targetOnly) {
       list = list.filter((c) => c.target_person_matched || (c.target_person_sim !== undefined && c.target_person_sim >= 0.363));
+    }
+
+    if (tagFilter !== null) {
+      list = list.filter((c) =>
+        (c.tags || []).some((t) => t.tag_id === tagFilter && (tagIncludeSuggested || t.status === 'confirmed')),
+      );
     }
 
     return list;
@@ -102,24 +125,8 @@ export class CurateService {
         distData = fb.distribution || fb.stats;
       }
 
-      const mapCandidate = (c: CandidateFrame, isPick: boolean): CandidateFrame => ({
-        ...c,
-        video_id: String(videoId),
-        is_pick: isPick,
-        role: isPick ? 'pick' : 'runner_up',
-        time_s: c.t !== undefined ? c.t : (c.time_s || 0),
-        thumb_url: c.preview_url || c.thumb_url || `/api/frames/${c.id}/preview`,
-        preview_url: c.preview_url || `/api/frames/${c.id}/preview`,
-        full_url: c.full_url || `/api/frames/${c.id}/full`,
-        state: c.state || (isPick ? 'keep' : 'reject'),
-        target_person_sim: c.target_person_sim ?? c.zs_scores?.['target_person_sim'] ?? 0,
-        target_person_matched: Boolean(c.target_person_matched ?? c.zs_scores?.['target_person_matched']),
-        face_count: c.face_count ?? c.zs_scores?.['face_count'] ?? 0,
-        faces: c.faces ?? c.zs_scores?.['faces'] ?? [],
-      });
-
-      const normalizedPicks = rawPicks.map((c) => mapCandidate(c, true));
-      const normalizedRunners = rawRunners.map((c) => mapCandidate(c, false));
+      const normalizedPicks = rawPicks.map((c) => this.normalizeFrame(c, true, videoId));
+      const normalizedRunners = rawRunners.map((c) => this.normalizeFrame(c, false, videoId));
       const allCandidates = [...normalizedPicks, ...normalizedRunners];
 
       this.candidates.set(allCandidates);
@@ -136,6 +143,48 @@ export class CurateService {
     } finally {
       this.isLoading.set(false);
     }
+  }
+
+  /**
+   * Phase F reselect: re-runs pick vs runner_up over the stored frames with the given knobs and replaces the
+   * candidate list from the curation-300-shaped response. Errors (409 busy, 400 infeasible, 422) are rethrown
+   * as ApiError and leave the current list untouched.
+   */
+  async reselect(videoId: string | number, request: ReselectRequest): Promise<ReselectReport> {
+    const res = await this.api.post<ReselectResponse>(`/api/videos/${videoId}/reselect`, request);
+    const picks = (res.picks || []).map((c) => this.normalizeFrame(c, true, videoId));
+    const runners = (res.runners || []).map((c) => this.normalizeFrame(c, false, videoId));
+    const all = [...picks, ...runners];
+    this.candidates.set(all);
+    if (res.chunks && res.chunks.length > 0) {
+      this.curationChunks.set(res.chunks);
+    }
+    const dist = res.distribution || res.stats;
+    if (dist) {
+      this.updateDistributionFromData(dist, all);
+    } else {
+      this.recalculateDistribution();
+    }
+    return res.reselect;
+  }
+
+  /** Unified frame row (curation-300 / candidates / reselect) -> grid candidate. */
+  private normalizeFrame(c: CandidateFrame, isPick: boolean, videoId: string | number): CandidateFrame {
+    return {
+      ...c,
+      video_id: String(videoId),
+      is_pick: isPick,
+      role: isPick ? 'pick' : 'runner_up',
+      time_s: c.t !== undefined ? c.t : (c.time_s || 0),
+      thumb_url: c.preview_url || c.thumb_url || `/api/frames/${c.id}/preview`,
+      preview_url: c.preview_url || `/api/frames/${c.id}/preview`,
+      full_url: c.full_url || `/api/frames/${c.id}/full`,
+      state: c.state || (isPick ? 'keep' : 'reject'),
+      target_person_sim: c.target_person_sim ?? c.zs_scores?.['target_person_sim'] ?? 0,
+      target_person_matched: Boolean(c.target_person_matched ?? c.zs_scores?.['target_person_matched']),
+      face_count: c.face_count ?? c.zs_scores?.['face_count'] ?? 0,
+      faces: c.faces ?? c.zs_scores?.['faces'] ?? [],
+    };
   }
 
   async setCandidateState(
@@ -244,6 +293,21 @@ export class CurateService {
     } finally {
       this.isLoading.set(false);
     }
+  }
+
+  /** Replace the tags of one frame in place (after the user tagged it in the lightbox). */
+  setFrameTags(frameId: number, tags: CandidateFrame['tags']): void {
+    this.candidates.update((list) => list.map((c) => (c.id === frameId ? { ...c, tags } : c)));
+  }
+
+  /** Refresh only the tags of every candidate (after a video-wide re-score), keeping all other state. */
+  async refreshTags(videoId: string | number): Promise<void> {
+    const res = await this.api.get<{ picks?: CandidateFrame[]; runners?: CandidateFrame[] }>(
+      `/api/videos/${videoId}/curation-300`,
+    );
+    const byId = new Map<number, CandidateFrame['tags']>();
+    for (const c of [...(res.picks || []), ...(res.runners || [])]) byId.set(c.id, c.tags || []);
+    this.candidates.update((list) => list.map((c) => (byId.has(c.id) ? { ...c, tags: byId.get(c.id) } : c)));
   }
 
   openLightbox(candidateId: number): void {

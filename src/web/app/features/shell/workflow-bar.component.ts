@@ -14,13 +14,18 @@ import {
   lucideChevronRight,
   lucideListChecks,
   lucideCaptions,
+  lucideHash,
+  lucideTarget,
+  lucideUserPlus,
 } from '@ng-icons/lucide';
 import { HlmButtonImports } from '@spartan-ng/helm/button';
 import { HlmBadgeImports } from '@spartan-ng/helm/badge';
 import { HlmTooltipImports } from '@spartan-ng/helm/tooltip';
 import { WorkflowService, WorkflowStepInfo, WorkflowStepId } from '../../core/services/workflow.service';
+import { JobEventService } from '../../core/services/job-event.service';
 import { VideoService } from '../../core/services/video.service';
 import { ChunkService } from '../../core/services/chunk.service';
+import { derivedVideoStatus } from '../../core/ui/status';
 import { CurateService } from '../../core/services/curate.service';
 import { formatShortTime } from '../../core/utils/time.utils';
 import { videoStatusMeta } from '../../core/ui/status';
@@ -43,6 +48,9 @@ import { videoStatusMeta } from '../../core/ui/status';
       lucideChevronRight,
       lucideListChecks,
       lucideCaptions,
+      lucideHash,
+      lucideTarget,
+      lucideUserPlus,
     }),
   ],
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -69,17 +77,37 @@ import { videoStatusMeta } from '../../core/ui/status';
               hlmBadge
               [variant]="statusMeta().variant"
               size="sm"
-              class="gap-1 font-semibold text-[11px]"
+              class="gap-1 font-semibold text-xs"
             >
               {{ statusMeta().label }}
             </span>
 
+            <!-- LoRA profile (decision 1): character = identity gate + solo crops + character captions -->
+            <div class="inline-flex rounded-md border border-border p-0.5 text-xs" role="group" aria-label="LoRA profile">
+              @for (p of profiles; track p.value) {
+                <button
+                  type="button"
+                  class="rounded px-2 py-0.5 font-semibold cursor-pointer transition-colors"
+                  [class.bg-secondary]="(v.profile || 'concept') === p.value"
+                  [class.text-secondary-foreground]="(v.profile || 'concept') === p.value"
+                  [class.text-muted-foreground]="(v.profile || 'concept') !== p.value"
+                  [attr.aria-pressed]="(v.profile || 'concept') === p.value"
+                  [title]="p.hint"
+                  (click)="onProfile(v.id, p.value)"
+                >
+                  {{ p.label }}
+                </button>
+              }
+            </div>
+
             @if (v.title_hash) {
               <span
-                class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-mono font-semibold bg-muted text-foreground border border-border"
+                class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs tabular-nums font-semibold bg-muted text-foreground border border-border"
                 title="Deterministic Video Title Hash for LoRA scene disambiguation"
               >
-                🏷️ {{ v.title_hash }}
+                <ng-icon name="lucideHash" class="size-3 text-muted-foreground" aria-hidden="true" />
+                <span class="sr-only">Title hash</span>
+                {{ v.title_hash }}
               </span>
             }
 
@@ -87,19 +115,21 @@ import { videoStatusMeta } from '../../core/ui/status';
               <button
                 type="button"
                 (click)="openPersonModal.emit()"
-                class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-primary/10 text-primary border border-primary/20 hover:bg-primary/20 transition-colors cursor-pointer"
+                class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold bg-primary/10 text-primary border border-primary/20 hover:bg-primary/20 transition-colors cursor-pointer"
                 title="Target person: {{ v.target_person_name }}. Click to change."
               >
-                <span>🎯 {{ v.target_person_name }}</span>
+                <ng-icon name="lucideTarget" class="size-3" aria-hidden="true" />
+                <span>{{ v.target_person_name }}</span>
               </button>
             } @else {
               <button
                 type="button"
                 (click)="openPersonModal.emit()"
-                class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium border border-border text-muted-foreground hover:text-foreground hover:bg-muted transition-colors cursor-pointer"
+                class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium border border-border text-muted-foreground hover:text-foreground hover:bg-muted transition-colors cursor-pointer"
                 title="Assign target person for face-prioritized extraction"
               >
-                <span>🎯 + Person</span>
+                <ng-icon name="lucideUserPlus" class="size-3" aria-hidden="true" />
+                <span>Person</span>
               </button>
             }
           </div>
@@ -116,8 +146,8 @@ import { videoStatusMeta } from '../../core/ui/status';
                 class="flex items-center gap-1.5 px-2 py-1 rounded-md text-xs font-semibold transition-colors disabled:cursor-not-allowed"
                 [class.text-primary]="step.state === 'current'"
                 [class.bg-primary/10]="step.state === 'current'"
-                [class.text-success]="step.state === 'done'"
-                [class.text-warning]="step.state === 'running'"
+                [class.text-success-strong]="step.state === 'done'"
+                [class.text-warning-strong]="step.state === 'running'"
                 [class.text-destructive]="step.state === 'error'"
                 [class.text-muted-foreground]="step.state === 'locked'"
                 [class.opacity-60]="step.state === 'locked'"
@@ -127,12 +157,12 @@ import { videoStatusMeta } from '../../core/ui/status';
                 <!-- Step State Icon -->
                 @switch (step.state) {
                   @case ('done') {
-                    <span class="flex size-4 items-center justify-center rounded-full bg-success/20 text-success">
+                    <span class="flex size-4 items-center justify-center rounded-full bg-success/20 text-success-strong">
                       <ng-icon name="lucideCheck" class="size-2.5 font-bold" />
                     </span>
                   }
                   @case ('running') {
-                    <span class="flex size-4 items-center justify-center rounded-full bg-warning/20 text-warning animate-spin">
+                    <span class="flex size-4 items-center justify-center rounded-full bg-warning/20 text-warning-strong animate-spin">
                       <ng-icon name="lucideLoader2" class="size-2.5" />
                     </span>
                   }
@@ -147,7 +177,7 @@ import { videoStatusMeta } from '../../core/ui/status';
                     </span>
                   }
                   @default {
-                    <span class="flex size-4 items-center justify-center rounded-full bg-primary text-primary-foreground font-black text-[10px]">
+                    <span class="flex size-4 items-center justify-center rounded-full bg-primary text-primary-foreground font-black text-xs">
                       {{ step.stepNumber }}
                     </span>
                   }
@@ -156,7 +186,7 @@ import { videoStatusMeta } from '../../core/ui/status';
               </button>
 
               @if (!last) {
-                <span class="text-muted-foreground/40 text-xs select-none" aria-hidden="true">&rarr;</span>
+                <ng-icon name="lucideChevronRight" class="size-3 text-muted-foreground/60" aria-hidden="true" />
               }
             }
           </nav>
@@ -167,7 +197,7 @@ import { videoStatusMeta } from '../../core/ui/status';
           <!-- Left: Contextual State Summary -->
           <div class="flex items-center gap-3 text-xs">
             @if (activeJob(); as job) {
-              <div class="flex items-center gap-2 text-warning font-medium">
+              <div class="flex items-center gap-2 text-warning-strong font-medium">
                 <ng-icon name="lucideLoader2" class="size-3.5 animate-spin" />
                 <span>{{ job.type }}: {{ Math.round(job.progress * 100) }}% ({{ job.step || 'Running' }})</span>
               </div>
@@ -187,15 +217,15 @@ import { videoStatusMeta } from '../../core/ui/status';
                   {{ chunkService.chunks().length }} Chunks
                 </span>
                 <span class="text-muted-foreground">&middot;</span>
-                <span [class.text-destructive]="chunkService.budgetSum() !== 100" [class.text-success]="chunkService.budgetSum() === 100">
+                <span [class.text-destructive]="chunkService.budgetSum() !== 100" [class.text-success-strong]="chunkService.budgetSum() === 100">
                   Budget: {{ chunkService.budgetSum() }}%
                 </span>
                 @if (chunkService.isDirty()) {
-                  <span hlmBadge variant="warning" size="sm" class="text-[10px] py-0 px-1.5">Unsaved Changes</span>
+                  <span hlmBadge variant="warning" size="sm" class="text-xs py-0 px-1.5">Unsaved Changes</span>
                 }
               </div>
             } @else if (v.status === 'exported') {
-              <div class="flex items-center gap-1.5 text-success font-medium">
+              <div class="flex items-center gap-1.5 text-success-strong font-medium">
                 <ng-icon name="lucideCheckCircle2" class="size-3.5" />
                 <span>Video dataset exports complete</span>
               </div>
@@ -238,6 +268,36 @@ import { videoStatusMeta } from '../../core/ui/status';
 export class WorkflowBarComponent {
   private readonly workflowService = inject(WorkflowService);
   private readonly videoService = inject(VideoService);
+  private readonly jobEvents = inject(JobEventService);
+
+  readonly profiles = [
+    { value: 'concept' as const, label: 'Concept', hint: 'Concept LoRA: all people and scenes count' },
+    {
+      value: 'character' as const,
+      label: 'Character',
+      hint: 'Character LoRA: only frames showing the target person; multi-person frames are cropped to them',
+    },
+  ];
+
+  async onProfile(videoId: string, profile: 'concept' | 'character'): Promise<void> {
+    try {
+      const res = await this.videoService.setProfile(videoId, profile);
+      if (profile === 'character' && res) {
+        if (res.applied) {
+          this.jobEvents.showToast(
+            'Character profile',
+            `${res.demoted?.length ?? 0} off-target picks replaced, ${res.cropped?.length ?? 0} multi-person picks cropped.`,
+            videoId,
+          );
+          await this.curateService.loadCandidates(videoId);
+        } else if (res.reason) {
+          this.jobEvents.showToast('Character profile', res.reason, videoId);
+        }
+      }
+    } catch (err) {
+      this.jobEvents.showToast('Profile not saved', String((err as Error)?.message ?? err), videoId, true);
+    }
+  }
   readonly chunkService = inject(ChunkService);
   private readonly curateService = inject(CurateService);
 
@@ -321,7 +381,8 @@ export class WorkflowBarComponent {
         await this.videoService.selectNextVideo();
         break;
       case 'restore':
-        await this.videoService.updateStatus(v.id, 'new');
+        // Decision 3: restore goes back to the status the data implies, not to 'new'
+        await this.videoService.updateStatus(v.id, derivedVideoStatus(v, this.chunkService.chunks().length));
         break;
     }
   }

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
 from typing import Any
 
@@ -13,6 +14,33 @@ from pipeline.rag.linter import lint_prompt
 from pipeline.rag.taxonomy import CHARACTERS, TAXONOMY_CATEGORIES
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_TEMPERATURE = 0.70
+MAX_VARIATIONS = 10
+
+
+def variation_temperature(index: int, n: int) -> float:
+    """Batch "Generate N": the first variation keeps the default, the rest spread up to +0.25."""
+    if n <= 1 or index <= 0:
+        return DEFAULT_TEMPERATURE
+    return round(DEFAULT_TEMPERATURE + 0.25 * index / (n - 1), 3)
+
+
+def exemplar_subsets(pool_size: int, top_k: int, n: int) -> list[list[int]]:
+    """Exemplar index subsets (into a relevance-ordered pool) for ``n`` variations.
+
+    Variation 0 gets the best ``top_k``; the others draw a seeded random ``top_k`` subset of the pool (kept in
+    relevance order) so batch variations are grounded in different exemplars when the pool is larger.
+    """
+    k = min(top_k, pool_size)
+    base = list(range(k))
+    subsets = [base]
+    for i in range(1, n):
+        if pool_size <= k:
+            subsets.append(base)
+        else:
+            subsets.append(sorted(random.Random(i).sample(range(pool_size), k)))
+    return subsets
 
 GEMMA_SYSTEM_INSTRUCTION = """You are an expert photographic director and visual prompt architect for Krea 2 (MMDiT architecture powered by Qwen3-VL text encoder) and the fine-art LoRA '{trigger}'.
 
@@ -103,8 +131,12 @@ class RagPromptGenerator:
         trigger: str = "restrained_elegance",
         api_key: str | None = None,
         local_url: str | None = None,
+        temperature: float = DEFAULT_TEMPERATURE,
     ) -> dict[str, Any]:
-        """Synthesizes RAG context, character specification, and user clicks into Archetypes A, B, and C."""
+        """Synthesizes RAG context, character specification, and user clicks into Archetypes A, B, and C.
+
+        ``temperature`` is jittered per call by batch generation ("Generate N") to vary the wording.
+        """
         effective_trigger = trigger.strip() or "restrained_elegance"
         system_prompt = GEMMA_SYSTEM_INSTRUCTION.replace("{trigger}", effective_trigger)
 
@@ -131,12 +163,12 @@ class RagPromptGenerator:
         # Dispatch to local Ollama or OpenRouter
         if model == "local" or (local_url and local_url.strip()):
             url = ((local_url or "").strip() or "http://localhost:11434").rstrip("/")
-            raw_json_str = await self._call_ollama(url, system_prompt, user_content)
+            raw_json_str = await self._call_ollama(url, system_prompt, user_content, temperature=temperature)
         else:
             key = (api_key or self.settings.openrouter_api_key or "").strip()
             if not key:
                 raise ValueError("OpenRouter API key is missing. Configure it in .env or settings.")
-            raw_json_str = await self._call_openrouter(key, model, system_prompt, user_content)
+            raw_json_str = await self._call_openrouter(key, model, system_prompt, user_content, temperature=temperature)
 
         # Parse JSON
         parsed_data = self._clean_and_parse_json(raw_json_str, effective_trigger)
@@ -193,7 +225,9 @@ class RagPromptGenerator:
             ],
         }
 
-    async def _call_openrouter(self, api_key: str, model: str, system_prompt: str, user_prompt: str) -> str:
+    async def _call_openrouter(
+        self, api_key: str, model: str, system_prompt: str, user_prompt: str, temperature: float = DEFAULT_TEMPERATURE
+    ) -> str:
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -206,7 +240,7 @@ class RagPromptGenerator:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "temperature": 0.70,
+            "temperature": temperature,
             "max_tokens": 800,
             "response_format": {"type": "json_object"},
         }
@@ -222,7 +256,9 @@ class RagPromptGenerator:
         except (ValueError, KeyError, IndexError, TypeError) as err:
             raise RagUpstreamError(f"Unexpected OpenRouter response: {resp.text[:300]}") from err
 
-    async def _call_ollama(self, base_url: str, system_prompt: str, user_prompt: str) -> str:
+    async def _call_ollama(
+        self, base_url: str, system_prompt: str, user_prompt: str, temperature: float = DEFAULT_TEMPERATURE
+    ) -> str:
         payload = {
             "model": "gemma2:2b",
             "messages": [
@@ -231,6 +267,7 @@ class RagPromptGenerator:
             ],
             "stream": False,
             "format": "json",
+            "options": {"temperature": temperature},
         }
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:

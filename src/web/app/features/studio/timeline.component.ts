@@ -113,7 +113,7 @@ import { ChunkItem } from '../../core/models/chunk.model';
           @if (hoverThumbUrl()) {
             <img [src]="hoverThumbUrl()!" alt="hover thumb" class="w-28 h-16 object-cover rounded mb-1" />
           }
-          <span class="font-mono text-[10px] text-foreground">{{ formatHms(hoverTime()!) }}</span>
+          <span class="tabular-nums text-xs text-foreground">{{ formatHms(hoverTime()!) }}</span>
         </div>
       }
     </div>

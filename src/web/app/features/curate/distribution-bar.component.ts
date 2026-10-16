@@ -1,6 +1,6 @@
 import { ChangeDetectionStrategy, Component, computed, inject } from '@angular/core';
 import { NgIcon, provideIcons } from '@ng-icons/core';
-import { lucideUsers, lucideUser, lucideWrench, lucideEye, lucideAlertTriangle } from '@ng-icons/lucide';
+import { lucideUsers, lucideUser, lucideWrench, lucideEye, lucideAlertTriangle, lucideTarget } from '@ng-icons/lucide';
 import { HlmProgressImports } from '@spartan-ng/helm/progress';
 import { HlmBadgeImports } from '@spartan-ng/helm/badge';
 import { CurateService } from '../../core/services/curate.service';
@@ -9,7 +9,7 @@ import { VideoService } from '../../core/services/video.service';
 @Component({
   selector: 'app-distribution-bar',
   imports: [NgIcon, HlmProgressImports, HlmBadgeImports],
-  providers: [provideIcons({ lucideUsers, lucideUser, lucideWrench, lucideEye, lucideAlertTriangle })],
+  providers: [provideIcons({ lucideUsers, lucideUser, lucideWrench, lucideEye, lucideAlertTriangle, lucideTarget })],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 rounded-xl border border-border bg-card p-3 shadow-xs select-none">
@@ -22,7 +22,7 @@ import { VideoService } from '../../core/services/video.service';
           </span>
           <div class="flex items-center gap-1">
             @if (multipleHealth() === 'warning' || multipleHealth() === 'danger') {
-              <ng-icon name="lucideAlertTriangle" class="size-3 text-warning" title="Outside optimal range" />
+              <ng-icon name="lucideAlertTriangle" class="size-3 text-warning-strong" title="Outside optimal range" />
             }
             <span class="font-bold text-foreground tabular-nums">{{ dist()?.multiple_people?.pct || 0 }}%</span>
           </div>
@@ -42,7 +42,7 @@ import { VideoService } from '../../core/services/video.service';
           </span>
           <div class="flex items-center gap-1">
             @if (onePersonHealth() === 'warning') {
-              <ng-icon name="lucideAlertTriangle" class="size-3 text-warning" title="Outside optimal range" />
+              <ng-icon name="lucideAlertTriangle" class="size-3 text-warning-strong" title="Outside optimal range" />
             }
             <span class="font-bold text-foreground tabular-nums">{{ dist()?.one_person?.pct || 0 }}%</span>
           </div>
@@ -62,7 +62,7 @@ import { VideoService } from '../../core/services/video.service';
           </span>
           <div class="flex items-center gap-1">
             @if (toolsHealth() === 'warning') {
-              <ng-icon name="lucideAlertTriangle" class="size-3 text-warning" title="Outside optimal range" />
+              <ng-icon name="lucideAlertTriangle" class="size-3 text-warning-strong" title="Outside optimal range" />
             }
             <span class="font-bold text-foreground tabular-nums">{{ dist()?.tools_equipment?.pct || 0 }}%</span>
           </div>
@@ -93,7 +93,7 @@ import { VideoService } from '../../core/services/video.service';
         <div class="flex flex-col gap-1.5 p-2 rounded-lg bg-background border border-primary/40">
           <div class="flex items-center justify-between text-xs">
             <span class="font-medium text-foreground flex items-center gap-1.5 truncate" [title]="tName">
-              <span>🎯</span>
+              <ng-icon name="lucideTarget" class="size-3.5 text-muted-foreground shrink-0" aria-hidden="true" />
               <span class="truncate">{{ tName }}</span>
             </span>
             <span class="font-bold text-primary tabular-nums">{{ dist()?.target_person_pct ?? dist()?.target_person?.pct ?? 0 }}%</span>

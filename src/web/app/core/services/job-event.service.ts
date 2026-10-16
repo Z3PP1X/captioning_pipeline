@@ -27,6 +27,8 @@ export class JobEventService {
   readonly activeJobs = signal<Map<number, ActiveJob>>(new Map());
   readonly toasts = signal<ToastNotification[]>([]);
   readonly connectionState = signal<'connecting' | 'connected' | 'disconnected'>('connecting');
+  /** Last `tags_updated` event: the image tag model learned something or a suggestion pass finished. */
+  readonly tagsUpdated = signal<{ videoId: string | null; at: number } | null>(null);
   private eventSource: EventSource | null = null;
 
   initSSE(onJobFinished?: (videoId: string, videoName: string) => void): void {
@@ -50,6 +52,11 @@ export class JobEventService {
         }
         const d = msg.data;
         if (!d) return;
+
+        if (msg.type === 'tags_updated') {
+          this.tagsUpdated.set({ videoId: d.video_id != null ? String(d.video_id) : null, at: Date.now() });
+          return;
+        }
 
         if (
           msg.type === 'job_queued' ||
@@ -79,13 +86,22 @@ export class JobEventService {
             return next;
           });
 
-          if (isCaption) {
+          const isTagging = (d as any).suggested !== undefined || finishedJob?.type === 'tag_suggest';
+          if (isTagging) {
+            this.showToast(
+              'Auto-Tagging Complete',
+              `${(d as any).suggested ?? 0} tag suggestions for ${d.video_name || 'Video'}.`,
+              d.video_id,
+              false,
+              { label: 'Review in Curate', tab: 'curate', videoId: d.video_id }
+            );
+          } else if (isCaption) {
             this.showToast(
               'Captioning Complete',
               `${d.video_name || 'Video'} has finished batch captioning!`,
               d.video_id,
               false,
-              { label: 'View Dataset →', tab: 'dataset', videoId: d.video_id }
+              { label: 'View Dataset', tab: 'dataset', videoId: d.video_id }
             );
           } else {
             this.showToast(
@@ -93,7 +109,7 @@ export class JobEventService {
               `${d.video_name || 'Video'} has finished extracting candidates! Ready for curation.`,
               d.video_id,
               false,
-              { label: 'Start Curating →', tab: 'curate', videoId: d.video_id }
+              { label: 'Start Curating', tab: 'curate', videoId: d.video_id }
             );
           }
 

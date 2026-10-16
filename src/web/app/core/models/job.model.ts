@@ -9,7 +9,7 @@ export interface ActiveJob {
 }
 
 export interface JobSSEMessage {
-  type: 'connected' | 'job_queued' | 'job_started' | 'job_progress' | 'job_finished' | 'job_cancelled' | 'job_error';
+  type: 'connected' | 'job_queued' | 'job_started' | 'job_progress' | 'job_finished' | 'job_cancelled' | 'job_error' | 'tags_updated';
   data?: {
     job_id: number;
     video_id: string | number;

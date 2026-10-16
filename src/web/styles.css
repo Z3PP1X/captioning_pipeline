@@ -26,7 +26,9 @@
   --color-input: var(--input);
   --color-ring: var(--ring);
   --color-success: var(--success);
+  --color-success-strong: var(--success-strong);
   --color-warning: var(--warning);
+  --color-warning-strong: var(--warning-strong);
   --color-info: var(--info);
   --color-sidebar: var(--sidebar);
   --color-sidebar-foreground: var(--sidebar-foreground);
@@ -67,6 +69,9 @@
 
   --success: #22C55E;
   --warning: #FFBC1F;
+  /* AA-safe shades for state carried by text/icons/borders on white (success-strong 5.02:1, warning-strong 5.93:1) */
+  --success-strong: #15803D;
+  --warning-strong: #8A5A00;
   --info: #1658C7;
   --sidebar: #1A1A1A;
   --sidebar-foreground: #FFFFFF;

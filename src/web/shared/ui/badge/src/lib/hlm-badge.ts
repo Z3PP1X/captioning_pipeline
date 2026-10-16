@@ -14,11 +14,13 @@ const badgeVariants = cva(
         outline: 'border-border text-foreground [a]:hover:bg-muted [a]:hover:text-muted-foreground',
         ghost: 'hover:bg-muted hover:text-muted-foreground dark:hover:bg-muted/50',
         link: 'text-primary underline-offset-4 hover:underline',
-        // Semantic tints (design system): foreground text, meaning carried by the icon
-        success: 'border-success/30 bg-success/10 text-foreground [&>ng-icon]:text-foreground',
-        warning: 'border-warning/40 bg-warning/15 text-foreground',
+        // Semantic tints (design system): ink text (AA on every tint), meaning carried by the icon, which uses the
+        // *-strong tokens (success-strong 4.60:1 on success/10, warning-strong 5.46:1 on warning/15; >= 3:1 non-text)
+        success: 'border-success/30 bg-success/10 text-foreground [&>ng-icon]:text-success-strong',
+        warning: 'border-warning/40 bg-warning/15 text-foreground [&>ng-icon]:text-warning-strong',
         danger: 'border-destructive/30 bg-destructive/10 text-foreground [&>ng-icon]:text-destructive',
         muted: 'border-border bg-muted text-muted-foreground',
+        // "In review" (curating): distinct from running (warning) and done (success)
         info: 'border-info/30 bg-info/10 text-foreground [&>ng-icon]:text-info',
       },
     },

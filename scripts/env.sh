@@ -10,6 +10,11 @@ export CP_CACHE_DIR="${CP_CACHE_DIR:-$HOME/.cache/captioning_pipeline}"
 export CP_VIDEO_DIR="${CP_VIDEO_DIR:-/mnt/c/Users/Patri/Videos/_girls}"
 export CP_FINISHED_DIR="${CP_FINISHED_DIR:-/mnt/c/Users/Patri/Documents/captioning_pipeline/data/finished}"
 export PATH="$UV_PROJECT_ENVIRONMENT/bin:$HOME/.local/bin:$PATH"
+# Node from nvm (installed by setup.sh) when it is not already on PATH
+if ! command -v node >/dev/null 2>&1 && [ -s "${NVM_DIR:-$HOME/.nvm}/nvm.sh" ]; then
+  # shellcheck disable=SC1091
+  source "${NVM_DIR:-$HOME/.nvm}/nvm.sh" >/dev/null
+fi
 mkdir -p "$CP_CACHE_DIR" "$HOME/.venvs"
 
 cd "$PROJECT_ROOT"

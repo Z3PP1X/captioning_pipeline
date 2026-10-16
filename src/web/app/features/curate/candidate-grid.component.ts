@@ -22,6 +22,7 @@ import {
 import { HlmButtonImports } from '@spartan-ng/helm/button';
 import { HlmBadgeImports } from '@spartan-ng/helm/badge';
 import { HlmSkeletonImports } from '@spartan-ng/helm/skeleton';
+import { HlmNativeSelectImports } from '@spartan-ng/helm/native-select';
 import { CurateService } from '../../core/services/curate.service';
 import { ChunkService } from '../../core/services/chunk.service';
 import { VideoService } from '../../core/services/video.service';
@@ -29,6 +30,8 @@ import { SettingsService } from '../../core/services/settings.service';
 import { formatShortTime } from '../../core/utils/time.utils';
 import { CandidateFrame, CandidateState } from '../../core/models/candidate.model';
 import { ChunkItem } from '../../core/models/chunk.model';
+import { ConfirmService } from '../../core/services/confirm.service';
+import { candidateChunkInfo, chunkTagsText } from '../../core/utils/chunk-fields.utils';
 
 export interface ChunkCandidateGroup {
   chunkId: number | string;
@@ -47,7 +50,7 @@ export interface ChunkCandidateGroup {
 
 @Component({
   selector: 'app-candidate-grid',
-  imports: [NgIcon, HlmButtonImports, HlmBadgeImports, HlmSkeletonImports],
+  imports: [NgIcon, HlmButtonImports, HlmBadgeImports, HlmSkeletonImports, HlmNativeSelectImports],
   providers: [
     provideIcons({
       lucideCheck,
@@ -101,7 +104,7 @@ export interface ChunkCandidateGroup {
               </span>
 
               <span class="tabular-nums text-xs text-muted-foreground">
-                {{ formatShortTime(group.start_s) }} → {{ formatShortTime(group.end_s) }} ({{ group.duration_s }}s)
+                {{ formatShortTime(group.start_s) }} – {{ formatShortTime(group.end_s) }} ({{ group.duration_s }}s)
               </span>
 
               @if (group.tags) {
@@ -138,16 +141,18 @@ export interface ChunkCandidateGroup {
 
             <!-- Right: Actions (Caption Model Selector, Keep All in Chunk, Deselect All in Chunk, Seek) -->
             <div class="flex items-center gap-2">
-              <select
+              <label class="sr-only" [for]="'grid-chunk-model-' + group.chunkId">Caption model for chunk #{{ group.chunkNumber }}</label>
+              <hlm-native-select
+                size="sm"
+                selectClass="text-xs"
+                [selectId]="'grid-chunk-model-' + group.chunkId"
                 [value]="group.captionModel"
-                (change)="onModelChange(group.chunkId, $any($event.target).value)"
-                class="h-7 rounded border border-input bg-card px-2 text-xs text-foreground focus:ring-1 focus:ring-ring cursor-pointer"
-                title="Captioning Model for Chunk #{{ group.chunkNumber }}"
+                (valueChange)="onModelChange(group.chunkId, $event ?? group.captionModel)"
               >
                 @for (m of settingsService.openRouterModels(); track m.id) {
                   <option [value]="m.id">{{ m.name }}</option>
                 }
-              </select>
+              </hlm-native-select>
 
               <button
                 hlmBtn
@@ -157,7 +162,7 @@ export interface ChunkCandidateGroup {
                 class="h-7 cursor-pointer gap-1"
                 title="Keep all picks in Chunk #{{ group.chunkNumber }}"
               >
-                <ng-icon name="lucideCheck" class="size-3 text-success" />
+                <ng-icon name="lucideCheck" class="size-3 text-success-strong" />
                 <span>Keep All</span>
               </button>
 
@@ -196,11 +201,11 @@ export interface ChunkCandidateGroup {
 
               <div
                 class="group relative flex flex-col rounded-lg border bg-card overflow-hidden transition-all text-xs"
-                [class.border-success]="isStarred || (isKept && !isStarred)"
+                [class.border-success-strong]="isStarred || (isKept && !isStarred)"
                 [class.ring-1]="isStarred || (isKept && !isStarred)"
-                [class.ring-success]="isKept && !isStarred"
-                [class.ring-warning]="isStarred"
-                [class.border-warning]="isStarred"
+                [class.ring-success-strong]="isKept && !isStarred"
+                [class.ring-warning-strong]="isStarred"
+                [class.border-warning-strong]="isStarred"
                 [class.border-destructive]="isRejected"
                 [class.opacity-40]="isRejected"
                 [class.border-border]="!isKept && !isRejected && !isStarred"
@@ -233,15 +238,15 @@ export interface ChunkCandidateGroup {
                       </span>
 
                       @if (isStarred) {
-                        <span hlmBadge variant="warning" class="shrink-0 text-[10px] px-1 py-0 h-4 font-bold drop-shadow">
+                        <span hlmBadge variant="warning" class="shrink-0 text-xs px-1 py-0 h-4 font-bold drop-shadow">
                           Star
                         </span>
                       } @else if (isKept) {
-                        <span hlmBadge variant="success" class="shrink-0 text-[10px] px-1 py-0 h-4 font-bold drop-shadow">
+                        <span hlmBadge variant="success" class="shrink-0 text-xs px-1 py-0 h-4 font-bold drop-shadow">
                           Kept
                         </span>
                       } @else if (isRejected) {
-                        <span hlmBadge variant="destructive" class="shrink-0 text-[10px] px-1 py-0 h-4 font-bold drop-shadow">
+                        <span hlmBadge variant="destructive" class="shrink-0 text-xs px-1 py-0 h-4 font-bold drop-shadow">
                           Reject
                         </span>
                       }
@@ -253,7 +258,7 @@ export interface ChunkCandidateGroup {
                           class="shrink-0 text-xs px-1.5 py-0 bg-background/90 font-medium gap-1"
                           title="Captioned"
                         >
-                          <ng-icon name="lucideCheck" class="size-2.5 text-success" />
+                          <ng-icon name="lucideCheck" class="size-2.5 text-success-strong" />
                           Captioned
                         </span>
                       }
@@ -262,16 +267,17 @@ export interface ChunkCandidateGroup {
                         <span
                           hlmBadge
                           variant="secondary"
-                          class="shrink-0 text-[10px] px-1 py-0 h-4 font-bold bg-primary/20 text-primary border border-primary/30 drop-shadow"
+                          class="shrink-0 gap-0.5 text-xs px-1 py-0 h-4 font-bold bg-primary/20 text-primary border border-primary/30 drop-shadow"
                           [title]="'Target Person Match: ' + Math.round((c.target_person_sim || 0) * 100) + '%'"
                         >
-                          🎯 {{ Math.round((c.target_person_sim || 0) * 100) }}%
+                          <ng-icon name="lucideTarget" class="size-2.5" />
+                          {{ Math.round((c.target_person_sim || 0) * 100) }}%
                         </span>
                       }
                     </div>
 
                     @if (c.score !== undefined) {
-                      <span class="rounded-md bg-secondary/80 px-1.5 py-0.5 text-xs tabular-nums text-white">
+                      <span class="rounded-md bg-secondary/80 px-1.5 py-0.5 text-xs tabular-nums text-secondary-foreground">
                         {{ (c.score * 100).toFixed(0) }}
                       </span>
                     }
@@ -279,19 +285,41 @@ export interface ChunkCandidateGroup {
 
                   <!-- Bottom Timestamp Overlay -->
                   <div class="absolute bottom-1 left-1.5 pointer-events-none">
-                    <span class="rounded-md bg-secondary/80 px-1 py-0.5 tabular-nums text-xs text-white">
+                    <span class="rounded-md bg-secondary/80 px-1 py-0.5 tabular-nums text-xs text-secondary-foreground">
                       {{ formatShortTime(c.t !== undefined ? c.t : c.time_s) }}
                     </span>
                   </div>
                 </div>
+
+                <!-- Learned image tags: solid = confirmed by you, dashed = suggested by the model -->
+                @if (c.tags?.length) {
+                  <ul class="flex flex-wrap gap-1 px-1.5 pt-1.5 bg-card" [attr.aria-label]="'Tags of frame ' + c.id">
+                    @for (t of c.tags!.slice(0, 3); track t.tag_id) {
+                      <li
+                        class="inline-flex max-w-full items-center gap-1 rounded-full border px-1.5 leading-4 text-xs"
+                        [class.border-dashed]="t.status === 'suggested'"
+                        [class.text-muted-foreground]="t.status === 'suggested'"
+                        [class.font-semibold]="t.status === 'confirmed'"
+                        [style.border-color]="t.color"
+                        [title]="t.status === 'suggested' ? 'Suggested ' + t.name + ' (' + Math.round((t.score || 0) * 100) + '%) - open the frame to confirm' : t.name"
+                      >
+                        <span class="size-1.5 shrink-0 rounded-full" [style.background-color]="t.color"></span>
+                        <span class="truncate">{{ t.name }}</span>
+                      </li>
+                    }
+                    @if (c.tags!.length > 3) {
+                      <li class="text-xs text-muted-foreground leading-4">+{{ c.tags!.length - 3 }}</li>
+                    }
+                  </ul>
+                }
 
                 <!-- Card Actions Bar -->
                 <div class="flex items-center justify-between p-1.5 bg-card border-t border-border">
                   <div class="flex items-center gap-1">
                     <button
                       (click)="onSetState(c, 'keep')"
-                      class="size-6 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-success cursor-pointer"
-                      [class.text-success]="c.state === 'keep'"
+                      class="size-6 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-success-strong cursor-pointer"
+                      [class.text-success-strong]="c.state === 'keep'"
                       title="Keep frame (K)"
                       aria-label="Keep frame (K)"
                     >
@@ -300,8 +328,8 @@ export interface ChunkCandidateGroup {
 
                     <button
                       (click)="onSetState(c, 'star')"
-                      class="size-6 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-warning cursor-pointer"
-                      [class.text-warning]="c.state === 'star'"
+                      class="size-6 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-warning-strong cursor-pointer"
+                      [class.text-warning-strong]="c.state === 'star'"
                       title="Star frame (S)"
                       aria-label="Star frame (S)"
                     >
@@ -371,6 +399,7 @@ export class CandidateGridComponent {
   readonly chunkService = inject(ChunkService);
   private readonly videoService = inject(VideoService);
   readonly settingsService = inject(SettingsService);
+  private readonly confirm = inject(ConfirmService);
 
   readonly seekChunk = output<number>();
   readonly tagPerson = output<number>();
@@ -421,12 +450,7 @@ export class CandidateGridComponent {
       ).length;
       const captionedCount = cands.filter((c) => c.is_captioned).length;
 
-      const tagText =
-        typeof ch.tags === 'string'
-          ? ch.tags
-          : Array.isArray(ch.tags)
-            ? (ch.tags as string[]).join(', ')
-            : '';
+      const tagText = chunkTagsText(ch.tags);
 
       result.push({
         chunkId: ch.id ?? ch.position,
@@ -448,15 +472,10 @@ export class CandidateGridComponent {
     for (const [key, cands] of groupMap.entries()) {
       if (!seenGroupKeys.has(key) && cands.length > 0) {
         const first = cands[0];
-        const chunkNum =
-          first.chunk_pos !== undefined
-            ? first.chunk_pos + 1
-            : first.chunk_position !== undefined
-              ? first.chunk_position + 1
-              : 1;
-
-        const start = first.chunk_start || 0;
-        const end = first.chunk_end || 0;
+        const info = candidateChunkInfo(first);
+        const chunkNum = info.position !== null ? info.position + 1 : 1;
+        const start = info.start_s;
+        const end = info.end_s;
         const picksCount = cands.filter(
           (c) => c.state === 'keep' || (c.is_pick && c.state !== 'reject')
         ).length;
@@ -469,7 +488,7 @@ export class CandidateGridComponent {
           end_s: end,
           duration_s: parseFloat(Math.max(0, end - start).toFixed(1)),
           captionModel: first.caption_model || 'google/gemma-4-31b-it',
-          tags: '',
+          tags: info.tags,
           candidates: cands,
           picksCount,
           totalCount: cands.length,
@@ -507,6 +526,13 @@ export class CandidateGridComponent {
 
   async onRejectChunk(group: ChunkCandidateGroup): Promise<void> {
     const activePicks = group.candidates.filter((c) => c.is_pick && c.state !== 'reject');
+    if (activePicks.length === 0) return;
+    const ok = await this.confirm.ask({
+      title: `Deselect all picks in chunk #${group.chunkNumber}?`,
+      description: `${activePicks.length} ${activePicks.length === 1 ? 'pick is' : 'picks are'} marked as rejected. You can re-select frames one by one afterwards.`,
+      confirmLabel: 'Deselect all',
+    });
+    if (!ok) return;
     for (const c of activePicks) {
       await this.curateService.setCandidateState(c.video_id, c.id, 'reject');
     }

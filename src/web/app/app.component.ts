@@ -6,7 +6,9 @@ import {
   effect,
   inject,
   signal,
+  untracked,
 } from '@angular/core';
+import { DOCUMENT } from '@angular/common';
 import { HeaderComponent } from './features/shell/header.component';
 import { VideoQueueComponent } from './features/shell/video-queue.component';
 import { StudioViewComponent } from './features/studio/studio-view.component';
@@ -16,7 +18,9 @@ import { LightboxModalComponent } from './features/modals/lightbox-modal.compone
 import { SettingsModalComponent } from './features/modals/settings-modal.component';
 import { OpenRouterModalComponent } from './features/modals/openrouter-modal.component';
 import { PersonModalComponent } from './features/modals/person-modal.component';
+import { TagManagerModalComponent } from './features/modals/tag-manager-modal.component';
 import { ToastContainerComponent } from './features/shell/toast-container.component';
+import { ConfirmDialogComponent } from './features/shell/confirm-dialog.component';
 import { PromptClickerViewComponent } from './features/prompt-clicker/prompt-clicker-view.component';
 import { PipelineBoardComponent, BoardNavigateEvent } from './features/pipeline-board/pipeline-board.component';
 import { WorkflowBarComponent } from './features/shell/workflow-bar.component';
@@ -27,6 +31,9 @@ import { JobEventService, ToastAction } from './core/services/job-event.service'
 import { SettingsService } from './core/services/settings.service';
 import { DatasetService } from './core/services/dataset.service';
 import { HotkeyService } from './core/services/hotkey.service';
+import { TagService } from './core/services/tag.service';
+import { UiStateService } from './core/services/ui-state.service';
+import { AppTab, buildHashRoute, isRouteHash, parseHashRoute } from './core/utils/hash-route.utils';
 
 @Component({
   selector: 'app-root',
@@ -43,13 +50,16 @@ import { HotkeyService } from './core/services/hotkey.service';
     SettingsModalComponent,
     OpenRouterModalComponent,
     PersonModalComponent,
+    TagManagerModalComponent,
     ToastContainerComponent,
+    ConfirmDialogComponent,
   ],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div class="flex flex-col h-screen w-screen overflow-hidden bg-canvas text-foreground">
       <a
         href="#main-content"
+        (click)="skipToMain($event)"
         class="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50 focus:px-3 focus:py-1.5 focus:rounded-md focus:bg-primary focus:text-primary-foreground focus:shadow-lg focus:outline-none focus:ring-2 focus:ring-ring text-xs font-semibold"
       >
         Skip to main content
@@ -95,6 +105,7 @@ import { HotkeyService } from './core/services/hotkey.service';
                 class="flex-1 min-h-0 flex flex-col overflow-hidden w-full h-full"
                 (openVlmModal)="isOpenRouterModalOpen.set(true)"
                 (openPersonModal)="openPersonModal($event.frameId)"
+                (openTagManager)="isTagManagerOpen.set(true)"
                 (seekChunk)="onSeekChunk($event)"
               />
             }
@@ -128,7 +139,12 @@ import { HotkeyService } from './core/services/hotkey.service';
         />
       }
 
+      @if (isTagManagerOpen()) {
+        <app-tag-manager-modal (close)="isTagManagerOpen.set(false)" />
+      }
+
       <app-toast-container (actionRequest)="onToastAction($event)" />
+      <app-confirm-dialog />
     </div>
   `,
 })
@@ -140,11 +156,18 @@ export class AppComponent implements OnInit {
   readonly settingsService = inject(SettingsService);
   readonly datasetService = inject(DatasetService);
   private readonly hotkeys = inject(HotkeyService);
+  private readonly tagService = inject(TagService);
+  private readonly uiState = inject(UiStateService);
+  private readonly document = inject(DOCUMENT);
 
-  readonly currentTab = signal<'board' | 'studio' | 'curate' | 'dataset' | 'prompt-clicker'>('board');
+  readonly currentTab = signal<AppTab>('board');
+  /** Becomes true once the deep link from the initial hash has been applied; before that the hash is not written. */
+  private readonly routeReady = signal(false);
+  private initialHashPending = true;
   readonly isSettingsModalOpen = signal<boolean>(false);
   readonly isOpenRouterModalOpen = signal<boolean>(false);
   readonly isPersonModalOpen = signal<boolean>(false);
+  readonly isTagManagerOpen = signal<boolean>(false);
   readonly personModalFrameId = signal<number | null>(null);
 
   openPersonModal(frameId?: number): void {
@@ -164,6 +187,33 @@ export class AppComponent implements OnInit {
         }
       }
     });
+
+    // The tag model re-scores the whole video after every accept/reject: pull the new suggestions into the grid
+    effect(() => {
+      const ev = this.jobEvents.tagsUpdated();
+      const video = untracked(() => this.videoService.currentVideo());
+      if (!ev || !video || untracked(() => this.currentTab()) !== 'curate') return;
+      if (ev.videoId === null || ev.videoId === String(video.id)) {
+        this.curateService.refreshTags(video.id).catch(() => undefined);
+        this.tagService.refreshCurrentFrame();
+      }
+    });
+
+    // F9: mirror tab + selected video into location.hash (`#/curate?video=<id>`); each change is a history entry
+    effect(() => {
+      if (!this.routeReady()) return;
+      const hash = buildHashRoute(this.currentTab(), this.videoService.currentVideo()?.id ?? null);
+      const first = this.initialHashPending;
+      this.initialHashPending = false;
+      const win = this.document.defaultView;
+      if (!win || win.location.hash === hash) return;
+      if (first) {
+        // Normalising the URL on startup must not add a history entry
+        win.history.replaceState(win.history.state, '', hash);
+      } else {
+        win.location.hash = hash;
+      }
+    });
   }
 
   async ngOnInit(): Promise<void> {
@@ -178,15 +228,53 @@ export class AppComponent implements OnInit {
       }
     });
 
+    // Restore the deep link before loading so the right view renders immediately
+    const initial = parseHashRoute(this.document.defaultView?.location.hash);
+    this.currentTab.set(initial.tab);
+
     // Load initial settings and videos
     await this.settingsService.loadSettings();
     await this.videoService.loadVideos();
-    await this.videoService.selectNextVideo();
+    const linked = initial.videoId ? await this.videoService.selectVideo(initial.videoId) : null;
+    if (!linked) {
+      await this.videoService.selectNextVideo();
+    }
+    if (initial.tab === 'dataset') {
+      this.datasetService.loadDataset();
+    }
+    this.routeReady.set(true);
   }
 
   @HostListener('window:keydown', ['$event'])
   onKeyDown(e: KeyboardEvent): void {
     this.hotkeys.handleKeyDown(e);
+  }
+
+  /** Back/forward buttons and manually edited URLs. */
+  @HostListener('window:hashchange')
+  async onHashChange(): Promise<void> {
+    const hash = this.document.defaultView?.location.hash ?? '';
+    if (!this.routeReady() || !isRouteHash(hash)) return;
+    const route = parseHashRoute(hash);
+    // Do not write intermediate states back into the history while the route is applied
+    this.routeReady.set(false);
+    try {
+      const current = this.videoService.currentVideo();
+      if (route.videoId && String(current?.id) !== route.videoId) {
+        await this.videoService.selectVideo(route.videoId);
+      }
+      if (route.tab !== this.currentTab()) {
+        this.onTabChange(route.tab);
+      }
+    } finally {
+      this.routeReady.set(true);
+    }
+  }
+
+  skipToMain(e: Event): void {
+    // A plain #main-content anchor would replace the route hash
+    e.preventDefault();
+    this.document.getElementById('main-content')?.focus();
   }
 
   private registerHotkeys(): void {
@@ -195,9 +283,21 @@ export class AppComponent implements OnInit {
     });
 
     this.hotkeys.register('escape', () => {
+      // Escape closes the topmost layer: dialogs first (they can sit on top of the lightbox)...
+      if (this.uiState.modalOpen()) {
+        this.isSettingsModalOpen.set(false);
+        this.isOpenRouterModalOpen.set(false);
+        this.isPersonModalOpen.set(false);
+        this.isTagManagerOpen.set(false);
+        return;
+      }
+      // ...then region marking, then the lightbox
+      if (this.tagService.drawMode() || this.tagService.pendingBox()) {
+        this.tagService.drawMode.set(false);
+        this.tagService.pendingBox.set(null);
+        return;
+      }
       this.curateService.closeLightbox();
-      this.isSettingsModalOpen.set(false);
-      this.isOpenRouterModalOpen.set(false);
     });
 
     this.hotkeys.register('keep', () => {
@@ -231,9 +331,14 @@ export class AppComponent implements OnInit {
     this.hotkeys.register('lightbox_next', () => {
       this.curateService.nextLightbox();
     });
+
+    this.hotkeys.register('tag_region', () => {
+      this.tagService.pendingBox.set(null);
+      this.tagService.drawMode.update((on) => !on);
+    });
   }
 
-  onTabChange(tab: 'board' | 'studio' | 'curate' | 'dataset' | 'prompt-clicker'): void {
+  onTabChange(tab: AppTab): void {
     this.currentTab.set(tab);
     const video = this.videoService.currentVideo();
     if (tab === 'curate' && video) {

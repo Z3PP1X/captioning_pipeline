@@ -16,6 +16,39 @@ class ScoringEngine:
     def __init__(self, classifier: ClipClassifier | None = None):
         self.classifier = classifier or ClipClassifier()
         self._prompt_embeddings: dict[str, np.ndarray] = {}
+        # Phase F: weights fitted from curation_events, blended into the composite when set (None = default path)
+        self.learned_weights: dict[str, float] | None = None
+        self.learned_blend: float = 0.5
+
+    def configure_learned(self, weights: dict[str, float] | None, blend: float = 0.5) -> None:
+        """Set (or clear with None) the learned component weights used by `score_candidates_batch`."""
+        self.learned_weights = dict(weights) if weights else None
+        self.learned_blend = float(blend)
+
+    # Phase F2 quality v2 (off on a bare engine; JobManager turns it on from the `quality_v2` setting)
+    quality_v2: bool = False
+    # Raw v2 components of the video's other frames, so a single-chunk batch is normalised against the video
+    quality_reference: dict[str, list[float]] | None = None
+
+    def configure_quality(self, enabled: bool, video_reference: dict[str, list[float]] | None = None) -> None:
+        self.quality_v2 = bool(enabled)
+        self.quality_reference = video_reference
+
+    def _quality_v2_batch(self, candidates: list[dict[str, Any]]) -> list[tuple[float, float, dict[str, float]]]:
+        """(sharpness, quality, normalised components) per candidate from `metrics.q_raw` (computed if missing)."""
+        from pipeline.quality import combine, normalise_components, raw_components
+
+        raws: list[dict[str, Any]] = []
+        for cand in candidates:
+            metrics = cand.get("metrics") or {}
+            raw = metrics.get("q_raw")
+            if raw is None and cand.get("img_bgr") is not None:
+                raw = raw_components(cand["img_bgr"], metrics, metrics.get("faces"))
+                metrics["q_raw"] = raw
+                cand["metrics"] = metrics
+            raws.append(raw or {})
+        norm = normalise_components(raws, [c.get("chunk_id") for c in candidates], self.quality_reference)
+        return [(*combine(nm), nm) for nm in norm]
 
     def _get_dimension_prompts(self) -> dict[str, tuple[list[str], list[str]]]:
         """Returns positive and negative text prompts for each semantic scoring dimension."""
@@ -84,6 +117,10 @@ class ScoringEngine:
             return []
 
         prompt_vecs = self._ensure_prompt_vectors()
+        for cand in candidates:
+            if not cand.get("metrics"):
+                cand["metrics"] = compute_tier1_metrics(cand["img_bgr"])
+        v2 = self._quality_v2_batch(candidates) if self.quality_v2 else None
 
         for idx, cand in enumerate(candidates):
             emb = image_embeddings[idx]  # shape (512,)
@@ -110,6 +147,9 @@ class ScoringEngine:
                 0.35 * exp_score + 0.30 * contrast_score + 0.20 * entropy_score + 0.15 * clipping_penalty,
                 4,
             )
+            if v2 is not None:
+                # Quality v2: percentile-normalised subject sharpness / technical quality replace the absolute ones
+                sharpness_score, quality_score, _ = v2[idx]
 
             # 3-7. Semantic dimensions via two-probe sigmoid contrast
             scores: dict[str, float] = {}
@@ -184,6 +224,16 @@ class ScoringEngine:
                 "face_count": face_count,
                 "composite": round(comp, 4),
             }
+            if v2 is not None:
+                scored_dict["quality_version"] = 2
+                scored_dict["q_components"] = v2[idx][2]
+            if self.learned_weights:
+                from pipeline.learned_weights import blend_composite, components_from_scores
+
+                scored_dict["composite_base"] = round(comp, 4)
+                scored_dict["composite"] = round(
+                    blend_composite(comp, components_from_scores(scored_dict), self.learned_weights, self.learned_blend), 4
+                )
 
             cand["scores"] = scored_dict
             cand["zs_scores"] = scored_dict

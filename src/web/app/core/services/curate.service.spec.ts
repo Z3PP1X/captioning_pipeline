@@ -103,6 +103,46 @@ describe('CurateService', () => {
     });
   });
 
+  describe('reselect', () => {
+    it('posts the knobs and replaces the candidates from the curation-300-shaped response', async () => {
+      const report = {
+        target_count: 2, picks_count: 2, shortfall: 0, promoted: [4], demoted: [2], locked: 1, dup_skipped: 0,
+        excluded_rejected: 0, diversity: 0.7, elasticity: 0.2, learned_weights_active: false, chunks: [],
+      };
+      mockApi.post!.mockResolvedValue({
+        picks: [{ id: 3, chunk_id: 20, t: 15, state: 'star' }, { id: 4, chunk_id: 20, t: 18, state: 'keep' }],
+        runners: [{ id: 1, chunk_id: 10, t: 1.5, state: 'candidate' }, { id: 2, chunk_id: 10, t: 3, state: 'reject' }],
+        chunks: [{ id: 10, position: 0 }, { id: 20, position: 1 }],
+        distribution: { multiple_pct: 40, one_person_pct: 30, tools_equipment_pct: 10, face_visible_pct: 60 },
+        reselect: report,
+      });
+
+      const res = await service.reselect('vid-1', { target_count: 2, diversity: 0.7 });
+
+      expect(mockApi.post).toHaveBeenCalledWith('/api/videos/vid-1/reselect', { target_count: 2, diversity: 0.7 });
+      expect(res).toEqual(report);
+      const list = service.candidates();
+      expect(list.map((c) => [c.id, c.is_pick, c.role])).toEqual([
+        [3, true, 'pick'],
+        [4, true, 'pick'],
+        [1, false, 'runner_up'],
+        [2, false, 'runner_up'],
+      ]);
+      expect(list[1].time_s).toBe(18);
+      expect(list[1].preview_url).toBe('/api/frames/4/preview');
+      expect(service.curationChunks()).toHaveLength(2);
+      expect(service.distribution()?.multiple_people?.pct).toBe(40);
+      expect(service.distribution()?.selected_count).toBe(2);
+    });
+
+    it('leaves the list untouched and rethrows on 409', async () => {
+      const err = Object.assign(new Error('busy'), { status: 409 });
+      mockApi.post!.mockRejectedValue(err);
+      await expect(service.reselect('vid-1', {})).rejects.toBe(err);
+      expect(service.candidates()).toEqual(mockFrames);
+    });
+  });
+
   describe('lightbox navigation', () => {
     it('opens lightbox at correct candidate index', () => {
       service.openLightbox(3);

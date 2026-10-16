@@ -8,83 +8,71 @@ import {
   signal,
   OnInit,
 } from '@angular/core';
-import { CommonModule } from '@angular/common';
 import { NgIcon, provideIcons } from '@ng-icons/core';
 import {
   lucideUser,
   lucideUserPlus,
   lucideUserCheck,
   lucideCheck,
-  lucideX,
   lucideTrash2,
   lucideZap,
   lucideTarget,
   lucideLoader2,
   lucidePlus,
+  lucideBan,
+  lucideMinus,
 } from '@ng-icons/lucide';
 import { HlmButtonImports } from '@spartan-ng/helm/button';
 import { HlmBadgeImports } from '@spartan-ng/helm/badge';
+import { HlmDialogImports } from '@spartan-ng/helm/dialog';
 import { PersonService } from '../../core/services/person.service';
 import { VideoService } from '../../core/services/video.service';
 import { CurateService } from '../../core/services/curate.service';
 import { Person, DetectedFace } from '../../core/models/person.model';
+import { ConfirmService } from '../../core/services/confirm.service';
+import { registerModal } from '../../core/services/ui-state.service';
 
 @Component({
   selector: 'app-person-modal',
-  imports: [CommonModule, NgIcon, HlmButtonImports, HlmBadgeImports],
+  imports: [NgIcon, HlmButtonImports, HlmBadgeImports, HlmDialogImports],
   providers: [
     provideIcons({
       lucideUser,
       lucideUserPlus,
       lucideUserCheck,
       lucideCheck,
-      lucideX,
       lucideTrash2,
       lucideZap,
       lucideTarget,
       lucideLoader2,
       lucidePlus,
+      lucideBan,
+      lucideMinus,
     }),
   ],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
-    <div
-      class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-xs p-4 animate-in fade-in select-none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="person-modal-title"
-      (click)="onBackdropClick($event)"
-    >
-      <div
-        class="relative flex flex-col max-h-[90vh] max-w-xl w-full rounded-2xl border border-border bg-card overflow-hidden shadow-2xl"
-        (click)="$event.stopPropagation()"
+    <!-- Rendered behind @if in the shell: the dialog is open for as long as the component exists -->
+    <hlm-dialog state="open" (closed)="close.emit()">
+      <hlm-dialog-content
+        *hlmDialogPortal="let ctx"
+        class="sm:max-w-xl w-full p-0 gap-0 flex flex-col max-h-[90vh] overflow-hidden rounded-2xl bg-card"
+        closeLabel="Close"
       >
         <!-- Modal Header -->
-        <div class="flex items-center justify-between border-b border-border px-6 py-4 bg-muted/20">
-          <div class="flex items-center gap-2.5">
-            <div class="flex size-8 items-center justify-center rounded-lg bg-primary/10 text-primary">
-              <ng-icon name="lucideTarget" class="size-4" />
-            </div>
-            <div>
-              <h3 id="person-modal-title" class="font-sans font-bold text-base text-foreground">
-                {{ frameId() ? 'Tag Face in Candidate Frame' : 'Person & Character Management' }}
-              </h3>
-              <p class="text-xs text-muted-foreground">
-                {{ frameId() ? 'Select or create a person identity to prioritize in extractions' : 'Manage target identities for auto-extraction and scoring' }}
-              </p>
-            </div>
+        <hlm-dialog-header class="flex-row items-center gap-2.5 border-b border-border px-6 py-4 pr-14 bg-muted/20">
+          <div class="flex size-8 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+            <ng-icon name="lucideTarget" class="size-4" />
           </div>
-          <button
-            hlmBtn
-            variant="ghost"
-            size="xs"
-            (click)="close.emit()"
-            class="size-8 rounded-full cursor-pointer"
-            aria-label="Close"
-          >
-            <ng-icon name="lucideX" class="size-4" />
-          </button>
-        </div>
+          <div class="flex flex-col gap-1">
+            <h3 hlmDialogTitle class="font-sans font-bold text-base text-foreground">
+              {{ frameId() ? 'Tag Face in Candidate Frame' : 'Person & Character Management' }}
+            </h3>
+            <p hlmDialogDescription class="text-xs text-muted-foreground">
+              {{ frameId() ? 'Select or create a person identity to prioritize in extractions' : 'Manage target identities for auto-extraction and scoring' }}
+            </p>
+          </div>
+        </hlm-dialog-header>
 
         <!-- Modal Body -->
         <div class="flex flex-col gap-5 p-6 overflow-y-auto">
@@ -98,22 +86,24 @@ import { Person, DetectedFace } from '../../core/models/person.model';
 
               <!-- Positive & Negative Badges -->
               <div class="flex flex-wrap items-center gap-1.5 pt-1 border-t border-border/40">
-                <span class="text-[11px] text-muted-foreground font-medium">Positive (Prioritize):</span>
+                <span class="text-xs text-muted-foreground font-medium">Positive (Prioritize):</span>
                 @for (pos of v.positive_persons || []; track pos.id) {
-                  <span hlmBadge variant="secondary" class="gap-1 bg-primary/10 text-primary border-primary/20 text-[11px]">
-                    🎯 {{ pos.name }}
+                  <span hlmBadge variant="secondary" class="gap-1 bg-primary/10 text-primary border-primary/20 text-xs">
+                    <ng-icon name="lucideTarget" class="size-3" aria-hidden="true" />
+                    {{ pos.name }}
                   </span>
                 } @empty {
-                  <span class="text-[11px] text-muted-foreground italic">None</span>
+                  <span class="text-xs text-muted-foreground italic">None</span>
                 }
 
-                <span class="text-[11px] text-muted-foreground font-medium ml-2">Negative (Exclude):</span>
+                <span class="text-xs text-muted-foreground font-medium ml-2">Negative (Exclude):</span>
                 @for (neg of v.negative_persons || []; track neg.id) {
-                  <span hlmBadge variant="destructive" class="gap-1 bg-destructive/10 text-destructive border-destructive/20 text-[11px]">
-                    🚫 {{ neg.name }}
+                  <span hlmBadge variant="destructive" class="gap-1 bg-destructive/10 text-destructive border-destructive/20 text-xs">
+                    <ng-icon name="lucideBan" class="size-3" aria-hidden="true" />
+                    {{ neg.name }}
                   </span>
                 } @empty {
-                  <span class="text-[11px] text-muted-foreground italic">None</span>
+                  <span class="text-xs text-muted-foreground italic">None</span>
                 }
 
                 @if ((v.positive_persons?.length || 0) > 0 || (v.negative_persons?.length || 0) > 0) {
@@ -132,7 +122,7 @@ import { Person, DetectedFace } from '../../core/models/person.model';
 
               <!-- Re-evaluate button on already extracted frames -->
               @if (v.status !== 'new') {
-                <div class="flex items-center justify-between pt-1 border-t border-border/40 text-[11px] text-muted-foreground">
+                <div class="flex items-center justify-between pt-1 border-t border-border/40 text-xs text-muted-foreground">
                   <span>Recognition runs locally on extracted candidate images</span>
                   <button
                     hlmBtn
@@ -222,7 +212,7 @@ import { Person, DetectedFace } from '../../core/models/person.model';
                       <span class="font-bold text-foreground truncate" [title]="p.name">
                         {{ p.name }}
                       </span>
-                      <span class="text-[11px] text-muted-foreground">
+                      <span class="text-xs text-muted-foreground">
                         {{ p.exemplar_count }} {{ p.exemplar_count === 1 ? 'exemplar' : 'exemplars' }}
                       </span>
                     </div>
@@ -255,10 +245,11 @@ import { Person, DetectedFace } from '../../core/models/person.model';
                         size="xs"
                         [disabled]="isSubmitting()"
                         (click)="onTogglePersonRole(p, 'positive')"
-                        class="cursor-pointer gap-1 text-[11px] h-7 px-2"
+                        class="cursor-pointer gap-1 text-xs h-7 px-2"
                         title="{{ isPos ? 'Remove positive prioritization' : 'Prioritize frames with ' + p.name }}"
                       >
-                        <span>{{ isPos ? '🎯 Active' : '+ Positiv' }}</span>
+                        <ng-icon [name]="isPos ? 'lucideTarget' : 'lucidePlus'" class="size-3" aria-hidden="true" />
+                        <span>{{ isPos ? 'Active' : 'Positive' }}</span>
                       </button>
 
                       <!-- Toggle Negative Exclusion -->
@@ -268,10 +259,11 @@ import { Person, DetectedFace } from '../../core/models/person.model';
                         size="xs"
                         [disabled]="isSubmitting()"
                         (click)="onTogglePersonRole(p, 'negative')"
-                        class="cursor-pointer gap-1 text-[11px] h-7 px-2"
+                        class="cursor-pointer gap-1 text-xs h-7 px-2"
                         title="{{ isNeg ? 'Remove negative exclusion' : 'Exclude frames showing exclusively ' + p.name }}"
                       >
-                        <span>{{ isNeg ? '🚫 Excluded' : '- Negativ' }}</span>
+                        <ng-icon [name]="isNeg ? 'lucideBan' : 'lucideMinus'" class="size-3" aria-hidden="true" />
+                        <span>{{ isNeg ? 'Excluded' : 'Negative' }}</span>
                       </button>
                     }
 
@@ -281,7 +273,8 @@ import { Person, DetectedFace } from '../../core/models/person.model';
                       size="xs"
                       (click)="onDeletePerson(p)"
                       title="Delete person"
-                      class="size-7 p-0 text-muted-foreground hover:text-destructive cursor-pointer opacity-0 group-hover:opacity-100 transition-opacity"
+                      [attr.aria-label]="'Delete person ' + p.name"
+                      class="size-7 p-0 text-muted-foreground hover:text-destructive cursor-pointer opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity"
                     >
                       <ng-icon name="lucideTrash2" class="size-3.5" />
                     </button>
@@ -303,7 +296,7 @@ import { Person, DetectedFace } from '../../core/models/person.model';
                   <ng-icon name="lucideZap" class="size-3.5 text-primary" />
                   <span>Autonomous Extraction Pipeline</span>
                 </span>
-                <span class="text-[11px] text-muted-foreground">
+                <span class="text-xs text-muted-foreground">
                   Autonomously chunks, decodes, extracts candidate frames, and prioritizes the target person.
                 </span>
               </div>
@@ -323,7 +316,7 @@ import { Person, DetectedFace } from '../../core/models/person.model';
         </div>
 
         <!-- Modal Footer -->
-        <div class="flex items-center justify-end border-t border-border px-6 py-3 bg-muted/10">
+        <hlm-dialog-footer class="border-t border-border px-6 py-3 bg-muted/10">
           <button
             hlmBtn
             variant="outline"
@@ -333,15 +326,16 @@ import { Person, DetectedFace } from '../../core/models/person.model';
           >
             Close
           </button>
-        </div>
-      </div>
-    </div>
+        </hlm-dialog-footer>
+      </hlm-dialog-content>
+    </hlm-dialog>
   `,
 })
 export class PersonModalComponent implements OnInit {
   readonly personService = inject(PersonService);
   private readonly videoService = inject(VideoService);
   private readonly curateService = inject(CurateService);
+  private readonly confirm = inject(ConfirmService);
 
   readonly close = output<void>();
   readonly frameId = input<number | null>(null);
@@ -352,14 +346,13 @@ export class PersonModalComponent implements OnInit {
   readonly persons = this.personService.persons;
   readonly currentVideo = this.videoService.currentVideo;
 
-  ngOnInit(): void {
-    this.personService.loadPersons();
+  constructor() {
+    // Rendered behind @if in the shell: open for as long as it exists
+    registerModal('person');
   }
 
-  onBackdropClick(e: MouseEvent): void {
-    if (e.target === e.currentTarget) {
-      this.close.emit();
-    }
+  ngOnInit(): void {
+    this.personService.loadPersons();
   }
 
   async onCreateOrTagNew(): Promise<void> {
@@ -481,7 +474,12 @@ export class PersonModalComponent implements OnInit {
   }
 
   async onDeletePerson(p: Person): Promise<void> {
-    if (!confirm(`Are you sure you want to delete person "${p.name}"?`)) return;
+    const ok = await this.confirm.ask({
+      title: `Delete ${p.name}?`,
+      description: 'The person and all face exemplars are removed. Videos that target this person lose the filter. This cannot be undone.',
+      confirmLabel: 'Delete person',
+    });
+    if (!ok) return;
 
     this.isSubmitting.set(true);
     try {
