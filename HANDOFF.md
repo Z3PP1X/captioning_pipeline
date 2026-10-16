@@ -630,6 +630,8 @@ Clicker review §4-5.
 
 ## 5. Verify the current state in WSL (do this first)
 
+**One command (session 5):** `bash scripts/verify_wsl.sh` runs setup, both test suites, the production build, the skills check and a server smoke test, and writes a log to `~/.cache/captioning_pipeline/verify_wsl.log`. Then do the manual items below (golden path, image tagging, captioning/Phase F).
+
 ```bash
 # from Windows: wsl bash -lc "<command>"; inside WSL:
 cd /mnt/c/Users/Patri/Documents/captioning_pipeline
