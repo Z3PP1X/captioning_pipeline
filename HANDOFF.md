@@ -534,7 +534,16 @@ failures down the L1→L2→L3 cascade, per-mode trigger profiles, a `captions` 
 - Run §5 in WSL.
 - Tune on real footage: tag thresholds, cut detector sensitivity (`cut_*` settings), quality-v2 gates, and
   per-domain RAG retrieval (`/api/rag/eval`). All of these were tuned only on synthetic data.
-- The first DINOv2, TOPIQ or SigLIP use downloads its model (24 MB, 177 MB and 99 MB).
+- ~~First model downloads~~ **Verified on macOS (session 5):** each model downloaded on first use and behaved
+  correctly on synthetic images.
+  - DINOv2-S (24 MB, 384-d): a mirrored copy scored 0.976 vs 0.610 for an unrelated image.
+  - SigLIP (99 MB, 768-d): 0.724 vs 0.707; a narrow margin on synthetic images.
+  - TOPIQ-NR (177 MB): a sharp image scored 0.59, its blurred copy 0.20.
+  - CLIP-IQA: 0.50 sharp vs 0.39 blurred.
+  - On WSL they download again into `~/.cache/captioning_pipeline/models`. The Docker image does not include them
+    yet (only CLIP and the face models).
+- **Cannot be done from the macOS session:** the WSL run (§5) and tuning on the real library. This machine has no
+  WSL, Docker or video library.
 - Known limits:
   - Cross-dissolves without a single-frame spike are not detected as cuts.
   - Learned-weights accuracy is measured on the training data.
