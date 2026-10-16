@@ -540,8 +540,9 @@ failures down the L1→L2→L3 cascade, per-mode trigger profiles, a `captions` 
   - SigLIP (99 MB, 768-d): 0.724 vs 0.707; a narrow margin on synthetic images.
   - TOPIQ-NR (177 MB): a sharp image scored 0.59, its blurred copy 0.20.
   - CLIP-IQA: 0.50 sharp vs 0.39 blurred.
-  - On WSL they download again into `~/.cache/captioning_pipeline/models`. The Docker image does not include them
-    yet (only CLIP and the face models).
+  - On WSL they download again into `~/.cache/captioning_pipeline/models`. To pre-fetch them, run
+    `python scripts/download_models.py <dir> --optional`, or build the Docker image with
+    `--build-arg INCLUDE_OPTIONAL_MODELS=1`.
 - **Cannot be done from the macOS session:** the WSL run (§5) and tuning on the real library. This machine has no
   WSL, Docker or video library.
 - Known limits:

@@ -45,7 +45,13 @@ RUN uv sync --frozen
 
 # Pre-download and embed the ONNX CLIP vision & text models and tokenizer
 COPY scripts/download_models.py scripts/download_models.py
-RUN uv run python scripts/download_models.py /app/models
+# INCLUDE_OPTIONAL_MODELS=1 also bakes in DINOv2 / SigLIP / TOPIQ (~300 MB) instead of downloading them on first use
+ARG INCLUDE_OPTIONAL_MODELS=0
+RUN if [ "$INCLUDE_OPTIONAL_MODELS" = "1" ]; then \
+      uv run python scripts/download_models.py /app/models --optional; \
+    else \
+      uv run python scripts/download_models.py /app/models; \
+    fi
 
 # Copy built frontend assets from Stage 1
 COPY --from=frontend-builder /app/src/web/dist /app/src/web/dist
