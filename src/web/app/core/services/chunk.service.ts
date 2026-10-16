@@ -17,6 +17,7 @@ export class ChunkService {
   readonly outPoint = signal<number | null>(null);
   readonly snapCuts = signal<boolean>(true);
   readonly isExtracting = signal<boolean>(false);
+  readonly extractingChunkIds = signal<Set<number>>(new Set());
   readonly requestedSeekTime = signal<number | null>(null);
   readonly isDirty = signal<boolean>(false);
 
@@ -230,6 +231,42 @@ export class ChunkService {
       throw err;
     } finally {
       this.isExtracting.set(false);
+    }
+  }
+
+  isExtractingChunk(chunkId: number | null | undefined): boolean {
+    if (chunkId === undefined || chunkId === null) return false;
+    return this.extractingChunkIds().has(chunkId);
+  }
+
+  /**
+   * Multi-step targeted extraction: extracts new candidates and picks strictly within this chunk's timecode.
+   * Preserves all other chunks and existing curations.
+   */
+  async extractChunk(
+    chunkId: number,
+    options?: { k?: number; budget_pct?: number }
+  ): Promise<{ job_id: number; status: string }> {
+    try {
+      this.extractingChunkIds.update((set) => {
+        const next = new Set(set);
+        next.add(chunkId);
+        return next;
+      });
+      const res = await this.api.post<{ job_id: number; status: string; chunk_id: number; video_id: string }>(
+        `/api/chunks/${chunkId}/extract`,
+        options || {}
+      );
+      return res;
+    } catch (err) {
+      console.error(`Failed to extract chunk #${chunkId}:`, err);
+      throw err;
+    } finally {
+      this.extractingChunkIds.update((set) => {
+        const next = new Set(set);
+        next.delete(chunkId);
+        return next;
+      });
     }
   }
 

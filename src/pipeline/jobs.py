@@ -184,7 +184,7 @@ class JobManager:
             (video_id, *transitional),
         )
 
-    def _start_job(self, job_id: int, video_id: str, video_name: str, chunk_id: int | None = None) -> bool:
+    def _start_job(self, job_id: int, video_id: str | None, video_name: str, chunk_id: int | None = None) -> bool:
         """Mark a queued job running. False if it was cancelled while still queued."""
         with self.db.write() as conn:
             cur = conn.execute(
@@ -202,13 +202,14 @@ class JobManager:
         })
         return True
 
-    def _finish_cancelled(self, job_id: int, video_id: str, video_name: str) -> None:
+    def _finish_cancelled(self, job_id: int, video_id: str | None, video_name: str) -> None:
         with self.db.write() as conn:
             conn.execute(
                 "UPDATE jobs SET status='cancelled', finished_at=? WHERE id=?",
                 (time.time(), job_id),
             )
-            self._settle_video_status(conn, video_id)
+            if video_id:
+                self._settle_video_status(conn, video_id)
         self.broadcast_event("job_cancelled", {
             "job_id": job_id,
             "video_id": video_id,
@@ -383,337 +384,373 @@ class JobManager:
         self.decode_executor.submit(self._run_extract_750_job, job_id, video_id, video_name, options or {})
         return job_id
 
+    def _execute_extract_750(
+        self,
+        video_id: str,
+        options: dict[str, Any] | None = None,
+        on_progress: Callable[[float, str], None] | None = None,
+        check_cancel: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        video = self.db.one("SELECT * FROM videos WHERE id=?", (video_id,))
+        if not video:
+            raise ValueError(f"Video {video_id} not found")
+
+        vpath = Path(video["path"])
+        chunks = self.db.all("SELECT * FROM chunks WHERE video_id=? ORDER BY position ASC", (video_id,))
+        if not chunks:
+            from pipeline.autochunk import AutoChunker
+            chunker = AutoChunker(self.db, self.settings)
+            chunks = chunker.generate_balanced_chunks(video_id, target_frames=300)
+
+        # Scenes the human skipped during review are not sampled at all
+        chunks = [c for c in chunks if (c.get("priority") or "normal") != "skip"]
+        if not chunks:
+            raise RuntimeError("Every scene is skipped - nothing to extract")
+
+        total_chunks = len(chunks)
+        user_settings = merged_user_settings(self.db.get_setting("user_settings", {}))
+        options = options or {}
+        target_total = int(user_settings.get("target_candidates", 750))
+        target_curated = int(options.get("target_curated") or user_settings.get("target_curated", 300))
+        if options.get("target_curated"):
+            target_total = max(target_total, round(target_curated * 2.5))
+        category_quotas = user_settings.get("category_quotas")
+        mmr_lambda = float(user_settings.get("mmr_lambda", 0.65))
+
+        letterbox = video.get("letterbox")
+        watermark_rect = video.get("watermark_rect")
+
+        video_persons = self.db.get_video_persons(video_id, include_embeddings=True)
+        pos_persons = video_persons.get("positive", [])
+        neg_persons = video_persons.get("negative", [])
+
+        # Primary positive target person for legacy single target display/compatibility
+        if not pos_persons and video.get("target_person_id"):
+            legacy_p = self.db.get_person(video["target_person_id"])
+            if legacy_p:
+                pos_persons = [legacy_p]
+
+        pos_embeddings = [person_embedding(p) for p in pos_persons]
+        pos_embeddings = [p for p in pos_embeddings if p is not None]
+        neg_embeddings = [person_embedding(p) for p in neg_persons]
+        neg_embeddings = [n for n in neg_embeddings if n is not None]
+
+        target_person = pos_persons[0] if pos_persons else None
+        target_person_emb = pos_embeddings[0] if pos_embeddings else None
+
+        if pos_persons and neg_persons:
+            sample_desc = f"Sampling frames with {len(pos_persons)} positive & {len(neg_persons)} negative face filters..."
+        elif pos_persons:
+            sample_desc = f"Sampling candidate frames with target person '{pos_persons[0]['name']}' face recognition..."
+        elif neg_persons:
+            sample_desc = f"Sampling frames excluding {len(neg_persons)} negative person face(s)..."
+        else:
+            sample_desc = f"Sampling candidate frames across {total_chunks} chunks..."
+        if on_progress:
+            on_progress(0.05, sample_desc)
+
+        # 1. Sample candidate frames per chunk (streamed at 512px with pre-crop & gates)
+        all_candidates: list[dict[str, Any]] = []
+        seen_cand_ts: set[float] = set()
+
+        for idx, ch in enumerate(chunks):
+            if check_cancel:
+                check_cancel()
+
+            bpct = float(ch.get("budget_pct", 100.0 / max(1, total_chunks)))
+            chunk_n = max(15, round(target_total * (bpct / 100.0)))
+            dur = max(1.0, float(ch["end_s"]) - float(ch["start_s"]))
+            needed_fps = max(1.0, (chunk_n * 1.5) / dur)
+
+            raw_samples = sample_chunk_frames(
+                vpath,
+                float(ch["start_s"]),
+                float(ch["end_s"]),
+                sample_fps=needed_fps,
+                max_samples=chunk_n * 2,
+                max_dim=512,  # Stream at 512px to keep RAM minimal (C4/H5)
+            )
+
+            chunk_cands: list[dict[str, Any]] = []
+            for t, img_bgr in raw_samples:
+                t_val = round(float(t), 3)
+                if t_val in seen_cand_ts:
+                    continue
+
+                # Pre-crop letterbox and watermark before metrics & CLIP (C5/H8/H9)
+                img_cropped = apply_letterbox_crop(img_bgr, letterbox)
+                img_cropped = apply_watermark_crop(img_cropped, watermark_rect)
+
+                metrics = compute_tier1_metrics(img_cropped)
+
+                # Hard filter check (C5/H8)
+                ok, _ = hard_filter_check(metrics, sharpness_floor=15.0)
+                if not ok:
+                    continue
+
+                # Intra-chunk pHash deduplication <= 4 (C5/H8)
+                if any(phash_hamming_distance(metrics["phash"], kept["metrics"]["phash"]) <= 4 for kept in chunk_cands):
+                    continue
+
+                # Face detection & target person matching via YuNet + SFace
+                if pos_embeddings or neg_embeddings:
+                    match_res = self.face_engine.match_frame_multi(
+                        img_cropped,
+                        positive_features=pos_embeddings,
+                        negative_features=neg_embeddings,
+                    )
+                    # Rule: Exclude frame if exclusively the negative person is visible!
+                    if match_res["excluded"]:
+                        continue
+
+                    metrics["target_person_sim"] = match_res["max_pos_sim"]
+                    metrics["target_person_matched"] = match_res["pos_matched"]
+                    metrics["negative_person_matched"] = match_res["neg_matched"]
+                    metrics["face_count"] = match_res["face_count"]
+                    metrics["faces"] = match_res["faces"]
+                else:
+                    detected_faces = self.face_engine.detect_faces(img_cropped)
+                    metrics["target_person_sim"] = 0.0
+                    metrics["target_person_matched"] = False
+                    metrics["negative_person_matched"] = False
+                    metrics["face_count"] = len(detected_faces)
+                    metrics["faces"] = [{"box": f["box"], "score": f["score"]} for f in detected_faces]
+
+                cand_dict = {
+                    "chunk_id": ch["id"],
+                    "t": t_val,
+                    "img_bgr": img_cropped,
+                    "metrics": metrics,
+                    "target_person_sim": metrics["target_person_sim"],
+                    "target_person_matched": metrics["target_person_matched"],
+                    "face_count": metrics["face_count"],
+                }
+                seen_cand_ts.add(t_val)
+                chunk_cands.append(cand_dict)
+                all_candidates.append(cand_dict)
+
+            p = 0.05 + 0.35 * ((idx + 1) / total_chunks)
+            if on_progress:
+                on_progress(round(p, 2), f"Sampled Chunk {idx + 1}/{total_chunks} ({len(chunk_cands)} valid frames)")
+
+        if not all_candidates:
+            raise RuntimeError("No candidate frames could be sampled from video")
+
+        # 2. Batch Embeddings & 7-Dimension Scoring (metrics are already computed during sampling)
+        if check_cancel:
+            check_cancel()
+        if on_progress:
+            on_progress(0.50, f"Computing CLIP embeddings on {len(all_candidates)} filtered frames...")
+        images_to_embed = [c["img_bgr"] for c in all_candidates]
+        embeddings = self.classifier.embed_images(images_to_embed, batch_size=32)
+
+        if check_cancel:
+            check_cancel()
+        step_desc = (
+            f"Evaluating scoring with target person '{target_person['name']}' priority..."
+            if target_person else "Evaluating 7-dimension scoring criteria..."
+        )
+        if on_progress:
+            on_progress(0.68, step_desc)
+        self.scoring_engine.score_candidates_batch(
+            all_candidates, embeddings, target_person_embedding=target_person_emb
+        )
+
+        # 3. Multi-objective reduction
+        if on_progress:
+            on_progress(0.78, f"Optimizing best {target_curated} frame subset...")
+        picks_300, runners_450, stats = self.scoring_engine.reduce_750_to_300(
+            all_candidates, chunks, target_total=target_curated, category_quotas=category_quotas, mmr_lambda=mmr_lambda
+        )
+
+        # 4. Save previews and decode exact full-resolution frames for picks
+        if on_progress:
+            on_progress(0.82, "Saving thumbnails and native frames...")
+        preview_dir = self.settings.cache_dir / "previews" / video_id
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        cand_dir = self.settings.cache_dir / "candidates" / video_id
+        cand_dir.mkdir(parents=True, exist_ok=True)
+
+        # Prune stale candidate and preview files for this video (M9)
+        for old_f in list(preview_dir.glob("*.webp")) + list(cand_dir.glob("*.png")):
+            try:
+                old_f.unlink()
+            except OSError:
+                pass
+
+        all_to_store = picks_300 + runners_450
+
+        picks_by_chunk: dict[int, list[dict[str, Any]]] = {}
+        for p in picks_300:
+            cid = p["chunk_id"]
+            picks_by_chunk.setdefault(cid, []).append(p)
+
+        # Stream native frames directly to disk chunk by chunk without accumulating in RAM (C4/H5)
+        for cid, ch_picks in picks_by_chunk.items():
+            if check_cancel:
+                check_cancel()
+            ts = [p["t"] for p in ch_picks]
+            def write_pick(target_t: float, native_img: np.ndarray):
+                pick_path = cand_dir / f"full_c{cid}_{int(target_t * 1000)}.png"
+                cv2.imwrite(str(pick_path), native_img)
+            decode_exact_frames(vpath, ts, on_frame=write_pick)
+
+        # Last cancel point: commit replaces the current frames, picks and exports.
+        if check_cancel:
+            check_cancel()
+        saved_records = []
+        seen_store_ts: set[float] = set()
+        for item in all_to_store:
+            t = round(float(item["t"]), 3)
+            if t in seen_store_ts:
+                continue
+            seen_store_ts.add(t)
+            cid = item["chunk_id"]
+            is_pick = item.get("role") == "pick"
+
+            prev_path = preview_dir / f"prev_c{cid}_{int(t * 1000)}.webp"
+            h, w = item["img_bgr"].shape[:2]
+            pw = 384
+            ph = max(16, int(h * (pw / w)))
+            small = cv2.resize(item["img_bgr"], (pw, ph), interpolation=cv2.INTER_AREA)
+            cv2.imwrite(str(prev_path), small, [cv2.IMWRITE_WEBP_QUALITY, 85])
+
+            full_path = cand_dir / f"full_c{cid}_{int(t * 1000)}.png"
+            if not is_pick:
+                # Runners are saved at 512px; re-decoded to native resolution on demand (C1/H1)
+                cv2.imwrite(str(full_path), item["img_bgr"])
+
+            saved_records.append({
+                "item": item,
+                "t": t,
+                "prev_path": str(prev_path),
+                "full_path": str(full_path),
+                "is_pick": is_pick,
+            })
+
+        # 5. Database Commit
+        if on_progress:
+            on_progress(0.92, "Committing records to database...")
+        with self.db.write() as conn:
+            conn.execute("DELETE FROM frames WHERE video_id=?", (video_id,))
+            for rec in saved_records:
+                item = rec["item"]
+                is_pick = rec["is_pick"]
+                cursor = conn.execute(
+                    """
+                    INSERT OR REPLACE INTO frames (
+                        video_id, chunk_id, t, metrics, phash, embedding,
+                        zs_scores, preview_path, full_path, native
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        video_id,
+                        item["chunk_id"],
+                        rec["t"],
+                        json.dumps(item["metrics"]),
+                        item["metrics"]["phash"],
+                        item["embedding"].tobytes(),
+                        json.dumps(item["scores"]),
+                        rec["prev_path"],
+                        rec["full_path"],
+                        1 if is_pick else 0,
+                    ),
+                )
+                frame_id = cursor.lastrowid
+                conn.execute(
+                    """
+                    INSERT INTO picks (frame_id, chunk_id, role, rank, state)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (frame_id, item["chunk_id"], item.get("role", "pick"), item.get("rank", 0), item.get("state", "keep")),
+                )
+
+        # 6. Local postprocessing: Deduplicate >= 95% similar images & trim to target budget (150-200)
+        dedup_report = {}
+        is_autopilot = self.autopilot.get_state(video_id)["stage"] == "extracting"
+        if not is_autopilot:
+            if on_progress:
+                on_progress(0.96, "Running local similarity deduplication (≥95%) & score-optimal selection...")
+            sim_threshold = float(user_settings.get("similarity_dedup_threshold", 0.95))
+            target_min = int(user_settings.get("target_curated_min", 150))
+            target_max = int(user_settings.get("target_curated_max", 200))
+            if options.get("target_curated"):
+                t_cur = int(options["target_curated"])
+                target_min = min(target_min, t_cur)
+                target_max = min(target_max, max(t_cur, target_min))
+            try:
+                from pipeline.refine import Refiner
+                refiner = Refiner(self.db, self.settings)
+                dedup_report = refiner.deduplicate_and_trim_similarity(
+                    video_id,
+                    similarity_threshold=sim_threshold,
+                    target_min=target_min,
+                    target_max=target_max,
+                    check_cancel=check_cancel,
+                )
+            except Exception as e:
+                dedup_report = {"error": str(e)}
+
+        with self.db.write() as conn:
+            conn.execute("UPDATE videos SET status='curating_300' WHERE id=?", (video_id,))
+
+        final_picks_count = (
+            dedup_report.get("after_count", len(picks_300))
+            if isinstance(dedup_report, dict) and "after_count" in dedup_report
+            else len(picks_300)
+        )
+        stats["dedup_similarity"] = dedup_report
+
+        runners_count = len(runners_450)
+        del all_candidates, images_to_embed, embeddings, picks_300, runners_450, saved_records
+        import gc
+        gc.collect()
+
+        return {
+            "picks_count": final_picks_count,
+            "runners_count": runners_count,
+            "stats": stats,
+            "dedup_report": dedup_report,
+        }
+
     def _run_extract_750_job(self, job_id: int, video_id: str, video_name: str, options: dict[str, Any] | None = None) -> None:
         if not self._start_job(job_id, video_id, video_name):
             return
 
+        def update_job_progress(p: float, step: str):
+            with self.db.write() as conn:
+                conn.execute("UPDATE jobs SET progress=? WHERE id=?", (p, job_id))
+            self.broadcast_event("job_progress", {
+                "job_id": job_id,
+                "video_id": video_id,
+                "video_name": video_name,
+                "chunk_id": None,
+                "progress": p,
+                "step": step,
+            })
+
         try:
-            video = self.db.one("SELECT * FROM videos WHERE id=?", (video_id,))
-            if not video:
-                raise ValueError(f"Video {video_id} not found")
-
-            vpath = Path(video["path"])
-            chunks = self.db.all("SELECT * FROM chunks WHERE video_id=? ORDER BY position ASC", (video_id,))
-            if not chunks:
-                from pipeline.autochunk import AutoChunker
-                chunker = AutoChunker(self.db, self.settings)
-                chunks = chunker.generate_balanced_chunks(video_id, target_frames=300)
-
-            # Scenes the human skipped during review are not sampled at all
-            chunks = [c for c in chunks if (c.get("priority") or "normal") != "skip"]
-            if not chunks:
-                raise RuntimeError("Every scene is skipped - nothing to extract")
-
-            total_chunks = len(chunks)
-            user_settings = merged_user_settings(self.db.get_setting("user_settings", {}))
-            options = options or {}
-            target_total = int(user_settings.get("target_candidates", 750))
-            target_curated = int(options.get("target_curated") or user_settings.get("target_curated", 300))
-            if options.get("target_curated"):
-                target_total = max(target_total, round(target_curated * 2.5))
-            category_quotas = user_settings.get("category_quotas")
-            mmr_lambda = float(user_settings.get("mmr_lambda", 0.65))
-
-            letterbox = video.get("letterbox")
-            watermark_rect = video.get("watermark_rect")
-
-            video_persons = self.db.get_video_persons(video_id, include_embeddings=True)
-            pos_persons = video_persons.get("positive", [])
-            neg_persons = video_persons.get("negative", [])
-
-            # Primary positive target person for legacy single target display/compatibility
-            if not pos_persons and video.get("target_person_id"):
-                legacy_p = self.db.get_person(video["target_person_id"])
-                if legacy_p:
-                    pos_persons = [legacy_p]
-
-            pos_embeddings = [person_embedding(p) for p in pos_persons]
-            pos_embeddings = [p for p in pos_embeddings if p is not None]
-            neg_embeddings = [person_embedding(p) for p in neg_persons]
-            neg_embeddings = [n for n in neg_embeddings if n is not None]
-
-            target_person = pos_persons[0] if pos_persons else None
-            target_person_emb = pos_embeddings[0] if pos_embeddings else None
-
-            def update_job_progress(p: float, step: str):
-                with self.db.write() as conn:
-                    conn.execute("UPDATE jobs SET progress=? WHERE id=?", (p, job_id))
-                self.broadcast_event("job_progress", {
-                    "job_id": job_id,
-                    "video_id": video_id,
-                    "video_name": video_name,
-                    "chunk_id": None,
-                    "progress": p,
-                    "step": step,
-                })
-
-            if pos_persons and neg_persons:
-                sample_desc = f"Sampling frames with {len(pos_persons)} positive & {len(neg_persons)} negative face filters..."
-            elif pos_persons:
-                sample_desc = f"Sampling candidate frames with target person '{pos_persons[0]['name']}' face recognition..."
-            elif neg_persons:
-                sample_desc = f"Sampling frames excluding {len(neg_persons)} negative person face(s)..."
-            else:
-                sample_desc = f"Sampling candidate frames across {total_chunks} chunks..."
-            update_job_progress(0.05, sample_desc)
-
-            # 1. Sample candidate frames per chunk (streamed at 512px with pre-crop & gates)
-            all_candidates: list[dict[str, Any]] = []
-            seen_cand_ts: set[float] = set()
-
-            for idx, ch in enumerate(chunks):
-                self._check_cancel(job_id)
-
-                bpct = float(ch.get("budget_pct", 100.0 / max(1, total_chunks)))
-                chunk_n = max(15, round(target_total * (bpct / 100.0)))
-                dur = max(1.0, float(ch["end_s"]) - float(ch["start_s"]))
-                needed_fps = max(1.0, (chunk_n * 1.5) / dur)
-
-                raw_samples = sample_chunk_frames(
-                    vpath,
-                    float(ch["start_s"]),
-                    float(ch["end_s"]),
-                    sample_fps=needed_fps,
-                    max_samples=chunk_n * 2,
-                    max_dim=512,  # Stream at 512px to keep RAM minimal (C4/H5)
-                )
-
-                chunk_cands: list[dict[str, Any]] = []
-                for t, img_bgr in raw_samples:
-                    t_val = round(float(t), 3)
-                    if t_val in seen_cand_ts:
-                        continue
-
-                    # Pre-crop letterbox and watermark before metrics & CLIP (C5/H8/H9)
-                    img_cropped = apply_letterbox_crop(img_bgr, letterbox)
-                    img_cropped = apply_watermark_crop(img_cropped, watermark_rect)
-
-                    metrics = compute_tier1_metrics(img_cropped)
-
-                    # Hard filter check (C5/H8)
-                    ok, _ = hard_filter_check(metrics, sharpness_floor=15.0)
-                    if not ok:
-                        continue
-
-                    # Intra-chunk pHash deduplication <= 4 (C5/H8)
-                    if any(phash_hamming_distance(metrics["phash"], kept["metrics"]["phash"]) <= 4 for kept in chunk_cands):
-                        continue
-
-                    # Face detection & target person matching via YuNet + SFace
-                    if pos_embeddings or neg_embeddings:
-                        match_res = self.face_engine.match_frame_multi(
-                            img_cropped,
-                            positive_features=pos_embeddings,
-                            negative_features=neg_embeddings,
-                        )
-                        # Rule: Exclude frame if exclusively the negative person is visible!
-                        if match_res["excluded"]:
-                            continue
-
-                        metrics["target_person_sim"] = match_res["max_pos_sim"]
-                        metrics["target_person_matched"] = match_res["pos_matched"]
-                        metrics["negative_person_matched"] = match_res["neg_matched"]
-                        metrics["face_count"] = match_res["face_count"]
-                        metrics["faces"] = match_res["faces"]
-                    else:
-                        detected_faces = self.face_engine.detect_faces(img_cropped)
-                        metrics["target_person_sim"] = 0.0
-                        metrics["target_person_matched"] = False
-                        metrics["negative_person_matched"] = False
-                        metrics["face_count"] = len(detected_faces)
-                        metrics["faces"] = [{"box": f["box"], "score": f["score"]} for f in detected_faces]
-
-                    cand_dict = {
-                        "chunk_id": ch["id"],
-                        "t": t_val,
-                        "img_bgr": img_cropped,
-                        "metrics": metrics,
-                        "target_person_sim": metrics["target_person_sim"],
-                        "target_person_matched": metrics["target_person_matched"],
-                        "face_count": metrics["face_count"],
-                    }
-                    seen_cand_ts.add(t_val)
-                    chunk_cands.append(cand_dict)
-                    all_candidates.append(cand_dict)
-
-                p = 0.05 + 0.35 * ((idx + 1) / total_chunks)
-                update_job_progress(round(p, 2), f"Sampled Chunk {idx + 1}/{total_chunks} ({len(chunk_cands)} valid frames)")
-
-            if not all_candidates:
-                raise RuntimeError("No candidate frames could be sampled from video")
-
-            # 2. Batch Embeddings & 7-Dimension Scoring (metrics are already computed during sampling)
-            self._check_cancel(job_id)
-            update_job_progress(0.50, f"Computing CLIP embeddings on {len(all_candidates)} filtered frames...")
-            images_to_embed = [c["img_bgr"] for c in all_candidates]
-            embeddings = self.classifier.embed_images(images_to_embed, batch_size=32)
-
-            self._check_cancel(job_id)
-            step_desc = (
-                f"Evaluating scoring with target person '{target_person['name']}' priority..."
-                if target_person else "Evaluating 7-dimension scoring criteria..."
+            res = self._execute_extract_750(
+                video_id,
+                options=options,
+                on_progress=update_job_progress,
+                check_cancel=lambda: self._check_cancel(job_id),
             )
-            update_job_progress(0.68, step_desc)
-            self.scoring_engine.score_candidates_batch(
-                all_candidates, embeddings, target_person_embedding=target_person_emb
-            )
-
-            # 3. Multi-objective reduction
-            update_job_progress(0.78, f"Optimizing best {target_curated} frame subset...")
-            picks_300, runners_450, stats = self.scoring_engine.reduce_750_to_300(
-                all_candidates, chunks, target_total=target_curated, category_quotas=category_quotas, mmr_lambda=mmr_lambda
-            )
-
-            # 4. Save previews and decode exact full-resolution frames for picks
-            update_job_progress(0.82, "Saving thumbnails and native frames...")
-            preview_dir = self.settings.cache_dir / "previews" / video_id
-            preview_dir.mkdir(parents=True, exist_ok=True)
-            cand_dir = self.settings.cache_dir / "candidates" / video_id
-            cand_dir.mkdir(parents=True, exist_ok=True)
-
-            # Prune stale candidate and preview files for this video (M9)
-            for old_f in list(preview_dir.glob("*.webp")) + list(cand_dir.glob("*.png")):
-                try:
-                    old_f.unlink()
-                except OSError:
-                    pass
-
-            all_to_store = picks_300 + runners_450
-
-            picks_by_chunk: dict[int, list[dict[str, Any]]] = {}
-            for p in picks_300:
-                cid = p["chunk_id"]
-                picks_by_chunk.setdefault(cid, []).append(p)
-
-            # Stream native frames directly to disk chunk by chunk without accumulating in RAM (C4/H5)
-            for cid, ch_picks in picks_by_chunk.items():
-                self._check_cancel(job_id)
-                ts = [p["t"] for p in ch_picks]
-                def write_pick(target_t: float, native_img: np.ndarray):
-                    pick_path = cand_dir / f"full_c{cid}_{int(target_t * 1000)}.png"
-                    cv2.imwrite(str(pick_path), native_img)
-                decode_exact_frames(vpath, ts, on_frame=write_pick)
-
-            # Last cancel point: commit replaces the current frames, picks and exports.
-            self._check_cancel(job_id)
-            saved_records = []
-            seen_store_ts: set[float] = set()
-            for item in all_to_store:
-                t = round(float(item["t"]), 3)
-                if t in seen_store_ts:
-                    continue
-                seen_store_ts.add(t)
-                cid = item["chunk_id"]
-                is_pick = item.get("role") == "pick"
-
-                prev_path = preview_dir / f"prev_c{cid}_{int(t * 1000)}.webp"
-                h, w = item["img_bgr"].shape[:2]
-                pw = 384
-                ph = max(16, int(h * (pw / w)))
-                small = cv2.resize(item["img_bgr"], (pw, ph), interpolation=cv2.INTER_AREA)
-                cv2.imwrite(str(prev_path), small, [cv2.IMWRITE_WEBP_QUALITY, 85])
-
-                full_path = cand_dir / f"full_c{cid}_{int(t * 1000)}.png"
-                if not is_pick:
-                    # Runners are saved at 512px; re-decoded to native resolution on demand (C1/H1)
-                    cv2.imwrite(str(full_path), item["img_bgr"])
-
-                saved_records.append({
-                    "item": item,
-                    "t": t,
-                    "prev_path": str(prev_path),
-                    "full_path": str(full_path),
-                    "is_pick": is_pick,
-                })
-
-            # 5. Database Commit
-            update_job_progress(0.92, "Committing records to database...")
             with self.db.write() as conn:
-                conn.execute("DELETE FROM frames WHERE video_id=?", (video_id,))
-                for rec in saved_records:
-                    item = rec["item"]
-                    is_pick = rec["is_pick"]
-                    cursor = conn.execute(
-                        """
-                        INSERT OR REPLACE INTO frames (
-                            video_id, chunk_id, t, metrics, phash, embedding,
-                            zs_scores, preview_path, full_path, native
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            video_id,
-                            item["chunk_id"],
-                            rec["t"],
-                            json.dumps(item["metrics"]),
-                            item["metrics"]["phash"],
-                            item["embedding"].tobytes(),
-                            json.dumps(item["scores"]),
-                            rec["prev_path"],
-                            rec["full_path"],
-                            1 if is_pick else 0,
-                        ),
-                    )
-                    frame_id = cursor.lastrowid
-                    conn.execute(
-                        """
-                        INSERT INTO picks (frame_id, chunk_id, role, rank, state)
-                        VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (frame_id, item["chunk_id"], item.get("role", "pick"), item.get("rank", 0), item.get("state", "keep")),
-                    )
-
-            # 6. Local postprocessing: Deduplicate >= 95% similar images & trim to target budget (150-200)
-            dedup_report = {}
-            is_autopilot = self.autopilot.get_state(video_id)["stage"] == "extracting"
-            if not is_autopilot:
-                update_job_progress(0.96, "Running local similarity deduplication (≥95%) & score-optimal selection...")
-                sim_threshold = float(user_settings.get("similarity_dedup_threshold", 0.95))
-                target_min = int(user_settings.get("target_curated_min", 150))
-                target_max = int(user_settings.get("target_curated_max", 200))
-                if options.get("target_curated"):
-                    t_cur = int(options["target_curated"])
-                    target_min = min(target_min, t_cur)
-                    target_max = min(target_max, max(t_cur, target_min))
-                try:
-                    from pipeline.refine import Refiner
-                    refiner = Refiner(self.db, self.settings)
-                    dedup_report = refiner.deduplicate_and_trim_similarity(
-                        video_id,
-                        similarity_threshold=sim_threshold,
-                        target_min=target_min,
-                        target_max=target_max,
-                        check_cancel=lambda: self._check_cancel(job_id),
-                    )
-                except Exception as e:
-                    dedup_report = {"error": str(e)}
-
-            with self.db.write() as conn:
-                conn.execute("UPDATE videos SET status='curating_300' WHERE id=?", (video_id,))
                 conn.execute(
                     "UPDATE jobs SET status='finished', error=NULL, progress=1.0, finished_at=? WHERE id=?",
                     (time.time(), job_id),
                 )
-
-            final_picks_count = (
-                dedup_report.get("after_count", len(picks_300))
-                if isinstance(dedup_report, dict) and "after_count" in dedup_report
-                else len(picks_300)
-            )
-            stats["dedup_similarity"] = dedup_report
 
             self.broadcast_event("job_finished", {
                 "job_id": job_id,
                 "video_id": video_id,
                 "video_name": video_name,
                 "chunk_id": None,
-                "picks_count": final_picks_count,
-                "runners_count": len(runners_450),
-                "stats": stats,
+                "picks_count": res.get("picks_count", 0),
+                "runners_count": res.get("runners_count", 0),
+                "stats": res.get("stats", {}),
             })
-
-            del all_candidates, images_to_embed, embeddings, picks_300, runners_450, saved_records
-            import gc
-            gc.collect()
 
             # An autopilot run continues with the similarity pass (no-op for manual extractions)
             self.autopilot.on_extract_finished(video_id)
@@ -733,6 +770,491 @@ class JobManager:
                 "error": str(ex),
             })
             self.autopilot.on_job_failed(video_id, str(ex))
+        finally:
+            self._cancel_flags.discard(job_id)
+
+    # -------------------------------------------------------------------------
+    # Batch Auto-Extract Pipeline (Sequential step-by-step for overnight runs)
+    # -------------------------------------------------------------------------
+    def submit_batch_auto_extract_job(
+        self,
+        video_ids: list[str] | None = None,
+        only_unextracted: bool = True,
+        options: dict[str, Any] | None = None,
+    ) -> int:
+        now = time.time()
+        if not video_ids:
+            query = "SELECT id, name, status FROM videos WHERE broken=0 AND duration > 0"
+            if only_unextracted:
+                query += " AND status IN ('new', 'chunked')"
+            query += " ORDER BY CASE status WHEN 'new' THEN 1 WHEN 'chunked' THEN 2 ELSE 3 END, name ASC"
+            rows = self.db.all(query)
+            target_ids = [r["id"] for r in rows]
+        else:
+            target_ids = list(video_ids)
+
+        if not target_ids:
+            raise ValueError("No eligible videos found to auto-extract")
+
+        title = f"Batch Auto-Extract ({len(target_ids)} videos)"
+        with self.db.write() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO jobs (type, video_id, chunk_id, status, progress, created_at)
+                VALUES ('batch_auto_extract', NULL, NULL, 'queued', 0.0, ?)
+                """,
+                (now,),
+            )
+            job_id = cursor.lastrowid
+
+        self.broadcast_event("job_queued", {
+            "job_id": job_id,
+            "video_id": None,
+            "video_name": title,
+            "chunk_id": None,
+        })
+        self.decode_executor.submit(self._run_batch_auto_extract_job, job_id, target_ids, options or {})
+        return job_id
+
+    def _run_batch_auto_extract_job(self, job_id: int, video_ids: list[str], options: dict[str, Any]) -> None:
+        title = f"Batch Auto-Extract ({len(video_ids)} videos)"
+        if not self._start_job(job_id, None, title):
+            return
+
+        def update_batch_progress(p: float, step: str):
+            with self.db.write() as conn:
+                conn.execute("UPDATE jobs SET progress=? WHERE id=?", (p, job_id))
+            self.broadcast_event("job_progress", {
+                "job_id": job_id,
+                "video_id": None,
+                "video_name": title,
+                "chunk_id": None,
+                "progress": p,
+                "step": step,
+            })
+
+        total = len(video_ids)
+        processed = 0
+        failed = 0
+        failures: list[str] = []
+
+        try:
+            for idx, vid in enumerate(video_ids):
+                self._check_cancel(job_id)
+                v = self.db.one("SELECT id, name, status, broken, duration FROM videos WHERE id=?", (vid,))
+                if not v or v.get("broken") or not v.get("duration"):
+                    continue
+
+                vname = v.get("name", vid)
+                base_p = idx / total
+                update_batch_progress(round(base_p, 3), f"[{idx+1}/{total}] '{vname}': Starting extraction...")
+
+                try:
+                    # 1. Ensure chunked
+                    chunks = self.db.all("SELECT id FROM chunks WHERE video_id=?", (vid,))
+                    if not chunks:
+                        from pipeline.autochunk import AutoChunker
+                        chunker = AutoChunker(self.db, self.settings)
+                        chunker.generate_balanced_chunks(vid, target_frames=300)
+
+                    # 2. Extract with scaled sub-progress
+                    def on_sub_prog(sub_p: float, sub_step: str):
+                        combined = base_p + (sub_p / total)
+                        update_batch_progress(round(combined, 3), f"[{idx+1}/{total}] {vname}: {sub_step}")
+
+                    with self.db.write() as conn:
+                        conn.execute("UPDATE videos SET status='extracting_750' WHERE id=?", (vid,))
+
+                    self._execute_extract_750(
+                        vid,
+                        options=options,
+                        on_progress=on_sub_prog,
+                        check_cancel=lambda: self._check_cancel(job_id),
+                    )
+                    processed += 1
+                    self.broadcast_event("video_updated", {"video_id": vid, "status": "curating_300"})
+                except JobCancelled:
+                    raise
+                except Exception as ex:
+                    failed += 1
+                    err_msg = f"{vname}: {type(ex).__name__}: {str(ex)}"
+                    failures.append(err_msg)
+                    with self.db.write() as conn:
+                        self._settle_video_status(conn, vid)
+                    continue
+
+            with self.db.write() as conn:
+                status_note = f"Finished {processed}/{total} videos ({failed} failed)" if failed else None
+                conn.execute(
+                    "UPDATE jobs SET status='finished', error=?, progress=1.0, finished_at=? WHERE id=?",
+                    (status_note, time.time(), job_id),
+                )
+
+            self.broadcast_event("job_finished", {
+                "job_id": job_id,
+                "video_id": None,
+                "video_name": title,
+                "chunk_id": None,
+                "processed": processed,
+                "failed": failed,
+                "total": total,
+            })
+        except JobCancelled:
+            self._finish_cancelled(job_id, None, title)
+        except Exception as ex:
+            with self.db.write() as conn:
+                conn.execute("UPDATE jobs SET status='error', error=?, finished_at=? WHERE id=?", (str(ex), time.time(), job_id))
+            self.broadcast_event("job_error", {
+                "job_id": job_id,
+                "video_id": None,
+                "video_name": title,
+                "error": str(ex),
+            })
+        finally:
+            self._cancel_flags.discard(job_id)
+
+    # -------------------------------------------------------------------------
+    # Targeted Single-Chunk Extraction (Multi-Step Frame Budget Re-Extraction)
+    # -------------------------------------------------------------------------
+    def submit_extract_chunk_job(self, chunk_id: int, options: dict[str, Any] | None = None) -> int:
+        now = time.time()
+        ch = self.db.one(
+            "SELECT c.id, c.video_id, v.name as video_name FROM chunks c JOIN videos v ON c.video_id=v.id WHERE c.id=?",
+            (chunk_id,),
+        )
+        if not ch:
+            raise ValueError(f"Chunk {chunk_id} not found")
+        video_id = ch["video_id"]
+        video_name = ch["video_name"]
+
+        with self.db.write() as conn:
+            self._assert_no_active_job(video_id)
+            cursor = conn.execute(
+                """
+                INSERT INTO jobs (type, video_id, chunk_id, status, progress, created_at)
+                VALUES ('extract_chunk', ?, ?, 'queued', 0.0, ?)
+                """,
+                (video_id, chunk_id, now),
+            )
+            job_id = cursor.lastrowid
+            conn.execute("UPDATE chunks SET dirty=1 WHERE id=?", (chunk_id,))
+
+        self.broadcast_event("job_queued", {
+            "job_id": job_id,
+            "video_id": video_id,
+            "video_name": video_name,
+            "chunk_id": chunk_id,
+        })
+        self.decode_executor.submit(self._run_extract_chunk_job, job_id, video_id, video_name, chunk_id, options or {})
+        return job_id
+
+    def _execute_extract_chunk(
+        self,
+        chunk_id: int,
+        k: int | None = None,
+        budget_pct: float | None = None,
+        on_progress: Callable[[float, str], None] | None = None,
+        check_cancel: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        chunk = self.db.one("SELECT * FROM chunks WHERE id=?", (chunk_id,))
+        if not chunk:
+            raise ValueError(f"Chunk {chunk_id} not found")
+        video_id = chunk["video_id"]
+        video = self.db.one("SELECT * FROM videos WHERE id=?", (video_id,))
+        if not video:
+            raise ValueError(f"Video {video_id} not found")
+        vpath = Path(video["path"])
+
+        with self.db.write() as conn:
+            if k is not None:
+                conn.execute("UPDATE chunks SET k=? WHERE id=?", (int(k), chunk_id))
+            if budget_pct is not None:
+                conn.execute("UPDATE chunks SET budget_pct=? WHERE id=?", (float(budget_pct), chunk_id))
+
+        target_k = int(k if k is not None else chunk.get("k", 15))
+        target_k = max(5, target_k)
+        target_samples = max(25, target_k * 3)
+
+        dur = max(1.0, float(chunk["end_s"]) - float(chunk["start_s"]))
+        needed_fps = max(1.0, (target_samples * 1.5) / dur)
+
+        letterbox = video.get("letterbox")
+        watermark_rect = video.get("watermark_rect")
+
+        video_persons = self.db.get_video_persons(video_id, include_embeddings=True)
+        pos_persons = video_persons.get("positive", [])
+        neg_persons = video_persons.get("negative", [])
+
+        if not pos_persons and video.get("target_person_id"):
+            legacy_p = self.db.get_person(video["target_person_id"])
+            if legacy_p:
+                pos_persons = [legacy_p]
+
+        pos_embeddings = [person_embedding(p) for p in pos_persons]
+        pos_embeddings = [p for p in pos_embeddings if p is not None]
+        neg_embeddings = [person_embedding(p) for p in neg_persons]
+        neg_embeddings = [n for n in neg_embeddings if n is not None]
+
+        target_person_emb = pos_embeddings[0] if pos_embeddings else None
+
+        if on_progress:
+            on_progress(0.10, f"Sampling candidate frames for Scene #{chunk.get('position', 0) + 1}...")
+        if check_cancel:
+            check_cancel()
+
+        raw_samples = sample_chunk_frames(
+            vpath,
+            float(chunk["start_s"]),
+            float(chunk["end_s"]),
+            sample_fps=needed_fps,
+            max_samples=target_samples * 2,
+            max_dim=512,
+        )
+
+        chunk_cands: list[dict[str, Any]] = []
+        seen_cand_ts: set[float] = set()
+
+        for t, img_bgr in raw_samples:
+            t_val = round(float(t), 3)
+            if t_val in seen_cand_ts:
+                continue
+
+            img_cropped = apply_letterbox_crop(img_bgr, letterbox)
+            img_cropped = apply_watermark_crop(img_cropped, watermark_rect)
+            metrics = compute_tier1_metrics(img_cropped)
+
+            ok, _ = hard_filter_check(metrics, sharpness_floor=15.0)
+            if not ok:
+                continue
+
+            if any(phash_hamming_distance(metrics["phash"], kept["metrics"]["phash"]) <= 4 for kept in chunk_cands):
+                continue
+
+            if pos_embeddings or neg_embeddings:
+                match_res = self.face_engine.match_frame_multi(
+                    img_cropped,
+                    positive_features=pos_embeddings,
+                    negative_features=neg_embeddings,
+                )
+                if match_res["excluded"]:
+                    continue
+                metrics["target_person_sim"] = match_res["max_pos_sim"]
+                metrics["target_person_matched"] = match_res["pos_matched"]
+                metrics["negative_person_matched"] = match_res["neg_matched"]
+                metrics["face_count"] = match_res["face_count"]
+                metrics["faces"] = match_res["faces"]
+            else:
+                detected_faces = self.face_engine.detect_faces(img_cropped)
+                metrics["target_person_sim"] = 0.0
+                metrics["target_person_matched"] = False
+                metrics["negative_person_matched"] = False
+                metrics["face_count"] = len(detected_faces)
+                metrics["faces"] = [{"box": f["box"], "score": f["score"]} for f in detected_faces]
+
+            cand_dict = {
+                "chunk_id": chunk_id,
+                "t": t_val,
+                "img_bgr": img_cropped,
+                "metrics": metrics,
+                "target_person_sim": metrics["target_person_sim"],
+                "target_person_matched": metrics["target_person_matched"],
+                "face_count": metrics["face_count"],
+            }
+            seen_cand_ts.add(t_val)
+            chunk_cands.append(cand_dict)
+
+        if not chunk_cands:
+            raise RuntimeError("No candidate frames could be sampled from chunk")
+
+        if check_cancel:
+            check_cancel()
+        if on_progress:
+            on_progress(0.50, f"Evaluating CLIP embeddings on {len(chunk_cands)} frames...")
+
+        embeddings = self.classifier.embed_images([c["img_bgr"] for c in chunk_cands], batch_size=32)
+        self.scoring_engine.score_candidates_batch(chunk_cands, embeddings, target_person_embedding=target_person_emb)
+
+        if check_cancel:
+            check_cancel()
+        if on_progress:
+            on_progress(0.75, f"Selecting top {target_k} frames...")
+
+        chunk_cands.sort(key=lambda c: float(c.get("scores", {}).get("composite", 0.0)), reverse=True)
+        picks = chunk_cands[:target_k]
+        runners = chunk_cands[target_k : target_k + max(target_k * 2, 20)]
+
+        for idx, p in enumerate(picks):
+            p["role"] = "pick"
+            p["state"] = "keep"
+            p["rank"] = idx + 1
+        for idx, r in enumerate(runners):
+            r["role"] = "runner_up"
+            r["state"] = "candidate"
+            r["rank"] = target_k + idx + 1
+
+        if on_progress:
+            on_progress(0.85, "Writing native frames and thumbnails...")
+
+        preview_dir = self.settings.cache_dir / "previews" / video_id
+        cand_dir = self.settings.cache_dir / "candidates" / video_id
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        cand_dir.mkdir(parents=True, exist_ok=True)
+
+        old_frames = self.db.all("SELECT id, preview_path, full_path FROM frames WHERE chunk_id=?", (chunk_id,))
+        for of in old_frames:
+            if of.get("preview_path"):
+                try:
+                    Path(of["preview_path"]).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            if of.get("full_path"):
+                try:
+                    Path(of["full_path"]).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        pick_ts = [p["t"] for p in picks]
+        def write_pick(target_t: float, native_img: np.ndarray):
+            pick_path = cand_dir / f"full_c{chunk_id}_{int(target_t * 1000)}.png"
+            cv2.imwrite(str(pick_path), native_img)
+        decode_exact_frames(vpath, pick_ts, on_frame=write_pick)
+
+        all_to_store = picks + runners
+        saved_records = []
+        seen_store_ts: set[float] = set()
+
+        for item in all_to_store:
+            t = round(float(item["t"]), 3)
+            if t in seen_store_ts:
+                continue
+            seen_store_ts.add(t)
+            is_pick = item.get("role") == "pick"
+
+            prev_path = preview_dir / f"prev_c{chunk_id}_{int(t * 1000)}.webp"
+            h, w = item["img_bgr"].shape[:2]
+            pw = 384
+            ph = max(16, int(h * (pw / w)))
+            small = cv2.resize(item["img_bgr"], (pw, ph), interpolation=cv2.INTER_AREA)
+            cv2.imwrite(str(prev_path), small, [cv2.IMWRITE_WEBP_QUALITY, 85])
+
+            full_path = cand_dir / f"full_c{chunk_id}_{int(t * 1000)}.png"
+            if not is_pick:
+                cv2.imwrite(str(full_path), item["img_bgr"])
+
+            saved_records.append({
+                "item": item,
+                "t": t,
+                "prev_path": str(prev_path),
+                "full_path": str(full_path),
+                "is_pick": is_pick,
+            })
+
+        with self.db.write() as conn:
+            conn.execute("DELETE FROM picks WHERE chunk_id=?", (chunk_id,))
+            conn.execute("DELETE FROM frames WHERE chunk_id=?", (chunk_id,))
+            for rec in saved_records:
+                item = rec["item"]
+                is_pick = rec["is_pick"]
+                cursor = conn.execute(
+                    """
+                    INSERT OR REPLACE INTO frames (
+                        video_id, chunk_id, t, metrics, phash, embedding,
+                        zs_scores, preview_path, full_path, native
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        video_id,
+                        chunk_id,
+                        rec["t"],
+                        json.dumps(item["metrics"]),
+                        item["metrics"]["phash"],
+                        item["embedding"].tobytes(),
+                        json.dumps(item.get("scores", {})),
+                        rec["prev_path"],
+                        rec["full_path"],
+                        1 if is_pick else 0,
+                    ),
+                )
+                frame_id = cursor.lastrowid
+                conn.execute(
+                    """
+                    INSERT INTO picks (frame_id, chunk_id, role, rank, state)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (frame_id, chunk_id, item.get("role", "pick"), item.get("rank", 0), item.get("state", "keep")),
+                )
+            conn.execute("UPDATE chunks SET dirty=0 WHERE id=?", (chunk_id,))
+            conn.execute("UPDATE videos SET status='curating_300' WHERE id=?", (video_id,))
+
+        return {
+            "chunk_id": chunk_id,
+            "video_id": video_id,
+            "picks_count": len(picks),
+            "runners_count": len(runners),
+        }
+
+    def _run_extract_chunk_job(
+        self,
+        job_id: int,
+        video_id: str,
+        video_name: str,
+        chunk_id: int,
+        options: dict[str, Any],
+    ) -> None:
+        if not self._start_job(job_id, video_id, video_name, chunk_id=chunk_id):
+            return
+
+        def update_job_progress(p: float, step: str):
+            with self.db.write() as conn:
+                conn.execute("UPDATE jobs SET progress=? WHERE id=?", (p, job_id))
+            self.broadcast_event("job_progress", {
+                "job_id": job_id,
+                "video_id": video_id,
+                "video_name": video_name,
+                "chunk_id": chunk_id,
+                "progress": p,
+                "step": step,
+            })
+
+        try:
+            res = self._execute_extract_chunk(
+                chunk_id,
+                k=options.get("k"),
+                budget_pct=options.get("budget_pct"),
+                on_progress=update_job_progress,
+                check_cancel=lambda: self._check_cancel(job_id),
+            )
+            with self.db.write() as conn:
+                conn.execute(
+                    "UPDATE jobs SET status='finished', error=NULL, progress=1.0, finished_at=? WHERE id=?",
+                    (time.time(), job_id),
+                )
+            self.broadcast_event("job_finished", {
+                "job_id": job_id,
+                "video_id": video_id,
+                "video_name": video_name,
+                "chunk_id": chunk_id,
+                "picks_count": res.get("picks_count", 0),
+                "runners_count": res.get("runners_count", 0),
+            })
+            self.broadcast_event("chunk_extracted", {
+                "video_id": video_id,
+                "chunk_id": chunk_id,
+                "picks_count": res.get("picks_count", 0),
+            })
+        except JobCancelled:
+            self._finish_cancelled(job_id, video_id, video_name)
+        except Exception as ex:
+            with self.db.write() as conn:
+                conn.execute("UPDATE jobs SET status='error', error=?, finished_at=? WHERE id=?", (str(ex), time.time(), job_id))
+                self._settle_video_status(conn, video_id)
+            self.broadcast_event("job_error", {
+                "job_id": job_id,
+                "video_id": video_id,
+                "video_name": video_name,
+                "chunk_id": chunk_id,
+                "error": str(ex),
+            })
         finally:
             self._cancel_flags.discard(job_id)
 

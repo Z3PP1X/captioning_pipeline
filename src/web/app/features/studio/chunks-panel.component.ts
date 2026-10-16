@@ -204,7 +204,7 @@ import { ChunkItem } from '../../core/models/chunk.model';
       <div class="flex flex-col gap-1.5 max-h-80 overflow-y-auto overflow-x-auto pr-1">
         <!-- List Column Headers -->
         @if (chunkService.chunks().length > 0) {
-          <div class="grid grid-cols-[135px_95px_95px_85px_1fr_110px_165px_36px] items-center gap-2.5 px-3 py-1.5 text-xs font-semibold text-muted-foreground uppercase tracking-wider border-b border-border/50 min-w-[840px]">
+          <div class="grid grid-cols-[135px_95px_95px_85px_1fr_110px_165px_72px] items-center gap-2.5 px-3 py-1.5 text-xs font-semibold text-muted-foreground uppercase tracking-wider border-b border-border/50 min-w-[880px]">
             <div>Chunk</div>
             <div>Start</div>
             <div>End</div>
@@ -212,14 +212,14 @@ import { ChunkItem } from '../../core/models/chunk.model';
             <div>Frame Budget</div>
             <div>Rule</div>
             <div>Model</div>
-            <div class="text-right">Action</div>
+            <div class="text-right">Actions</div>
           </div>
         }
 
         @for (chunk of chunkService.chunks(); track chunk.position; let idx = $index) {
           <div
             (click)="seek.emit(chunk.start_s)"
-            class="grid grid-cols-[135px_95px_95px_85px_1fr_110px_165px_36px] items-center gap-2.5 px-3 py-2 rounded-lg border transition-all text-xs cursor-pointer min-w-[840px]"
+            class="grid grid-cols-[135px_95px_95px_85px_1fr_110px_165px_72px] items-center gap-2.5 px-3 py-2 rounded-lg border transition-all text-xs cursor-pointer min-w-[880px]"
             [class]="isCurrentChunk(chunk)
               ? 'border-primary bg-primary/10 shadow-xs ring-1 ring-primary/40'
               : 'border-border bg-background hover:border-primary/50 hover:bg-muted/30'"
@@ -339,15 +339,28 @@ import { ChunkItem } from '../../core/models/chunk.model';
               </select>
             </div>
 
-            <!-- Column 8: Delete Action -->
-            <div class="flex items-center justify-end" (click)="$event.stopPropagation()">
+            <!-- Column 8: Actions (Extract Scene & Delete) -->
+            <div class="flex items-center justify-end gap-1.5" (click)="$event.stopPropagation()">
+              <button
+                type="button"
+                (click)="onExtractSingleChunk(chunk)"
+                [disabled]="!chunk.id || chunkService.isExtractingChunk(chunk.id)"
+                class="text-amber-500 hover:text-amber-400 p-1 rounded cursor-pointer transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                title="Extract frames for this chunk only (multi-step extraction)"
+              >
+                @if (chunkService.isExtractingChunk(chunk.id)) {
+                  <ng-icon name="lucideRefreshCw" class="size-3.5 animate-spin" />
+                } @else {
+                  <ng-icon name="lucideZap" class="size-3.5" />
+                }
+              </button>
               <button
                 type="button"
                 (click)="chunkService.deleteChunk(idx)"
                 class="text-muted-foreground hover:text-destructive p-1 rounded cursor-pointer transition-colors"
                 title="Remove this chunk"
               >
-                <ng-icon name="lucideTrash2" class="size-4" />
+                <ng-icon name="lucideTrash2" class="size-3.5" />
               </button>
             </div>
           </div>
@@ -583,6 +596,37 @@ export class ChunksPanelComponent {
       } catch (err) {
         this.jobEvents.showToast('Extraction Failed', `Error: ${err}`, video.id, true);
       }
+    }
+  }
+
+  async onExtractSingleChunk(chunk: ChunkItem): Promise<void> {
+    const video = this.videoService.currentVideo();
+    if (!video || !chunk.id) {
+      this.jobEvents.showToast(
+        'Extraction Warning',
+        'Please save chunks before extracting an individual scene.',
+        video?.id ?? null,
+        true
+      );
+      return;
+    }
+
+    try {
+      if (this.chunkService.isDirty()) {
+        const done = await this.withRechunkConfirm((confirm) => this.chunkService.saveChunks(video.id, confirm));
+        if (!done) return;
+      }
+      await this.chunkService.extractChunk(chunk.id, {
+        k: chunk.k,
+        budget_pct: chunk.budget_pct,
+      });
+      this.jobEvents.showToast(
+        'Scene Extraction Dispatched',
+        `Extracting frames specifically for Scene #${chunk.position + 1} (${chunk.budget_pct}% budget)...`,
+        video.id
+      );
+    } catch (err) {
+      this.jobEvents.showToast('Scene Extraction Failed', `Error: ${err}`, video.id, true);
     }
   }
 }

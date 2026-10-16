@@ -729,6 +729,25 @@ def auto_extract_endpoint(video_id: str, req: AutoExtractRequest = None):
     return {"job_id": job_id, "status": "queued"}
 
 
+class BatchAutoExtractRequest(BaseModel):
+    video_ids: list[str] | None = None
+    only_unextracted: bool = True
+    target_curated: int | None = None
+
+
+@app.post("/api/videos/batch-auto-extract")
+def batch_auto_extract_endpoint(req: BatchAutoExtractRequest | None = None):
+    """Executes the auto-extraction pipeline for all videos in list step by step (overnight batch run)."""
+    opts = req.model_dump(exclude_none=True) if req else {}
+    vids = opts.pop("video_ids", None)
+    only_un = opts.pop("only_unextracted", True)
+    try:
+        job_id = jobs.submit_batch_auto_extract_job(video_ids=vids, only_unextracted=only_un, options=opts)
+        return {"job_id": job_id, "status": "queued"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 # ----------------------------------------------------------------------------- Person enrollment from the video
 def _decode_frame_at(video_id: str, t: float, max_dim: int) -> np.ndarray:
     vid = db.one("SELECT path, letterbox, watermark_rect FROM videos WHERE id=?", (video_id,))
@@ -1025,6 +1044,28 @@ def update_chunk(chunk_id: int, patch: ChunkPatch):
             conn.execute(f"UPDATE chunks SET {', '.join(updates)} WHERE id = ?", tuple(params))
 
     return {"chunk": db.one("SELECT * FROM chunks WHERE id=?", (chunk_id,))}
+
+
+class ChunkExtractRequest(BaseModel):
+    k: int | None = Field(default=None, ge=1, le=500)
+    budget_pct: float | None = Field(default=None, ge=0.0, le=100.0)
+
+
+@app.post("/api/chunks/{chunk_id}/extract")
+@app.post("/api/videos/{video_id}/chunks/{chunk_id}/extract")
+def extract_chunk_endpoint(chunk_id: int, req: ChunkExtractRequest | None = None, video_id: str | None = None):
+    """Targeted single-chunk extraction: extracts candidates and picks strictly within this chunk's timecode range."""
+    ch = db.one("SELECT * FROM chunks WHERE id=?", (chunk_id,))
+    if not ch:
+        raise HTTPException(status_code=404, detail="Chunk not found")
+    opts = req.model_dump(exclude_none=True) if req else {}
+    try:
+        job_id = jobs.submit_extract_chunk_job(chunk_id, options=opts)
+        return {"job_id": job_id, "status": "queued", "chunk_id": chunk_id, "video_id": ch["video_id"]}
+    except JobConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/videos/{video_id}/chunks/suggest")

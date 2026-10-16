@@ -167,4 +167,34 @@ export class VideoService {
       throw err;
     }
   }
+
+  async batchAutoExtract(videoIds?: string[], onlyUnextracted = true): Promise<{ job_id: number; status: string }> {
+    try {
+      this.isLoading.set(true);
+      const res = await this.api.post<{ job_id: number; status: string }>(
+        '/api/videos/batch-auto-extract',
+        { video_ids: videoIds, only_unextracted: onlyUnextracted }
+      );
+      return res;
+    } catch (err) {
+      console.error('Failed to start batch auto-extraction:', err);
+      throw err;
+    } finally {
+      this.isLoading.set(false);
+    }
+  }
+
+  async autoExtractSingle(videoId: string | number): Promise<{ job_id: number; status: string }> {
+    const strId = String(videoId);
+    try {
+      const res = await this.api.post<{ job_id: number; status: string }>(
+        `/api/videos/${strId}/auto-extract`,
+        {}
+      );
+      return res;
+    } catch (err) {
+      console.error(`Failed to trigger auto-extract for video ${strId}:`, err);
+      throw err;
+    }
+  }
 }

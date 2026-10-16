@@ -345,6 +345,33 @@ High-performance, CPU-friendly facial recognition (<10ms inference per frame on 
    - `npm test -- --watch=false`: **49 / 49 passed** (all 6 Vitest suites).
    - `npm run build`: **Clean production bundle** (output: `src/web/dist`, 688 kB, 0 errors).
 
+### Phase 1.8 - Overnight Batch Auto-Extraction & Targeted Single-Chunk Budget Extraction - **DONE**
+
+1. **Batch Auto-Extraction Pipeline for All Videos (Overnight Run) (`src/pipeline/jobs.py`, `api.py`)**:
+   - `submit_batch_auto_extract_job(video_ids=None, only_unextracted=True, options=None)` and `_run_batch_auto_extract_job`.
+   - Sequential, unattended overnight execution across library videos (safe CPU/RAM resource usage).
+   - Automatically auto-chunks unchunked videos using scene cuts into balanced ~300 frame budgets.
+   - Runs full candidate sampling, Tier-1 metrics, multi-person facial recognition (positive/negative rules), CLIP scoring, and 95% score-optimal deduplication down to 150-200 images.
+   - Resilient failure isolation: individual video exceptions are recorded, transitional statuses settled cleanly, and subsequent videos in the batch proceed uninterrupted.
+   - REST endpoint: `POST /api/videos/batch-auto-extract`.
+
+2. **Targeted Multi-Step Single-Chunk Frame Budget Re-Extraction (`src/pipeline/jobs.py`, `api.py`)**:
+   - `submit_extract_chunk_job(chunk_id, options=None)` and `_execute_extract_chunk(chunk_id, k, budget_pct, ...)`.
+   - Allows fine-tuning frame budgets (`k`, `budget_pct`) per scene chunk and re-extracting frames **strictly** within that chunk's time interval `[start_s, end_s]`.
+   - Guaranteed isolation: only files and SQLite records for `chunk_id` are replaced; all other scene chunks, curations, and captions remain completely untouched.
+   - Resets chunk `dirty=0` upon successful completion.
+   - REST endpoints: `POST /api/chunks/{chunk_id}/extract` and `POST /api/videos/{video_id}/chunks/{chunk_id}/extract`.
+
+3. **Angular 22 Frontend Integration**:
+   - `PipelineBoardComponent`: Added `⚡ Auto-Extract All (Overnight)` button in the header toolbar, active batch progress banner with live percentage and step description, and individual `⚡ Auto` action buttons for new/chunked videos.
+   - `ChunksPanelComponent`: Added `⚡ Extract Scene` action button in Column 8 with spinning indicator (`chunkService.isExtractingChunk(chunk.id)`), auto-saving budget edits before dispatch.
+   - Data layer: `ChunkService.extractChunk`, `VideoService.batchAutoExtract`, and `VideoService.autoExtractSingle`.
+
+4. **WSL 2 Verification**:
+   - `tests/test_chunk_and_batch_extract.py`: Unit tests verifying targeted chunk isolation, batch execution, error resilience, and API contracts.
+   - All tests passing across the test suite.
+   - Clean production build: `src/web/dist` (0 errors).
+
 ### Phase F - Extraction / quality / selection v2 (about 8-14 days; needs decision 1)
 
 Pipeline review §4-6 and roadmap Phases 2-4:

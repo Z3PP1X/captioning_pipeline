@@ -45,6 +45,8 @@ Chunk = { id, video_id, position, start_s, end_s, k, budget_pct, caption_model: 
 | Method + path | Body | Response |
 | --- | --- | --- |
 | `POST /api/videos/{id}/extract-750` (alias `extract_750`) | `{}` | `{job_id, status:"queued"}` |
+| `POST /api/videos/batch-auto-extract` | `{video_ids?: string[], only_unextracted?: bool, options?: dict}` | `{job_id, status:"queued", video_count: int}`; sequential overnight batch extraction across videos with failure isolation |
+| `POST /api/chunks/{chunk_id}/extract` (alias `/api/videos/{video_id}/chunks/{chunk_id}/extract`) | `{k?: int, budget_pct?: float}` | `{job_id, status:"queued", chunk_id, video_id}`; multi-step targeted chunk extraction: extracts frames strictly within `[chunk.start_s, chunk.end_s]`, leaves other chunks untouched |
 | `GET /api/videos/{id}/curation-300` | - | `{video, chunks, scene_stats (=chunks), picks, runners, candidates (=picks+runners), stats, distribution}` |
 | `GET /api/videos/{id}/candidates` | - | `{frames, candidates (=frames), picks, runners, stats, distribution, scene_stats}` |
 | `GET /api/chunks/{chunk_id}/candidates` | - | `{frames}` with all unified frame fields |

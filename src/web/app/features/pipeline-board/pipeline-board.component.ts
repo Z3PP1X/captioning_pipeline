@@ -64,6 +64,23 @@ export interface BoardNavigateEvent {
         <div class="flex items-center gap-2">
           <button
             hlmBtn
+            variant="default"
+            size="sm"
+            (click)="onBatchAutoExtract()"
+            [disabled]="isBatchRunning() || videoService.isLoading()"
+            class="cursor-pointer gap-1.5 bg-amber-600 hover:bg-amber-500 text-white font-semibold"
+            title="Sequentially auto-chunk (if needed) and extract frames for all unextracted videos (suitable for overnight runs)"
+          >
+            <ng-icon
+              [name]="isBatchRunning() ? 'lucideRefreshCw' : 'lucideZap'"
+              class="size-3.5"
+              [class.motion-safe:animate-spin]="isBatchRunning()"
+            />
+            <span>{{ isBatchRunning() ? 'Batch Running...' : 'Auto-Extract All (Overnight)' }}</span>
+          </button>
+
+          <button
+            hlmBtn
             variant="outline"
             size="sm"
             (click)="onScan()"
@@ -91,6 +108,25 @@ export interface BoardNavigateEvent {
           </button>
         </div>
       </div>
+
+      <!-- Batch Auto-Extract Active Progress Banner -->
+      @if (batchJob()) {
+        <div class="mt-4 flex flex-col gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 p-3.5 text-xs">
+          <div class="flex items-center justify-between font-bold text-amber-500">
+            <div class="flex items-center gap-2">
+              <ng-icon name="lucideRefreshCw" class="size-4 animate-spin" />
+              <span>Overnight Batch Auto-Extraction: {{ batchJob()!.step || 'Processing' }}</span>
+            </div>
+            <span class="font-mono text-sm">{{ (batchJob()!.progress * 100).toFixed(0) }}%</span>
+          </div>
+          <div class="h-2 w-full rounded-full bg-border overflow-hidden">
+            <div
+              class="h-full bg-amber-500 transition-all duration-300 rounded-full"
+              [style.width.%]="batchJob()!.progress * 100"
+            ></div>
+          </div>
+        </div>
+      }
 
       <!-- Filters & Search Bar -->
       <div class="flex flex-col lg:flex-row lg:items-center justify-between gap-3 py-3">
@@ -213,16 +249,31 @@ export interface BoardNavigateEvent {
 
                 <!-- Next Action CTA Button -->
                 <td class="py-2.5 px-4 text-right" (click)="$event.stopPropagation()">
-                  <button
-                    hlmBtn
-                    variant="outline"
-                    size="xs"
-                    (click)="onAction(v, stageMeta.targetTab)"
-                    class="cursor-pointer gap-1 font-semibold group-hover:border-primary group-hover:text-primary transition-colors"
-                  >
-                    <span>{{ stageMeta.actionLabel }}</span>
-                    <ng-icon name="lucideArrowRight" class="size-3" />
-                  </button>
+                  <div class="flex items-center justify-end gap-1.5">
+                    @if ((v.status === 'new' || v.status === 'chunked') && !activeJob) {
+                      <button
+                        hlmBtn
+                        variant="outline"
+                        size="xs"
+                        (click)="onAutoExtractVideo(v)"
+                        title="Auto-extract candidate frames for this video"
+                        class="cursor-pointer gap-1 text-amber-500 hover:text-amber-400 hover:border-amber-500/50"
+                      >
+                        <ng-icon name="lucideZap" class="size-3" />
+                        <span class="hidden sm:inline">Auto</span>
+                      </button>
+                    }
+                    <button
+                      hlmBtn
+                      variant="outline"
+                      size="xs"
+                      (click)="onAction(v, stageMeta.targetTab)"
+                      class="cursor-pointer gap-1 font-semibold group-hover:border-primary group-hover:text-primary transition-colors"
+                    >
+                      <span>{{ stageMeta.actionLabel }}</span>
+                      <ng-icon name="lucideArrowRight" class="size-3" />
+                    </button>
+                  </div>
                 </td>
               </tr>
             } @empty {
@@ -261,6 +312,17 @@ export class PipelineBoardComponent {
   ];
 
   readonly runningCount = computed(() => this.jobEvents.activeJobs().size);
+
+  readonly batchJob = computed(() => {
+    for (const job of this.jobEvents.activeJobs().values()) {
+      if (job.type === 'batch_auto_extract') {
+        return job;
+      }
+    }
+    return null;
+  });
+
+  readonly isBatchRunning = computed(() => !!this.batchJob());
 
   readonly needsActionCount = computed(() => {
     return this.allVideos().filter((v) => v.status === 'curating' || v.status === 'curating_300').length;
@@ -368,6 +430,32 @@ export class PipelineBoardComponent {
 
   async onExportAll(): Promise<void> {
     await this.datasetService.exportAllCurated();
+  }
+
+  async onBatchAutoExtract(): Promise<void> {
+    try {
+      await this.videoService.batchAutoExtract(undefined, true);
+      this.jobEvents.showToast(
+        'Overnight Batch Dispatched',
+        'Auto-extracting all unextracted videos sequentially...',
+        null
+      );
+    } catch (err) {
+      this.jobEvents.showToast('Batch Dispatch Failed', String(err), null, true);
+    }
+  }
+
+  async onAutoExtractVideo(video: Video): Promise<void> {
+    try {
+      await this.videoService.autoExtractSingle(video.id);
+      this.jobEvents.showToast(
+        'Auto-Extraction Dispatched',
+        `Extracting candidate frames for ${video.name}...`,
+        video.id
+      );
+    } catch (err) {
+      this.jobEvents.showToast('Auto-Extraction Failed', String(err), video.id, true);
+    }
   }
 
   readonly formatShortTime = formatShortTime;
