@@ -27,6 +27,18 @@ import {
   TriggerPosition,
 } from '../models/studio.models';
 
+function buildLcsTable(a: string[], b: string[]): number[][] {
+  const m = a.length;
+  const n = b.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array<number>(n + 1).fill(0));
+  for (let i = m - 1; i >= 0; i--) {
+    for (let j = n - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j] ? 1 + dp[i + 1][j + 1] : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  return dp;
+}
+
 /**
  * Compute word-level LCS diff tokens between two caption strings for the Step 4 Live Diff View.
  */
@@ -36,42 +48,22 @@ export function computeCaptionWordDiff(beforeText: string, afterText: string): D
   if (a.length === 0 && b.length === 0) {
     return [];
   }
-  const m = a.length;
-  const n = b.length;
-  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array<number>(n + 1).fill(0));
-
-  for (let i = m - 1; i >= 0; i--) {
-    for (let j = n - 1; j >= 0; j--) {
-      if (a[i] === b[j]) {
-        dp[i][j] = 1 + dp[i + 1][j + 1];
-      } else {
-        dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
-      }
-    }
-  }
-
+  const dp = buildLcsTable(a, b);
   const out: DiffToken[] = [];
   let i = 0;
   let j = 0;
-  while (i < m && j < n) {
+  while (i < a.length && j < b.length) {
     if (a[i] === b[j]) {
-      out.push({ type: 'same', text: a[i] });
-      i++;
+      out.push({ type: 'same', text: a[i++] });
       j++;
     } else if (dp[i + 1][j] >= dp[i][j + 1]) {
-      out.push({ type: 'removed', text: a[i] });
-      i++;
+      out.push({ type: 'removed', text: a[i++] });
     } else {
-      out.push({ type: 'added', text: b[j] });
-      j++;
+      out.push({ type: 'added', text: b[j++] });
     }
   }
-  while (i < m) {
-    out.push({ type: 'removed', text: a[i++] });
-  }
-  while (j < n) {
-    out.push({ type: 'added', text: b[j++] });
-  }
+  for (; i < a.length; i++) out.push({ type: 'removed', text: a[i] });
+  for (; j < b.length; j++) out.push({ type: 'added', text: b[j] });
   return out;
 }
 
@@ -222,47 +214,55 @@ export class StudioApiService {
     const d = ev.data || {};
 
     if (ev.type === 'job_started' || ev.type === 'job_progress') {
-      this.activeJob.set({
-        job_id: d.job_id ?? 1,
-        dataset_id: d.dataset_id ?? this.activeDatasetId() ?? '',
-        progress: typeof d.progress === 'number' ? d.progress : 0.1,
-        step: d.step ?? 'Processing...',
-        cost_usd: d.cost_usd ?? 0,
-      });
+      this.handleJobProgressTelemetry(d);
     } else if (ev.type === 'job_finished') {
-      this.activeJob.set({
-        job_id: d.job_id ?? 1,
-        dataset_id: d.dataset_id ?? this.activeDatasetId() ?? '',
-        progress: 1.0,
-        step: d.step ?? 'Completed',
-        cost_usd: d.cost_usd ?? 0,
-      });
-      this.showToast(d.step ?? 'Background job completed', 'success');
-      void this.refreshDatasets();
-      const activeId = this.activeDataset()?.id;
-      if (activeId) {
-        void this.loadMediaItems(activeId);
-      }
-      setTimeout(() => {
-        const cur = this.activeJob();
-        if (cur && cur.progress >= 1.0) {
-          this.activeJob.set(null);
-        }
-      }, 3000);
+      this.handleJobFinishedTelemetry(d);
     } else if (ev.type === 'caption_accepted') {
-      const layer = d.layer ?? 'primary';
-      this.cascadeStats.update((s) => ({
-        ...s,
-        acceptedPrimary: layer === 'primary' ? s.acceptedPrimary + 1 : s.acceptedPrimary,
-        acceptedFallback1: layer === 'fallback_1' ? s.acceptedFallback1 + 1 : s.acceptedFallback1,
-        acceptedFallback2: layer === 'fallback_2' ? s.acceptedFallback2 + 1 : s.acceptedFallback2,
-      }));
+      this.handleCaptionAcceptedTelemetry(d.layer ?? 'primary');
     } else if (ev.type === 'caption_rejected') {
-      this.cascadeStats.update((s) => ({
-        ...s,
-        rejectedCount: s.rejectedCount + 1,
-      }));
+      this.cascadeStats.update((s) => ({ ...s, rejectedCount: s.rejectedCount + 1 }));
     }
+  }
+
+  private handleJobProgressTelemetry(d: StudioTelemetryEvent['data']): void {
+    this.activeJob.set({
+      job_id: d.job_id ?? 1,
+      dataset_id: d.dataset_id ?? this.activeDatasetId() ?? '',
+      progress: typeof d.progress === 'number' ? d.progress : 0.1,
+      step: d.step ?? 'Processing...',
+      cost_usd: d.cost_usd ?? 0,
+    });
+  }
+
+  private handleJobFinishedTelemetry(d: StudioTelemetryEvent['data']): void {
+    this.activeJob.set({
+      job_id: d.job_id ?? 1,
+      dataset_id: d.dataset_id ?? this.activeDatasetId() ?? '',
+      progress: 1.0,
+      step: d.step ?? 'Completed',
+      cost_usd: d.cost_usd ?? 0,
+    });
+    this.showToast(d.step ?? 'Background job completed', 'success');
+    void this.refreshDatasets();
+    const activeId = this.activeDataset()?.id;
+    if (activeId) {
+      void this.loadMediaItems(activeId);
+    }
+    setTimeout(() => {
+      const cur = this.activeJob();
+      if (cur && cur.progress >= 1.0) {
+        this.activeJob.set(null);
+      }
+    }, 3000);
+  }
+
+  private handleCaptionAcceptedTelemetry(layer: string): void {
+    this.cascadeStats.update((s) => ({
+      ...s,
+      acceptedPrimary: layer === 'primary' ? s.acceptedPrimary + 1 : s.acceptedPrimary,
+      acceptedFallback1: layer === 'fallback_1' ? s.acceptedFallback1 + 1 : s.acceptedFallback1,
+      acceptedFallback2: layer === 'fallback_2' ? s.acceptedFallback2 + 1 : s.acceptedFallback2,
+    }));
   }
 
   // =========================================================================
@@ -444,43 +444,61 @@ export class StudioApiService {
   ): Promise<{ items: StudioMediaItem[]; total: number }> {
     this.loadingItems.set(true);
     try {
-      let params = new HttpParams()
-        .set('include_duplicates', String(filters?.include_duplicates ?? true))
-        .set('limit', String(filters?.limit ?? 500))
-        .set('offset', String(filters?.offset ?? 0));
-
-      if (filters?.curation_state) {
-        params = params.set('curation_state', filters.curation_state);
-      }
-      if (filters?.cluster_id !== undefined && filters?.cluster_id !== null) {
-        params = params.set('cluster_id', String(filters.cluster_id));
-      }
-      if (filters?.min_quality && filters.min_quality > 0) {
-        params = params.set('min_quality', String(filters.min_quality));
-      }
-      if (filters?.tag_slug) {
-        params = params.set('tag_slug', filters.tag_slug);
-      }
-      if (filters?.caption_status) {
-        params = params.set('caption_status', filters.caption_status);
-      }
-
+      const params = this.buildMediaItemsParams(filters);
       const res = await firstValueFrom(
         this.http.get<{ items: StudioMediaItem[]; total: number }>(
           `/api/v1/datasets/${encodeURIComponent(datasetId)}/items`,
           { params },
         ),
       );
-      const items = res?.items ?? [];
-      const total = res?.total ?? items.length;
-      if (filters?.cluster_id === undefined) {
-        this.mediaItems.set(items);
-        this.totalMediaItems.set(total);
-      }
-      return { items, total };
+      return this.applyLoadedMediaItems(res, filters?.cluster_id === undefined);
     } finally {
       this.loadingItems.set(false);
     }
+  }
+
+  private buildMediaItemsParams(filters?: {
+    curation_state?: string;
+    cluster_id?: number;
+    min_quality?: number;
+    tag_slug?: string;
+    caption_status?: string;
+    include_duplicates?: boolean;
+    limit?: number;
+    offset?: number;
+  }): HttpParams {
+    const f = filters ?? {};
+    let params = new HttpParams()
+      .set('include_duplicates', String(f.include_duplicates ?? true))
+      .set('limit', String(f.limit ?? 500))
+      .set('offset', String(f.offset ?? 0));
+
+    const optionalPairs: Array<[string, string | number | undefined]> = [
+      ['curation_state', f.curation_state],
+      ['cluster_id', f.cluster_id],
+      ['min_quality', f.min_quality && f.min_quality > 0 ? f.min_quality : undefined],
+      ['tag_slug', f.tag_slug],
+      ['caption_status', f.caption_status],
+    ];
+    for (const [key, val] of optionalPairs) {
+      if (val !== undefined && val !== null && val !== '') {
+        params = params.set(key, String(val));
+      }
+    }
+    return params;
+  }
+
+  private applyLoadedMediaItems(
+    res: { items?: StudioMediaItem[]; total?: number } | null | undefined,
+    updateStore: boolean,
+  ): { items: StudioMediaItem[]; total: number } {
+    const items = res?.items ?? [];
+    const total = res?.total ?? items.length;
+    if (updateStore) {
+      this.mediaItems.set(items);
+      this.totalMediaItems.set(total);
+    }
+    return { items, total };
   }
 
   async batchTriage(
@@ -698,6 +716,8 @@ export class StudioApiService {
     mediaId: number,
     payload: {
       caption_text: string;
+      caption_medium?: string | null;
+      caption_short?: string | null;
       enforce_trigger?: boolean;
       trigger_word?: string | null;
       trigger_position?: TriggerPosition | null;
@@ -705,31 +725,43 @@ export class StudioApiService {
   ): Promise<{
     media_id: number;
     caption_text: string;
+    caption_medium: string;
+    caption_short: string;
     caption_status: string;
     word_count: number;
     warnings: string[];
   }> {
     const res = await firstValueFrom(
-      this.http.put<{
-        media_id: number;
-        caption_text: string;
-        caption_status: string;
-        word_count: number;
-        warnings: string[];
-      }>(`/api/v1/items/${mediaId}/caption`, {
+      this.http.put<
+        Partial<StudioMediaItem> & {
+          media_id?: number;
+          caption_text?: string;
+          word_count?: number;
+          warnings?: string[];
+        }
+      >(`/api/v1/items/${mediaId}/caption`, {
         caption_text: payload.caption_text,
+        caption_medium: payload.caption_medium ?? undefined,
+        caption_short: payload.caption_short ?? undefined,
         enforce_trigger: payload.enforce_trigger ?? true,
         trigger_word: payload.trigger_word,
         trigger_position: payload.trigger_position,
       }),
     );
 
+    const savedText = res?.caption_text ?? res?.active_caption ?? payload.caption_text;
+    const savedMedium = res?.caption_medium ?? payload.caption_medium ?? '';
+    const savedShort = res?.caption_short ?? payload.caption_short ?? '';
+    const wordCount = res?.word_count ?? savedText.trim().split(/\s+/).filter(Boolean).length;
+
     this.mediaItems.update((list) =>
       list.map((it) =>
         it.id === mediaId
           ? {
               ...it,
-              active_caption: res.caption_text,
+              active_caption: savedText,
+              caption_medium: savedMedium,
+              caption_short: savedShort,
               caption_status: 'manual',
               active_caption_model: 'manual',
               active_caption_layer: 'manual',
@@ -738,7 +770,85 @@ export class StudioApiService {
       ),
     );
     void this.refreshDatasets();
-    this.showToast(`Saved & approved caption (${res.word_count} words)`, 'success');
+    this.showToast(`Saved caption (${wordCount} words)`, 'success');
+    return {
+      media_id: mediaId,
+      caption_text: savedText,
+      caption_medium: savedMedium,
+      caption_short: savedShort,
+      caption_status: 'manual',
+      word_count: wordCount,
+      warnings: res?.warnings ?? [],
+    };
+  }
+
+  async approveMediaItem(mediaId: number): Promise<StudioMediaItem | null> {
+    this.mediaItems.update((list) =>
+      list.map((it) => (it.id === mediaId ? { ...it, caption_status: 'approved' } : it)),
+    );
+    const res = await firstValueFrom(
+      this.http.post<StudioMediaItem>(`/api/v1/items/${mediaId}/approve`, {}),
+    );
+    if (res && res.id) {
+      this.mediaItems.update((list) =>
+        list.map((it) => (it.id === mediaId ? { ...it, ...res, caption_status: 'approved' } : it)),
+      );
+    }
+    return res;
+  }
+
+  async applySmartCrop(mediaId: number): Promise<StudioMediaItem | null> {
+    const res = await firstValueFrom(
+      this.http.post<StudioMediaItem>(`/api/v1/items/${mediaId}/smart-crop`, {}),
+    );
+    this.mediaItems.update((list) =>
+      list.map((it) =>
+        it.id === mediaId
+          ? {
+              ...it,
+              crop_geometry: res?.crop_geometry ?? {
+                x: 0,
+                y: 0,
+                width: it.width || 1920,
+                height: Math.round(((it.height || 1080) * 0.92) / 16) * 16,
+              },
+            }
+          : it,
+      ),
+    );
+    return res;
+  }
+
+  async clearSmartCrop(mediaId: number): Promise<StudioMediaItem | null> {
+    const res = await firstValueFrom(
+      this.http.delete<StudioMediaItem>(`/api/v1/items/${mediaId}/smart-crop`),
+    );
+    this.mediaItems.update((list) =>
+      list.map((it) => (it.id === mediaId ? { ...it, crop_geometry: null } : it)),
+    );
+    return res;
+  }
+
+  async recaptionItem(mediaId: number): Promise<StudioMediaItem | null> {
+    const res = await firstValueFrom(
+      this.http.post<StudioMediaItem>(`/api/v1/items/${mediaId}/recaption`, {}),
+    );
+    if (res) {
+      this.mediaItems.update((list) =>
+        list.map((it) =>
+          it.id === mediaId
+            ? {
+                ...it,
+                active_caption: res.active_caption ?? it.active_caption,
+                caption_medium: res.caption_medium ?? it.caption_medium,
+                caption_short: res.caption_short ?? it.caption_short,
+                caption_status: res.caption_status ?? 'vlm_accepted',
+                active_caption_layer: res.active_caption_layer ?? 'primary',
+              }
+            : it,
+        ),
+      );
+    }
     return res;
   }
 
