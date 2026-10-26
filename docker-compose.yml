@@ -23,9 +23,11 @@ services:
       - FALLBACK_MODEL_2=${FALLBACK_MODEL_2:-meta-llama/llama-3.2-90b-vision-instruct}
     volumes:
       # 1. WSL2 Host Media Bind-Mounts (Sequential Read/Write Only)
-      # Maps HOST_MEDIA_ROOT (e.g., /mnt/c/Users/.../lora_raw_data or /home/user/data)
-      - "${HOST_MEDIA_ROOT:-./data/input}:/data/input:ro"
-      - "${HOST_EXPORT_ROOT:-${HOST_MEDIA_ROOT:-./data}/exports}:/data/exports:rw"
+      # Maps Windows "C:\Users\Patri\Pictures\_mods" via WSL2 (/mnt/c/Users/Patri/Pictures/_mods)
+      # into /data/input (default browser root) and preserves the literal WSL2 path as well.
+      - "${HOST_MEDIA_ROOT:-/mnt/c/Users/Patri/Pictures/_mods}:/data/input:ro"
+      - "/mnt/c/Users/Patri/Pictures/_mods:/mnt/c/Users/Patri/Pictures/_mods:ro"
+      - "${HOST_EXPORT_ROOT:-./data/exports}:/data/exports:rw"
 
       # 2. Named Docker Volume on Native Linux ext4 Filesystem (CRITICAL for WSL2!)
       # Stores SQLite WAL database (state.db), 384px WebP thumbnails, extracted temporary

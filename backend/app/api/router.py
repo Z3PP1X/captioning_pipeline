@@ -61,14 +61,24 @@ SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
 router = APIRouter()
 
 
+def _normalize_windows_or_wsl_path(raw_path: str) -> str:
+    cleaned = raw_path.strip().strip('"').strip("'")
+    if len(cleaned) >= 2 and cleaned[1] == ":" and cleaned[0].isalpha():
+        drive = cleaned[0].lower()
+        rest = cleaned[2:].replace("\\", "/").lstrip("/")
+        return f"/mnt/{drive}/{rest}" if rest else f"/mnt/{drive}"
+    return cleaned.replace("\\", "/")
+
+
 def _resolve_source_path(raw_path: str, app_settings: AppSettings) -> Path:
-    p = Path(raw_path)
+    normalized = _normalize_windows_or_wsl_path(raw_path)
+    p = Path(normalized)
     if p.exists():
         return p.resolve()
-    rel_in_input = app_settings.input_dir / raw_path.lstrip("/")
+    rel_in_input = app_settings.input_dir / normalized.lstrip("/")
     if rel_in_input.exists():
         return rel_in_input.resolve()
-    rel_in_proj = app_settings.project_root / raw_path.lstrip("/")
+    rel_in_proj = app_settings.project_root / normalized.lstrip("/")
     if rel_in_proj.exists():
         return rel_in_proj.resolve()
     return p
@@ -212,7 +222,8 @@ def browse_filesystem(
     app_settings: AppSettings = Depends(get_app_settings),
 ) -> dict[str, Any]:
     base_dir = app_settings.input_dir.resolve()
-    base_dir.mkdir(parents=True, exist_ok=True)
+    if not base_dir.exists():
+        base_dir.mkdir(parents=True, exist_ok=True)
     clean_sub = subpath.strip().lstrip("/")
     target = (base_dir / clean_sub).resolve() if clean_sub else base_dir
     if not str(target).startswith(str(base_dir)):
@@ -222,19 +233,20 @@ def browse_filesystem(
 
     directories: list[str] = []
     videos: list[str] = []
-    image_counts = 0
 
     for entry in sorted(target.iterdir()):
         if entry.name.startswith("."):
             continue
         if entry.is_dir():
             directories.append(entry.name)
-        elif entry.is_file():
-            suf = entry.suffix.lower()
-            if suf in SUPPORTED_IMAGE_EXTENSIONS:
-                image_counts += 1
-            elif suf in SUPPORTED_VIDEO_EXTENSIONS:
-                videos.append(entry.name)
+        elif entry.is_file() and entry.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS:
+            videos.append(entry.name)
+
+    image_counts = sum(
+        1
+        for p in target.rglob("*")
+        if p.is_file() and not p.name.startswith(".") and p.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+    )
 
     return {
         "current_path": str(target),

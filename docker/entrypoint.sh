@@ -10,8 +10,11 @@ mkdir -p \
     "${APPDATA_DIR}/frames" \
     "${APPDATA_DIR}/thumbnails" \
     "${APPDATA_DIR}/rag" \
-    "${INPUT_DIR}" \
     "${EXPORT_DIR}"
+
+if [ ! -d "${INPUT_DIR}" ]; then
+    mkdir -p "${INPUT_DIR}" || true
+fi
 
 echo "[entrypoint] Native Linux AppData Volume: ${APPDATA_DIR}"
 echo "[entrypoint] WSL2 Host Media Input Mount: ${INPUT_DIR}"
