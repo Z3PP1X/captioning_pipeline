@@ -58,10 +58,14 @@ import { ChunkItem } from '../../core/models/chunk.model';
             @let startPct = getPercent(chunk.start_s);
             @let widthPct = getPercent(chunk.end_s) - startPct;
             <div
+              role="button"
+              tabindex="0"
               class="absolute top-1.5 bottom-1.5 rounded-md border border-primary/70 bg-primary/25 z-10 flex items-center justify-center text-xs font-bold text-primary-foreground overflow-hidden cursor-pointer pointer-events-auto hover:bg-primary/40 transition-colors shadow-xs"
               [style.left.%]="startPct"
               [style.width.%]="widthPct"
               (click)="onChunkClick(chunk, $event)"
+              (keydown.enter)="onChunkClick(chunk, $event)"
+              (keydown.space)="onChunkClick(chunk, $event); $event.preventDefault()"
               title="Chunk #{{ chunk.position + 1 }} ({{ formatHms(chunk.start_s) }} - {{ formatHms(chunk.end_s) }}) Click to jump"
             >
               <span class="truncate px-1 drop-shadow">#{{ chunk.position + 1 }}</span>
@@ -161,7 +165,7 @@ export class TimelineComponent {
     return Math.max(0, Math.min(100, (timeS / dur) * 100));
   }
 
-  onChunkClick(chunk: ChunkItem, e: MouseEvent): void {
+  onChunkClick(chunk: ChunkItem, e: Event): void {
     e.stopPropagation();
     this.seek.emit(chunk.start_s);
   }

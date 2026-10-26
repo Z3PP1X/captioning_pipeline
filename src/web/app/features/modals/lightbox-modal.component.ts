@@ -53,7 +53,9 @@ import { FrameTagsPanelComponent } from '../tags/frame-tags-panel.component';
     @if (candidate(); as c) {
       <div
         class="fixed inset-0 z-50 flex items-center justify-center bg-secondary/80 backdrop-blur-xs p-4 animate-in fade-in select-none"
+        tabindex="-1"
         (click)="onBackdropClick($event)"
+        (keydown.escape)="curateService.closeLightbox()"
       >
         <!-- Custom media surface (not hlm-dialog): keeps dialog semantics and traps focus while open;
              focus starts on the image area and returns to the opener (grid card) when the lightbox closes -->
@@ -62,9 +64,11 @@ import { FrameTagsPanelComponent } from '../tags/frame-tags-panel.component';
           role="dialog"
           aria-modal="true"
           aria-label="Image Lightbox Preview"
+          tabindex="-1"
           cdkTrapFocus
           [cdkTrapFocusAutoCapture]="true"
           (click)="$event.stopPropagation()"
+          (keydown.escape)="curateService.closeLightbox()"
         >
           <!-- Close Button -->
           <button

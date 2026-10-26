@@ -243,31 +243,31 @@ export class TriageFilterBarComponent {
 
   @HostListener('window:keydown', ['$event'])
   handleKeyboardShortcut(event: KeyboardEvent): void {
-    const target = event.target as HTMLElement | null;
-    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
+    if (this.isEditableElement(event.target as HTMLElement | null)) {
       return;
     }
 
-    if (event.key === 'j' || event.key === 'J') {
+    const action = this.getShortcutAction(event);
+    if (action) {
       event.preventDefault();
-      this.onNavigateNext();
-    } else if (event.key === 'k' || event.key === 'K') {
-      event.preventDefault();
-      this.onNavigatePrevious();
-    } else if (event.key === 'Enter') {
-      event.preventDefault();
-      this.onApproveAndAdvance();
-    } else if (event.key === 'r' || event.key === 'R') {
-      event.preventDefault();
-      this.onRegenerateFallback();
-    } else if (event.key === 'c' || event.key === 'C') {
-      if (event.shiftKey) {
-        event.preventDefault();
-        this.applyCropToAll.emit();
-      } else {
-        event.preventDefault();
-        this.applyCrop.emit();
-      }
+      action();
     }
+  }
+
+  private isEditableElement(target: HTMLElement | null): boolean {
+    if (!target) return false;
+    return target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable;
+  }
+
+  private getShortcutAction(event: KeyboardEvent): (() => void) | null {
+    const key = event.key.toLowerCase();
+    const actions: Record<string, () => void> = {
+      j: () => this.onNavigateNext(),
+      k: () => this.onNavigatePrevious(),
+      enter: () => this.onApproveAndAdvance(),
+      r: () => this.onRegenerateFallback(),
+      c: () => (event.shiftKey ? this.applyCropToAll.emit() : this.applyCrop.emit()),
+    };
+    return actions[key] ?? null;
   }
 }

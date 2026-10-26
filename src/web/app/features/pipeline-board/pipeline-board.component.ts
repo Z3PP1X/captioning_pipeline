@@ -380,6 +380,26 @@ export class PipelineBoardComponent {
   /** Five pipeline stages (chunk, extract, curate, caption, export) shown as dots next to the badge. */
   readonly stageSlots = [0, 1, 2, 3, 4];
 
+  private readonly staticStageMap: Record<
+    string,
+    {
+      done: number | null;
+      running?: boolean;
+      label: string;
+      variant: 'default' | 'outline' | 'secondary' | 'destructive' | 'warning' | 'success';
+      actionLabel: string;
+      targetTab: 'studio' | 'curate';
+    }
+  > = {
+    new: { done: 0, label: 'New', variant: 'outline', actionLabel: 'Chunk', targetTab: 'studio' },
+    chunked: { done: 1, label: 'Chunked', variant: 'secondary', actionLabel: 'Extract', targetTab: 'studio' },
+    extracting: { done: 2, running: true, label: 'Extracting', variant: 'warning', actionLabel: 'Inspect', targetTab: 'studio' },
+    extracting_750: { done: 2, running: true, label: 'Extracting', variant: 'warning', actionLabel: 'Inspect', targetTab: 'studio' },
+    captioning: { done: 4, running: true, label: 'Captioning', variant: 'warning', actionLabel: 'Monitor', targetTab: 'curate' },
+    exported: { done: 5, label: 'Exported', variant: 'success', actionLabel: 'View Set', targetTab: 'curate' },
+    skipped: { done: null, label: 'Skipped', variant: 'outline', actionLabel: 'Restore', targetTab: 'studio' },
+  };
+
   getStageProgress(v: Video, activeJob: any): {
     /** Completed stages (0-5); null = no progression (broken / skipped). */
     done: number | null;
@@ -397,33 +417,16 @@ export class PipelineBoardComponent {
       const pct = Math.round(activeJob.progress * 100);
       return { done: 2, running: true, label: `${activeJob.step} ${pct}%`, variant: 'warning', actionLabel: 'View', targetTab: 'studio' };
     }
-
-    switch (v.status) {
-      case 'new':
-        return { done: 0, label: 'New', variant: 'outline', actionLabel: 'Chunk', targetTab: 'studio' };
-      case 'chunked':
-        return { done: 1, label: 'Chunked', variant: 'secondary', actionLabel: 'Extract', targetTab: 'studio' };
-      case 'extracting':
-      case 'extracting_750':
-        return { done: 2, running: true, label: 'Extracting', variant: 'warning', actionLabel: 'Inspect', targetTab: 'studio' };
-      case 'curating':
-      case 'curating_300':
-        return {
-          done: 3,
-          label: `Curating (${v.kept_count || 0}/300)`,
-          variant: 'default',
-          actionLabel: 'Curate',
-          targetTab: 'curate',
-        };
-      case 'captioning':
-        return { done: 4, running: true, label: 'Captioning', variant: 'warning', actionLabel: 'Monitor', targetTab: 'curate' };
-      case 'exported':
-        return { done: 5, label: 'Exported', variant: 'success', actionLabel: 'View Set', targetTab: 'curate' };
-      case 'skipped':
-        return { done: null, label: 'Skipped', variant: 'outline', actionLabel: 'Restore', targetTab: 'studio' };
-      default:
-        return { done: 0, label: v.status, variant: 'outline', actionLabel: 'Open', targetTab: 'studio' };
+    if (v.status === 'curating' || v.status === 'curating_300') {
+      return {
+        done: 3,
+        label: `Curating (${v.kept_count || 0}/300)`,
+        variant: 'default',
+        actionLabel: 'Curate',
+        targetTab: 'curate',
+      };
     }
+    return this.staticStageMap[v.status] ?? { done: 0, label: v.status, variant: 'outline', actionLabel: 'Open', targetTab: 'studio' };
   }
 
   onRowClick(video: Video): void {

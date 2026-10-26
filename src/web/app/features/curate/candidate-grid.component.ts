@@ -48,6 +48,74 @@ export interface ChunkCandidateGroup {
   isFullyCaptioned: boolean;
 }
 
+const DEFAULT_CAPTION_MODEL = 'google/gemma-4-31b-it';
+
+function isCandidatePicked(c: CandidateFrame): boolean {
+  return c.state === 'keep' || Boolean(c.is_pick && c.state !== 'reject');
+}
+
+function groupCandidatesByChunk(candidates: CandidateFrame[]): Map<string, CandidateFrame[]> {
+  const groupMap = new Map<string, CandidateFrame[]>();
+  for (const c of candidates) {
+    const key = String(c.chunk_id ?? 'unknown');
+    const existing = groupMap.get(key);
+    if (existing) {
+      existing.push(c);
+    } else {
+      groupMap.set(key, [c]);
+    }
+  }
+  return groupMap;
+}
+
+function buildGroupStats(cands: CandidateFrame[]) {
+  const picksCount = cands.filter(isCandidatePicked).length;
+  const captionedCount = cands.filter((c) => c.is_captioned).length;
+  return {
+    picksCount,
+    totalCount: cands.length,
+    captionedCount,
+    isFullyCaptioned: picksCount > 0 && captionedCount >= picksCount,
+  };
+}
+
+function roundDuration(start_s: number, end_s: number): number {
+  return parseFloat(Math.max(0, end_s - start_s).toFixed(1));
+}
+
+function buildKnownChunkGroup(ch: ChunkItem, idx: number, cands: CandidateFrame[]): ChunkCandidateGroup {
+  const start_s = ch.start_s || 0;
+  const end_s = ch.end_s || 0;
+  return {
+    chunkId: ch.id ?? ch.position,
+    chunkNumber: (ch.position ?? idx) + 1,
+    start_s,
+    end_s,
+    duration_s: roundDuration(start_s, end_s),
+    captionModel: ch.caption_model || DEFAULT_CAPTION_MODEL,
+    tags: chunkTagsText(ch.tags),
+    candidates: cands,
+    ...buildGroupStats(cands),
+  };
+}
+
+function buildOrphanChunkGroup(key: string, cands: CandidateFrame[]): ChunkCandidateGroup {
+  const first = cands[0];
+  const info = candidateChunkInfo(first);
+  const chunkNumber = info.position !== null ? info.position + 1 : 1;
+  return {
+    chunkId: key,
+    chunkNumber,
+    start_s: info.start_s,
+    end_s: info.end_s,
+    duration_s: roundDuration(info.start_s, info.end_s),
+    captionModel: first.caption_model || DEFAULT_CAPTION_MODEL,
+    tags: info.tags,
+    candidates: cands,
+    ...buildGroupStats(cands),
+  };
+}
+
 @Component({
   selector: 'app-candidate-grid',
   imports: [NgIcon, HlmButtonImports, HlmBadgeImports, HlmSkeletonImports, HlmNativeSelectImports],
@@ -408,99 +476,34 @@ export class CandidateGridComponent {
 
   readonly chunkGroups = computed<ChunkCandidateGroup[]>(() => {
     const filtered = this.curateService.filteredCandidates();
-    const loadedChunks =
-      this.curateService.curationChunks().length > 0
-        ? this.curateService.curationChunks()
-        : this.chunkService.chunks();
-
-    // Map chunk_id or position to ChunkItem
-    const chunkMap = new Map<string, ChunkItem>();
-    loadedChunks.forEach((ch, idx) => {
-      const keyId = ch.id !== null && ch.id !== undefined ? String(ch.id) : String(idx);
-      chunkMap.set(keyId, ch);
-      chunkMap.set(String(ch.position), ch);
-    });
-
-    // Group candidates by chunk_id
-    const groupMap = new Map<string, CandidateFrame[]>();
-    for (const c of filtered) {
-      const key = String(c.chunk_id ?? 'unknown');
-      if (!groupMap.has(key)) {
-        groupMap.set(key, []);
-      }
-      groupMap.get(key)!.push(c);
-    }
-
-    const result: ChunkCandidateGroup[] = [];
+    const loadedChunks = this.getLoadedChunks();
+    const groupMap = groupCandidatesByChunk(filtered);
     const seenGroupKeys = new Set<string>();
+    const result: ChunkCandidateGroup[] = [];
 
-    // First process chunks known from chunk list (maintains timeline order)
     for (let idx = 0; idx < loadedChunks.length; idx++) {
       const ch = loadedChunks[idx];
-      const key = ch.id !== null && ch.id !== undefined ? String(ch.id) : String(ch.position);
+      const key = String(ch.id ?? ch.position);
       seenGroupKeys.add(key);
-
-      const cands = groupMap.get(key) || [];
-      if (cands.length === 0) {
-        continue;
+      const cands = groupMap.get(key);
+      if (cands?.length) {
+        result.push(buildKnownChunkGroup(ch, idx, cands));
       }
-
-      const picksCount = cands.filter(
-        (c) => c.state === 'keep' || (c.is_pick && c.state !== 'reject')
-      ).length;
-      const captionedCount = cands.filter((c) => c.is_captioned).length;
-
-      const tagText = chunkTagsText(ch.tags);
-
-      result.push({
-        chunkId: ch.id ?? ch.position,
-        chunkNumber: ch.position !== undefined ? ch.position + 1 : idx + 1,
-        start_s: ch.start_s || 0,
-        end_s: ch.end_s || 0,
-        duration_s: parseFloat(Math.max(0, (ch.end_s || 0) - (ch.start_s || 0)).toFixed(1)),
-        captionModel: ch.caption_model || 'google/gemma-4-31b-it',
-        tags: tagText,
-        candidates: cands,
-        picksCount,
-        totalCount: cands.length,
-        captionedCount,
-        isFullyCaptioned: picksCount > 0 && captionedCount >= picksCount,
-      });
     }
 
-    // Next process any groups that didn't match loaded chunks by exact ID
     for (const [key, cands] of groupMap.entries()) {
       if (!seenGroupKeys.has(key) && cands.length > 0) {
-        const first = cands[0];
-        const info = candidateChunkInfo(first);
-        const chunkNum = info.position !== null ? info.position + 1 : 1;
-        const start = info.start_s;
-        const end = info.end_s;
-        const picksCount = cands.filter(
-          (c) => c.state === 'keep' || (c.is_pick && c.state !== 'reject')
-        ).length;
-        const captionedCount = cands.filter((c) => c.is_captioned).length;
-
-        result.push({
-          chunkId: key,
-          chunkNumber: chunkNum,
-          start_s: start,
-          end_s: end,
-          duration_s: parseFloat(Math.max(0, end - start).toFixed(1)),
-          captionModel: first.caption_model || 'google/gemma-4-31b-it',
-          tags: info.tags,
-          candidates: cands,
-          picksCount,
-          totalCount: cands.length,
-          captionedCount,
-          isFullyCaptioned: picksCount > 0 && captionedCount >= picksCount,
-        });
+        result.push(buildOrphanChunkGroup(key, cands));
       }
     }
 
-    // Sort result by chunkNumber ascending
     return result.sort((a, b) => a.chunkNumber - b.chunkNumber);
   });
+
+  private getLoadedChunks(): ChunkItem[] {
+    const curChunks = this.curateService.curationChunks();
+    return curChunks.length > 0 ? curChunks : this.chunkService.chunks();
+  }
 
   getThumbUrl(c: CandidateFrame): string {
     if (c.preview_url) return c.preview_url;

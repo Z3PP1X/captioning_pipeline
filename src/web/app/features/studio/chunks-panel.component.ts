@@ -205,7 +205,11 @@ import { ChunkItem } from '../../core/models/chunk.model';
 
         @for (chunk of chunkService.chunks(); track chunk.position; let idx = $index) {
           <div
-            (click)="seek.emit(chunk.start_s)"
+            role="button"
+            tabindex="0"
+            (click)="onRowClick(chunk, $event)"
+            (keydown.enter)="onRowKeydown(chunk, $event)"
+            (keydown.space)="onRowKeydown(chunk, $event)"
             class="grid grid-cols-[135px_95px_95px_85px_1fr_110px_165px_72px] items-center gap-2.5 px-3 py-2 rounded-lg border transition-all text-xs cursor-pointer min-w-[880px]"
             [class]="isCurrentChunk(chunk)
               ? 'border-primary bg-primary/10 shadow-xs ring-1 ring-primary/40'
@@ -252,7 +256,7 @@ import { ChunkItem } from '../../core/models/chunk.model';
             </div>
 
             <!-- Column 2: Start Time (hh:mm:ss) -->
-            <div class="flex items-center" (click)="$event.stopPropagation()">
+            <div class="flex items-center">
               <input
                 type="text"
                 [value]="formatHms(chunk.start_s)"
@@ -264,7 +268,7 @@ import { ChunkItem } from '../../core/models/chunk.model';
             </div>
 
             <!-- Column 3: End Time (hh:mm:ss) -->
-            <div class="flex items-center" (click)="$event.stopPropagation()">
+            <div class="flex items-center">
               <input
                 type="text"
                 [value]="formatHms(chunk.end_s)"
@@ -283,7 +287,7 @@ import { ChunkItem } from '../../core/models/chunk.model';
             </div>
 
             <!-- Column 5: Frame Budget Slider & Value -->
-            <div class="flex items-center gap-2 pr-2" (click)="$event.stopPropagation()">
+            <div class="flex items-center gap-2 pr-2">
               <input
                 type="range"
                 min="0"
@@ -299,7 +303,7 @@ import { ChunkItem } from '../../core/models/chunk.model';
             </div>
 
             <!-- Column 6: Rule Selector -->
-            <div (click)="$event.stopPropagation()">
+            <div>
               <label class="sr-only" [for]="'chunk-rule-' + idx">Selection rule for chunk {{ chunk.position + 1 }}</label>
               <hlm-native-select
                 size="sm"
@@ -318,7 +322,7 @@ import { ChunkItem } from '../../core/models/chunk.model';
             </div>
 
             <!-- Column 7: Model Selector -->
-            <div (click)="$event.stopPropagation()">
+            <div>
               <label class="sr-only" [for]="'chunk-model-' + idx">Caption model for chunk {{ chunk.position + 1 }}</label>
               <hlm-native-select
                 size="sm"
@@ -335,7 +339,7 @@ import { ChunkItem } from '../../core/models/chunk.model';
             </div>
 
             <!-- Column 8: Actions (Extract Scene & Delete) -->
-            <div class="flex items-center justify-end gap-1.5" (click)="$event.stopPropagation()">
+            <div class="flex items-center justify-end gap-1.5">
               <button
                 type="button"
                 (click)="onExtractSingleChunk(chunk)"
@@ -464,26 +468,30 @@ export class ChunksPanelComponent {
     }
   }
 
+  onRowClick(chunk: ChunkItem, event: MouseEvent): void {
+    const target = event.target as HTMLElement | null;
+    if (target?.closest('input, select, button, hlm-native-select, a')) {
+      return;
+    }
+    this.seek.emit(chunk.start_s);
+  }
+
+  onRowKeydown(chunk: ChunkItem, event: Event): void {
+    if (event.target !== event.currentTarget) {
+      return;
+    }
+    event.preventDefault();
+    this.seek.emit(chunk.start_s);
+  }
+
   /**
    * Runs a chunk write; guards re-chunking after curation/export or on 409 conflicts with the shared
    * alert-dialog (ConfirmService) instead of window.confirm (B4).
    */
   private async withRechunkConfirm(write: (confirm: boolean) => Promise<void>): Promise<boolean> {
     const video = this.videoService.currentVideo();
-    const isPostExtract = video && ['curating', 'curating_300', 'captioning', 'exported'].includes(video.status);
-
-    let reason: string;
-    if (isPostExtract) {
-      reason = `Video status is "${video.status}". Modifying scene chunks will delete existing frames and curation picks.`;
-    } else {
-      try {
-        await write(false);
-        return true;
-      } catch (err) {
-        if (!(err instanceof ApiError) || err.status !== 409) throw err;
-        reason = err.message || 'Chunks hold active curation picks.';
-      }
-    }
+    const reason = await this.resolveRechunkReason(video, write);
+    if (reason === null) return true;
 
     const ok = await this.confirm.ask({
       title: 'Confirm destructive re-chunking',
@@ -497,6 +505,22 @@ export class ChunksPanelComponent {
     } catch (err) {
       this.jobEvents.showToast('Re-chunk failed', String(err), video?.id ?? null, true);
       return false;
+    }
+  }
+
+  private async resolveRechunkReason(
+    video: { status: string } | null,
+    write: (confirm: boolean) => Promise<void>,
+  ): Promise<string | null> {
+    if (video && ['curating', 'curating_300', 'captioning', 'exported'].includes(video.status)) {
+      return `Video status is "${video.status}". Modifying scene chunks will delete existing frames and curation picks.`;
+    }
+    try {
+      await write(false);
+      return null;
+    } catch (err) {
+      if (!(err instanceof ApiError) || err.status !== 409) throw err;
+      return err.message || 'Chunks hold active curation picks.';
     }
   }
 

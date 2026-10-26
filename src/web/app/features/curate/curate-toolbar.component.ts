@@ -400,22 +400,31 @@ export class CurateToolbarComponent implements OnInit {
     this.isExporting.set(true);
     try {
       const res = await this.datasetService.exportVideo(video.id);
-      if (res?.error) {
-        this.jobEvents.showToast('Export failed', res.error, video.id, true);
-      } else if (!res?.exported) {
-        this.jobEvents.showToast('Nothing exported', res?.msg || 'No frames are marked Keep or Star yet.', video.id);
-      } else {
-        const where = res.per_video_dir ? ` to ${res.per_video_dir}` : '';
-        this.jobEvents.showToast('Video exported', `${res.exported} frames of ${video.name} exported${where}.`, video.id, false, {
-          label: 'View dataset',
-          tab: 'dataset',
-          videoId: video.id,
-        });
-      }
+      this.reportExportResult(video, res);
     } catch (err) {
       this.jobEvents.showToast('Export failed', err instanceof ApiError ? err.message : String(err), video.id, true);
     } finally {
       this.isExporting.set(false);
     }
+  }
+
+  private reportExportResult(
+    video: { id: string; name: string },
+    res: { error?: string; exported?: number; msg?: string; per_video_dir?: string } | null | undefined,
+  ): void {
+    if (res?.error) {
+      this.jobEvents.showToast('Export failed', res.error, video.id, true);
+      return;
+    }
+    if (!res?.exported) {
+      this.jobEvents.showToast('Nothing exported', res?.msg || 'No frames are marked Keep or Star yet.', video.id);
+      return;
+    }
+    const where = res.per_video_dir ? ` to ${res.per_video_dir}` : '';
+    this.jobEvents.showToast('Video exported', `${res.exported} frames of ${video.name} exported${where}.`, video.id, false, {
+      label: 'View dataset',
+      tab: 'dataset',
+      videoId: video.id,
+    });
   }
 }

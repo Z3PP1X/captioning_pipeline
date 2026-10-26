@@ -128,19 +128,32 @@ export function buildAxisCaps(caps: AxisCapsModel): Partial<Record<ReselectAxis,
   return out;
 }
 
+function countOrZero(value: number | undefined): number {
+  return value ?? 0;
+}
+
+function crossDatasetBlockedPart(report: ReselectReport): string | null {
+  const cross = report.cross_dataset;
+  return cross?.enabled && cross.blocked
+    ? `${cross.blocked} already in the dataset from other videos`
+    : null;
+}
+
 /** Comma-separated count parts of the reselect toast. */
 function reselectSummaryParts(report: ReselectReport): string[] {
   const parts = [
-    `${report.promoted?.length ?? 0} promoted`,
-    `${report.demoted?.length ?? 0} demoted`,
-    `${report.locked ?? 0} locked (starred/exported)`,
+    `${countOrZero(report.promoted?.length)} promoted`,
+    `${countOrZero(report.demoted?.length)} demoted`,
+    `${countOrZero(report.locked)} locked (starred/exported)`,
   ];
-  if (report.dup_skipped) parts.push(`${report.dup_skipped} near-duplicates skipped`);
-  if (report.cross_dataset?.enabled && report.cross_dataset.blocked) {
-    parts.push(`${report.cross_dataset.blocked} already in the dataset from other videos`);
+  const optionalParts = [
+    report.dup_skipped ? `${report.dup_skipped} near-duplicates skipped` : null,
+    crossDatasetBlockedPart(report),
+    axisOverflowPart(report),
+  ];
+  for (const part of optionalParts) {
+    if (part) parts.push(part);
   }
-  const capsPart = axisOverflowPart(report);
-  if (capsPart) parts.push(capsPart);
   return parts;
 }
 

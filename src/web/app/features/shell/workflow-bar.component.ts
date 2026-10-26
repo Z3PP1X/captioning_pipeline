@@ -283,19 +283,26 @@ export class WorkflowBarComponent {
     try {
       const res = await this.videoService.setProfile(videoId, profile);
       if (profile === 'character' && res) {
-        if (res.applied) {
-          this.jobEvents.showToast(
-            'Character profile',
-            `${res.demoted?.length ?? 0} off-target picks replaced, ${res.cropped?.length ?? 0} multi-person picks cropped.`,
-            videoId,
-          );
-          await this.curateService.loadCandidates(videoId);
-        } else if (res.reason) {
-          this.jobEvents.showToast('Character profile', res.reason, videoId);
-        }
+        await this.handleCharacterProfileResult(videoId, res);
       }
     } catch (err) {
       this.jobEvents.showToast('Profile not saved', String((err as Error)?.message ?? err), videoId, true);
+    }
+  }
+
+  private async handleCharacterProfileResult(
+    videoId: string,
+    res: { applied?: boolean; demoted?: unknown[]; cropped?: unknown[]; reason?: string },
+  ): Promise<void> {
+    if (res.applied) {
+      this.jobEvents.showToast(
+        'Character profile',
+        `${res.demoted?.length ?? 0} off-target picks replaced, ${res.cropped?.length ?? 0} multi-person picks cropped.`,
+        videoId,
+      );
+      await this.curateService.loadCandidates(videoId);
+    } else if (res.reason) {
+      this.jobEvents.showToast('Character profile', res.reason, videoId);
     }
   }
   readonly chunkService = inject(ChunkService);
@@ -357,33 +364,24 @@ export class WorkflowBarComponent {
     const v = this.video();
     if (!v || action.disabled) return;
 
-    switch (action.actionId) {
-      case 'auto_suggest':
-        await this.chunkService.autoSuggest(v.id);
-        break;
-      case 'save_chunks':
-        await this.chunkService.saveChunks(v.id);
-        break;
-      case 'normalise_budget':
+    const handlers: Record<string, () => Promise<void> | void> = {
+      auto_suggest: () => this.chunkService.autoSuggest(v.id),
+      save_chunks: () => this.chunkService.saveChunks(v.id),
+      normalise_budget: async () => {
         this.chunkService.normalizeBudgets();
         await this.chunkService.saveChunks(v.id);
-        break;
-      case 'extract':
-        await this.chunkService.extract750(v.id);
-        break;
-      case 'curate':
-        this.tabChange.emit('curate');
-        break;
-      case 'caption':
-        this.openCaptionModal.emit();
-        break;
-      case 'next_video':
-        await this.videoService.selectNextVideo();
-        break;
-      case 'restore':
-        // Decision 3: restore goes back to the status the data implies, not to 'new'
-        await this.videoService.updateStatus(v.id, derivedVideoStatus(v, this.chunkService.chunks().length));
-        break;
+      },
+      extract: () => this.chunkService.extract750(v.id),
+      curate: () => this.tabChange.emit('curate'),
+      caption: () => this.openCaptionModal.emit(),
+      next_video: () => this.videoService.selectNextVideo(),
+      // Decision 3: restore goes back to the status the data implies, not to 'new'
+      restore: () => this.videoService.updateStatus(v.id, derivedVideoStatus(v, this.chunkService.chunks().length)),
+    };
+
+    const run = handlers[action.actionId];
+    if (run) {
+      await run();
     }
   }
 

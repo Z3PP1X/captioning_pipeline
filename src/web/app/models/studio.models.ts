@@ -178,6 +178,8 @@ export interface StudioMediaItem {
   crop_geometry: { x: number; y: number; width: number; height: number } | null;
   is_outlier: number | boolean;
   active_caption: string | null;
+  caption_medium?: string | null;
+  caption_short?: string | null;
   caption_status: CaptionStatus;
   active_caption_model: string | null;
   active_caption_layer: 'primary' | 'fallback_1' | 'fallback_2' | 'manual' | 'cached' | null;

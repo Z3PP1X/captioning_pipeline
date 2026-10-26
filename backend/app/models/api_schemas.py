@@ -114,6 +114,8 @@ class DatasetCaptionJobRequest(BaseModel):
 
 class ManualCaptionUpdateRequest(BaseModel):
     caption_text: str = Field(..., min_length=1)
+    caption_medium: str | None = None
+    caption_short: str | None = None
     enforce_trigger: bool = True
     trigger_word: str | None = None
     trigger_position: Literal["prefix", "suffix", "natural_integration"] | None = None

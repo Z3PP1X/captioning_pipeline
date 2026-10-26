@@ -63,6 +63,13 @@ class DatabaseManager:
             conn = self._connect()
             try:
                 conn.executescript(ddl)
+                existing_cols = {
+                    str(r["name"])
+                    for r in conn.execute("PRAGMA table_info(media_items);").fetchall()
+                }
+                for col in ("caption_medium", "caption_short"):
+                    if col not in existing_cols:
+                        conn.execute(f"ALTER TABLE media_items ADD COLUMN {col} TEXT;")
                 conn.commit()
             finally:
                 conn.close()
@@ -980,6 +987,8 @@ class DatabaseManager:
         media_id: int,
         dataset_id: str,
         caption_text: str,
+        caption_medium: str | None = None,
+        caption_short: str | None = None,
         source: str = "vlm",
         caption_status: str = "vlm_accepted",
         skill_id: str | None = None,
@@ -996,7 +1005,18 @@ class DatabaseManager:
     ) -> dict[str, Any]:
         now = time.time()
         clean_text = caption_text.strip()
-        words = len(clean_text.split())
+        word_list = clean_text.split()
+        words = len(word_list)
+        clean_medium = (
+            caption_medium.strip()
+            if caption_medium is not None
+            else (" ".join(word_list[:45]) if word_list else "")
+        )
+        clean_short = (
+            caption_short.strip()
+            if caption_short is not None
+            else (" ".join(word_list[:14]) if word_list else "")
+        )
         with self.write() as conn:
             conn.execute(
                 "UPDATE caption_history SET is_active = 0 WHERE media_id = ?",
@@ -1036,21 +1056,58 @@ class DatabaseManager:
                 """
                 UPDATE media_items
                 SET active_caption = ?,
+                    caption_medium = ?,
+                    caption_short = ?,
                     caption_status = ?,
                     active_caption_model = ?,
                     active_caption_layer = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
-                (clean_text, caption_status, model_used, cascade_layer, now, int(media_id)),
+                (
+                    clean_text,
+                    clean_medium,
+                    clean_short,
+                    caption_status,
+                    model_used,
+                    cascade_layer,
+                    now,
+                    int(media_id),
+                ),
             )
         return {
             "media_id": int(media_id),
             "caption_text": clean_text,
+            "active_caption": clean_text,
+            "caption_medium": clean_medium,
+            "caption_short": clean_short,
             "caption_status": caption_status,
             "word_count": words,
             "warnings": warnings or [],
         }
+
+    def approve_media_item(self, media_id: int) -> dict[str, Any] | None:
+        now = time.time()
+        with self.write() as conn:
+            conn.execute(
+                "UPDATE media_items SET caption_status = 'approved', updated_at = ? WHERE id = ?",
+                (now, int(media_id)),
+            )
+        return self.get_media_item(media_id)
+
+    def set_media_smart_crop(
+        self,
+        media_id: int,
+        crop_geometry: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        now = time.time()
+        serialized = json.dumps(crop_geometry) if crop_geometry is not None else None
+        with self.write() as conn:
+            conn.execute(
+                "UPDATE media_items SET crop_geometry = ?, updated_at = ? WHERE id = ?",
+                (serialized, now, int(media_id)),
+            )
+        return self.get_media_item(media_id)
 
     def mark_needs_manual_caption(self, media_id: int, last_model: str | None = None) -> None:
         now = time.time()

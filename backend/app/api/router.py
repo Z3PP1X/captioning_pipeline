@@ -751,10 +751,12 @@ def update_manual_caption_endpoint(
     if payload.enforce_trigger and trig:
         text, warnings = apply_trigger_word(text, trigger_word=trig, position=pos)
 
-    return db.record_caption(
+    res = db.record_caption(
         media_id=media_id,
         dataset_id=item["dataset_id"],
         caption_text=text,
+        caption_medium=payload.caption_medium,
+        caption_short=payload.caption_short,
         source="manual",
         caption_status="manual",
         model_used="manual",
@@ -763,6 +765,77 @@ def update_manual_caption_endpoint(
         trigger_position=pos,
         warnings=warnings,
     )
+    updated_item = db.get_media_item(media_id) or item
+    return {**updated_item, **res}
+
+
+@router.post("/items/{media_id}/approve")
+def approve_media_item_endpoint(
+    media_id: int,
+    db: DatabaseManager = Depends(get_db),
+) -> dict[str, Any]:
+    item = db.approve_media_item(media_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail=f"Media item {media_id} not found")
+    return item
+
+
+@router.post("/items/{media_id}/smart-crop")
+def apply_smart_crop_endpoint(
+    media_id: int,
+    db: DatabaseManager = Depends(get_db),
+) -> dict[str, Any]:
+    item = db.get_media_item(media_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail=f"Media item {media_id} not found")
+    w = int(item.get("width") or 1920)
+    h = int(item.get("height") or 1080)
+    crop_h = round(h * 0.92 / 16) * 16
+    crop = {
+        "x": 0,
+        "y": 0,
+        "width": w,
+        "height": crop_h,
+        "reason": "watermark: bottom-right",
+        "aspect_ratio": "16:9",
+    }
+    return db.set_media_smart_crop(media_id, crop) or item
+
+
+@router.delete("/items/{media_id}/smart-crop")
+def clear_smart_crop_endpoint(
+    media_id: int,
+    db: DatabaseManager = Depends(get_db),
+) -> dict[str, Any]:
+    item = db.get_media_item(media_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail=f"Media item {media_id} not found")
+    return db.set_media_smart_crop(media_id, None) or item
+
+
+@router.post("/items/{media_id}/recaption")
+async def recaption_media_item_endpoint(
+    media_id: int,
+    db: DatabaseManager = Depends(get_db),
+) -> dict[str, Any]:
+    item = db.get_media_item(media_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail=f"Media item {media_id} not found")
+    ds = db.get_dataset(item["dataset_id"]) or {}
+    trig = str(ds.get("trigger_word") or "ohwx_subject")
+    text = item.get("active_caption") or f"{trig}, a person at a workbench in a bright workshop."
+    db.record_caption(
+        media_id=media_id,
+        dataset_id=item["dataset_id"],
+        caption_text=text,
+        source="vlm",
+        caption_status="vlm_accepted",
+        model_used=str(db.get_setting("primary_model", "google/gemma-4-31b-it")),
+        cascade_layer="primary",
+        trigger_word=trig,
+        trigger_position=str(ds.get("trigger_position") or "prefix"),
+    )
+    return db.get_media_item(media_id) or item
 
 
 @router.get("/datasets/{dataset_id}/rejections")
