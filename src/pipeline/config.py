@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import copy
+import math
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -57,7 +59,7 @@ def get_settings() -> Settings:
 
 
 # User-tunable pipeline settings, stored in SQLite and editable in the UI.
-DEFAULT_USER_SETTINGS: dict = {
+DEFAULT_USER_SETTINGS: dict[str, Any] = {
     "default_k": 5,
     "default_rule": "person",
     "snap_to_cuts": True,
@@ -71,6 +73,8 @@ DEFAULT_USER_SETTINGS: dict = {
     "runner_ups": 5,
     "max_edge": 2048,
     "min_export_edge": 0,
+    "normalize_to_buckets": True,
+    "export_bucket_preset": "4_buckets",
     "trigger_word": "restrained_elegance",
     "clip_model": "Xenova/clip-vit-base-patch32:quantized",
     # Candidate extraction & curated reduction (target 150 - 200 images per video)
@@ -153,7 +157,7 @@ DEFAULT_USER_SETTINGS: dict = {
 }
 
 
-def merged_user_settings(stored: dict | None) -> dict:
+def merged_user_settings(stored: dict[str, Any] | None) -> dict[str, Any]:
     """Deep-merge stored overrides onto defaults (one level of nesting)."""
     out = copy.deepcopy(DEFAULT_USER_SETTINGS)
     for k, v in (stored or {}).items():
@@ -201,6 +205,7 @@ SETTING_RANGES: dict[str, tuple[float, float]] = {
 }
 SETTING_CHOICES: dict[str, tuple[str, ...]] = {
     "default_rule": CHUNK_RULES,
+    "export_bucket_preset": ("4_buckets", "3_buckets"),
     "openrouter_mode": ("concept", "character", "style"),
     "openrouter_reasoning_effort": ("none", "minimal", "low", "medium", "high"),
     "cut_detector": ("content", "legacy"),
@@ -211,71 +216,79 @@ SETTING_CHOICES: dict[str, tuple[str, ...]] = {
 SELECTION_AXES = ("multi_person", "solo", "equipment", "face")
 
 
-def validate_user_settings(payload: dict) -> tuple[dict, list[str], list[str]]:
+def _validate_numeric_setting(key: str, value: Any, default: int | float) -> tuple[int | float | None, str | None]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None, f"{key}: expected a finite number"
+    if isinstance(default, int):
+        if float(value) != int(value):
+            return None, f"{key}: expected a whole number"
+        coerced: int | float = int(value)
+    else:
+        coerced = float(value)
+    lo_hi = SETTING_RANGES.get(key)
+    if lo_hi and not (lo_hi[0] <= coerced <= lo_hi[1]):
+        return None, f"{key}: must be between {lo_hi[0]} and {lo_hi[1]}"
+    return coerced, None
+
+
+def _validate_str_setting(key: str, value: Any) -> tuple[str | None, str | None]:
+    if not isinstance(value, str):
+        return None, f"{key}: expected text"
+    choices = SETTING_CHOICES.get(key)
+    if choices and value not in choices:
+        return None, f"{key}: must be one of {', '.join(choices)}"
+    return value, None
+
+
+def _is_valid_axis_share(axis: Any, share: Any) -> bool:
+    if axis not in SELECTION_AXES or isinstance(share, bool) or not isinstance(share, (int, float)):
+        return False
+    return math.isfinite(share) and (0.0 <= float(share) <= 1.0)
+
+
+def _validate_dict_setting(key: str, value: Any) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(value, dict):
+        return None, f"{key}: expected an object"
+    if key != "reselect_axis_caps":
+        return value, None
+    if not all(_is_valid_axis_share(a, share) for a, share in value.items()):
+        return None, f"{key}: axes must be {', '.join(SELECTION_AXES)} with a max share between 0 and 1"
+    return {a: float(share) for a, share in value.items()}, None
+
+
+def _validate_single_setting(key: str, value: Any, default: Any) -> tuple[Any, str | None]:
+    if isinstance(default, bool):
+        return (value, None) if isinstance(value, bool) else (None, f"{key}: expected true/false")
+    if isinstance(default, (int, float)):
+        return _validate_numeric_setting(key, value, default)
+    if isinstance(default, str):
+        return _validate_str_setting(key, value)
+    if isinstance(default, dict):
+        return _validate_dict_setting(key, value)
+    if isinstance(default, list):
+        return (value, None) if isinstance(value, list) else (None, f"{key}: expected a list")
+    return value, None
+
+
+def validate_user_settings(payload: dict[str, Any]) -> tuple[dict[str, Any], list[str], list[str]]:
     """Check a settings update against the defaults: (clean values, errors, ignored unknown keys).
 
     The type of each default decides what is accepted (ints may come as whole floats, floats as ints; NaN and
     infinities are rejected); `SETTING_RANGES` and `SETTING_CHOICES` add bounds. Unknown keys are dropped and
     reported rather than stored, so a typo cannot silently become a setting.
     """
-    import math
-
-    clean: dict = {}
+    clean: dict[str, Any] = {}
     errors: list[str] = []
     ignored: list[str] = []
     for key, value in payload.items():
         if key not in DEFAULT_USER_SETTINGS:
             ignored.append(key)
             continue
-        default = DEFAULT_USER_SETTINGS[key]
-        if isinstance(default, bool):
-            if not isinstance(value, bool):
-                errors.append(f"{key}: expected true/false")
-                continue
-        elif isinstance(default, (int, float)):
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-                errors.append(f"{key}: expected a finite number")
-                continue
-            if isinstance(default, int) and not isinstance(default, bool):
-                if float(value) != int(value):
-                    errors.append(f"{key}: expected a whole number")
-                    continue
-                value = int(value)
-            else:
-                value = float(value)
-            lo_hi = SETTING_RANGES.get(key)
-            if lo_hi and not (lo_hi[0] <= value <= lo_hi[1]):
-                errors.append(f"{key}: must be between {lo_hi[0]} and {lo_hi[1]}")
-                continue
-        elif isinstance(default, str):
-            if not isinstance(value, str):
-                errors.append(f"{key}: expected text")
-                continue
-            choices = SETTING_CHOICES.get(key)
-            if choices and value not in choices:
-                errors.append(f"{key}: must be one of {', '.join(choices)}")
-                continue
-        elif isinstance(default, dict):
-            if not isinstance(value, dict):
-                errors.append(f"{key}: expected an object")
-                continue
-            if key == "reselect_axis_caps":
-                bad = [
-                    a for a, share in value.items()
-                    if a not in SELECTION_AXES or isinstance(share, bool) or not isinstance(share, (int, float))
-                    or not math.isfinite(share) or not (0.0 <= float(share) <= 1.0)
-                ]
-                if bad:
-                    errors.append(
-                        f"{key}: axes must be {', '.join(SELECTION_AXES)} with a max share between 0 and 1"
-                    )
-                    continue
-                value = {a: float(share) for a, share in value.items()}
-        elif isinstance(default, list):
-            if not isinstance(value, list):
-                errors.append(f"{key}: expected a list")
-                continue
-        clean[key] = value
+        coerced, err = _validate_single_setting(key, value, DEFAULT_USER_SETTINGS[key])
+        if err is not None:
+            errors.append(err)
+            continue
+        clean[key] = coerced
     lo, hi = clean.get("target_curated_min"), clean.get("target_curated_max")
     if lo is not None and hi is not None and lo > hi:
         errors.append("target_curated_min must not exceed target_curated_max")

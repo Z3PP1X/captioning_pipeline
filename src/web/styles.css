@@ -44,40 +44,39 @@
 }
 
 :root {
-  --background: #FFFFFF;
-  --foreground: #1A1A1A;
-  --canvas: #E9EBEE;
-  --card: #FFFFFF;
-  --card-foreground: #1A1A1A;
-  --popover: #FFFFFF;
-  --popover-foreground: #1A1A1A;
-  --primary: #D73816;
+  --background: #090B0E;
+  --foreground: #F1F5F9;
+  --canvas: #090B0E;
+  --card: #11141B;
+  --card-foreground: #F1F5F9;
+  --popover: #11141B;
+  --popover-foreground: #F1F5F9;
+  --primary: #EA580C;
   --primary-foreground: #FFFFFF;
-  --brand: #E33B17;
-  --secondary: #1A1A1A;
-  --secondary-foreground: #FFFFFF;
-  --muted: #F4F5F6;
-  --muted-foreground: #65696F;
-  --accent: #F4F5F6;
-  --accent-foreground: #1A1A1A;
-  --destructive: #D70015;
+  --brand: #F97316;
+  --secondary: #1E293B;
+  --secondary-foreground: #F8FAFC;
+  --muted: #171B24;
+  --muted-foreground: #94A3B8;
+  --accent: #1E293B;
+  --accent-foreground: #F8FAFC;
+  --destructive: #EF4444;
   --destructive-foreground: #FFFFFF;
-  --border: #D7DADC;
-  --input: #868B90;
-  --ring: #D73816;
+  --border: #232936;
+  --input: #334155;
+  --ring: #F97316;
   --radius: 0.75rem;
 
   --success: #22C55E;
-  --warning: #FFBC1F;
-  /* AA-safe shades for state carried by text/icons/borders on white (success-strong 5.02:1, warning-strong 5.93:1) */
-  --success-strong: #15803D;
-  --warning-strong: #8A5A00;
-  --info: #1658C7;
-  --sidebar: #1A1A1A;
-  --sidebar-foreground: #FFFFFF;
+  --warning: #F59E0B;
+  --success-strong: #10B981;
+  --warning-strong: #F59E0B;
+  --info: #38BDF8;
+  --sidebar: #0D1017;
+  --sidebar-foreground: #F8FAFC;
 
-  --font-sans: Helvetica, Arial, "Noto Sans", sans-serif;
-  --font-display: Helvetica, Arial, "Noto Sans", sans-serif;
+  --font-sans: Inter, Helvetica, Arial, "Noto Sans", sans-serif;
+  --font-display: Inter, Helvetica, Arial, "Noto Sans", sans-serif;
 }
 
 body {
@@ -95,7 +94,7 @@ body {
   border-color: var(--border);
 }
 
-/* Custom Scrollbar for sleek dark/light studio aesthetics */
+/* Custom Scrollbar for sleek dark studio aesthetics */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;

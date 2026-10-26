@@ -20,6 +20,8 @@ ACCEPTED_SOURCES = ("vlm", "imported")
 _COLUMNS = (
     "frame_id", "video_id", "text", "model", "layer", "mode", "prompt_version", "trigger", "word_count",
     "cost_usd", "prompt_tokens", "completion_tokens", "warnings", "finish_reason", "job_id", "created_at", "source",
+    "caption_long", "caption_medium", "caption_short", "watermark", "borders", "suggested_crop", "applied_crop",
+    "leaked_traits", "review_status", "model_used",
 )
 
 
@@ -28,18 +30,27 @@ def _first_token(text: str) -> str | None:
     return words[0].strip(",.:;") if words else None
 
 
+def _to_json_val(val: Any) -> str | None:
+    if val is None:
+        return None
+    if isinstance(val, str):
+        return val
+    return json.dumps(val)
+
+
 def _row_values(frame_id: int, video_id: str | None, text: str, source: str, **meta: Any) -> tuple:
     warnings = meta.get("warnings")
+    resolved_text = text or meta.get("caption_long") or meta.get("caption_medium") or meta.get("caption_short") or ""
     values = {
         "frame_id": frame_id,
         "video_id": video_id,
-        "text": text,
+        "text": resolved_text,
         "model": meta.get("model"),
         "layer": meta.get("layer"),
         "mode": meta.get("mode"),
         "prompt_version": meta.get("prompt_version"),
-        "trigger": meta.get("trigger") or _first_token(text),
-        "word_count": len((text or "").split()),
+        "trigger": meta.get("trigger") or _first_token(resolved_text),
+        "word_count": len(resolved_text.split()),
         "cost_usd": meta.get("cost_usd"),
         "prompt_tokens": meta.get("prompt_tokens"),
         "completion_tokens": meta.get("completion_tokens"),
@@ -48,6 +59,16 @@ def _row_values(frame_id: int, video_id: str | None, text: str, source: str, **m
         "job_id": meta.get("job_id"),
         "created_at": meta.get("created_at") or time.time(),
         "source": source,
+        "caption_long": meta.get("caption_long"),
+        "caption_medium": meta.get("caption_medium"),
+        "caption_short": meta.get("caption_short"),
+        "watermark": _to_json_val(meta.get("watermark")),
+        "borders": _to_json_val(meta.get("borders")),
+        "suggested_crop": _to_json_val(meta.get("suggested_crop")),
+        "applied_crop": _to_json_val(meta.get("applied_crop")),
+        "leaked_traits": _to_json_val(meta.get("leaked_traits")),
+        "review_status": meta.get("review_status") or "PENDING",
+        "model_used": meta.get("model_used") or meta.get("model"),
     }
     return tuple(values[c] for c in _COLUMNS)
 
@@ -56,10 +77,58 @@ _INSERT = f"INSERT INTO captions ({', '.join(_COLUMNS)}) VALUES ({', '.join('?' 
 _UPDATE_ALL = ", ".join(f"{c}=excluded.{c}" for c in _COLUMNS if c != "frame_id")
 
 
+def _auto_index_moss_caption(
+    conn: sqlite3.Connection,
+    frame_id: int,
+    video_id: str | None,
+    text: str,
+    meta: dict[str, Any],
+) -> None:
+    try:
+        from pipeline.rag.moss_rag import ensure_moss_tables
+        ensure_moss_tables(conn)
+        long_val = meta.get("caption_long") or text or ""
+        med_val = meta.get("caption_medium") or text or ""
+        short_val = meta.get("caption_short") or text or ""
+        trigger_val = meta.get("trigger") or meta.get("trigger_phrase") or _first_token(text) or ""
+        mode_val = meta.get("mode") or "CHARACTER"
+        raw_tags = meta.get("tags") or []
+        tags_str = " ".join(raw_tags) if isinstance(raw_tags, (list, tuple)) else str(raw_tags or "")
+        tags_json = json.dumps(list(raw_tags)) if isinstance(raw_tags, (list, tuple)) else str(raw_tags or "[]")
+        now = time.time()
+        conn.execute("DELETE FROM moss_captions_fts WHERE frame_id = ?", (frame_id,))
+        conn.execute(
+            """
+            INSERT INTO moss_captions_fts (frame_id, video_id, trigger, mode, long, medium, short, tags)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (frame_id, video_id or "", trigger_val, mode_val, long_val, med_val, short_val, tags_str),
+        )
+        conn.execute(
+            """
+            INSERT INTO moss_captions_meta (frame_id, video_id, trigger, mode, long, medium, short, tags, embedding, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+            ON CONFLICT(frame_id) DO UPDATE SET
+                video_id=excluded.video_id,
+                trigger=excluded.trigger,
+                mode=excluded.mode,
+                long=excluded.long,
+                medium=excluded.medium,
+                short=excluded.short,
+                tags=excluded.tags,
+                updated_at=excluded.updated_at
+            """,
+            (frame_id, video_id or "", trigger_val, mode_val, long_val, med_val, short_val, tags_json, now),
+        )
+    except Exception:
+        pass
+
+
 def record_caption(conn: sqlite3.Connection, frame_id: int, video_id: str | None, text: str, **meta: Any) -> None:
     """Upsert a VLM caption (source 'vlm'): replaces whatever the frame had."""
     conn.execute(f"{_INSERT} ON CONFLICT(frame_id) DO UPDATE SET {_UPDATE_ALL}",
                  _row_values(frame_id, video_id, text, "vlm", **meta))
+    _auto_index_moss_caption(conn, frame_id, video_id, text, meta)
 
 
 def import_caption(
@@ -81,6 +150,8 @@ def import_caption(
             f"{_INSERT} ON CONFLICT(frame_id) DO UPDATE SET {_UPDATE_ALL} WHERE captions.source = 'stub'",
             _row_values(frame_id, video_id, text, "imported", **meta),
         )
+    if cur.rowcount > 0:
+        _auto_index_moss_caption(conn, frame_id, video_id, text, meta)
     return cur.rowcount > 0
 
 
@@ -92,19 +163,86 @@ def _decode(row: dict | None) -> dict | None:
     if row is None:
         return None
     out = dict(row)
-    raw = out.get("warnings")
-    if isinstance(raw, str):
-        try:
-            out["warnings"] = json.loads(raw)
-        except ValueError:
-            out["warnings"] = [raw]
-    elif raw is None:
-        out["warnings"] = []
+    for col in ("warnings", "watermark", "borders", "suggested_crop", "applied_crop", "leaked_traits"):
+        raw = out.get(col)
+        if isinstance(raw, str):
+            try:
+                out[col] = json.loads(raw)
+            except ValueError:
+                out[col] = [raw] if col == "warnings" else raw
+        elif raw is None and col == "warnings":
+            out["warnings"] = []
     return out
 
 
 def get_caption(db: DB, frame_id: int) -> dict | None:
     return _decode(db.one("SELECT * FROM captions WHERE frame_id=?", (frame_id,)))
+
+
+def _unpack_moss_input(
+    frame_id: int | Any,
+    video_id: str | None,
+    caption_long: str,
+    caption_medium: str,
+    caption_short: str,
+    meta: dict[str, Any],
+) -> tuple[int, str | None, str, str, str]:
+    fid = frame_id
+    vid = video_id
+    long_cap = caption_long
+    med_cap = caption_medium
+    short_cap = caption_short
+
+    if hasattr(frame_id, "frame_id"):
+        rec = frame_id
+        fid = rec.frame_id
+        vid = getattr(rec, "video_id", vid)
+        long_cap = getattr(rec, "caption_long", long_cap)
+        med_cap = getattr(rec, "caption_medium", med_cap)
+        short_cap = getattr(rec, "caption_short", short_cap)
+        attrs = ("watermark", "borders", "suggested_crop", "applied_crop", "leaked_traits", "review_status", "model_used", "trigger_phrase")
+        for attr in attrs:
+            if hasattr(rec, attr) and getattr(rec, attr) is not None and attr not in meta:
+                meta[attr] = getattr(rec, attr)
+    elif isinstance(frame_id, dict):
+        d = frame_id
+        fid = d.get("frame_id", fid)
+        vid = d.get("video_id", vid)
+        long_cap = d.get("caption_long", long_cap)
+        med_cap = d.get("caption_medium", med_cap)
+        short_cap = d.get("caption_short", short_cap)
+        for k, v in d.items():
+            if k not in ("frame_id", "video_id", "caption_long", "caption_medium", "caption_short") and k not in meta:
+                meta[k] = v
+
+    return int(fid), vid, long_cap, med_cap, short_cap
+
+
+def record_moss_caption(
+    conn: sqlite3.Connection,
+    frame_id: int | Any,
+    video_id: str | None = None,
+    caption_long: str = "",
+    caption_medium: str = "",
+    caption_short: str = "",
+    **meta: Any,
+) -> None:
+    """Upsert a MOSS multi-tier caption."""
+    fid, vid, long_cap, med_cap, short_cap = _unpack_moss_input(
+        frame_id, video_id, caption_long, caption_medium, caption_short, meta
+    )
+    meta["caption_long"] = long_cap
+    meta["caption_medium"] = med_cap
+    meta["caption_short"] = short_cap
+    if "trigger" not in meta and "trigger_phrase" in meta:
+        meta["trigger"] = meta["trigger_phrase"]
+
+    record_caption(conn, fid, vid, text=long_cap, **meta)
+
+
+def get_moss_caption(db: DB, frame_id: int) -> dict | None:
+    """Retrieve decoded MOSS caption dictionary for a frame."""
+    return get_caption(db, frame_id)
 
 
 def get_accepted_caption(db: DB, frame_id: int) -> dict | None:

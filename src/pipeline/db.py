@@ -5,9 +5,10 @@ import json
 import sqlite3
 import threading
 import time
-from contextlib import contextmanager
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS videos (
@@ -27,6 +28,11 @@ CREATE TABLE IF NOT EXISTS videos (
     title_hash TEXT,
     autopilot TEXT,
     profile TEXT NOT NULL DEFAULT 'concept',
+    target_architecture TEXT DEFAULT 'MOSS_IMAGE',
+    training_mode TEXT DEFAULT 'CHARACTER',
+    trigger_phrase TEXT,
+    class_noun TEXT,
+    locked_traits TEXT,
     updated_at REAL
 );
 CREATE TABLE IF NOT EXISTS chunks (
@@ -150,7 +156,17 @@ CREATE TABLE IF NOT EXISTS captions (
     finish_reason TEXT,
     job_id INTEGER,
     created_at REAL NOT NULL,
-    source TEXT NOT NULL DEFAULT 'vlm'
+    source TEXT NOT NULL DEFAULT 'vlm',
+    caption_long TEXT,
+    caption_medium TEXT,
+    caption_short TEXT,
+    watermark TEXT,
+    borders TEXT,
+    suggested_crop TEXT,
+    applied_crop TEXT,
+    leaked_traits TEXT,
+    review_status TEXT DEFAULT 'PENDING',
+    model_used TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_captions_video ON captions(video_id);
 -- Phase F: every human curation action, the training signal for learned quality weights (learned_weights.py).
@@ -190,8 +206,11 @@ CREATE TABLE IF NOT EXISTS frame_features (
 );
 """
 
-JSON_COLS = {"watermark_rect", "letterbox", "tags", "metrics", "zs_scores", "crop", "autopilot", "box",
-             "face_summary", "emb_refs", "gates", "q_components"}
+JSON_COLS = {
+    "watermark_rect", "letterbox", "tags", "metrics", "zs_scores", "crop", "autopilot", "box",
+    "face_summary", "emb_refs", "gates", "q_components",
+    "watermark", "borders", "suggested_crop", "applied_crop", "leaked_traits", "locked_traits",
+}
 
 
 class DB:
@@ -202,61 +221,102 @@ class DB:
         with self.conn() as c:
             c.execute("PRAGMA journal_mode=WAL")
             c.executescript(SCHEMA)
-            # Safe migrations: ensure required columns exist in chunks, frames, and videos
-            cols = [r["name"] for r in c.execute("PRAGMA table_info(chunks)").fetchall()]
-            if "budget_pct" not in cols:
-                c.execute("ALTER TABLE chunks ADD COLUMN budget_pct REAL NOT NULL DEFAULT 0.0")
-            if "caption_model" not in cols:
-                c.execute("ALTER TABLE chunks ADD COLUMN caption_model TEXT NOT NULL DEFAULT 'google/gemma-4-31b-it'")
-            if "priority" not in cols:
-                c.execute("ALTER TABLE chunks ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'")
-            if "person_presence" not in cols:
-                c.execute("ALTER TABLE chunks ADD COLUMN person_presence REAL")
-            if "face_presence" not in cols:
-                c.execute("ALTER TABLE chunks ADD COLUMN face_presence REAL")
-            frame_cols = [r["name"] for r in c.execute("PRAGMA table_info(frames)").fetchall()]
-            if "native" not in frame_cols:
-                c.execute("ALTER TABLE frames ADD COLUMN native INTEGER NOT NULL DEFAULT 0")
-            video_cols = [r["name"] for r in c.execute("PRAGMA table_info(videos)").fetchall()]
-            if "target_person_id" not in video_cols:
-                c.execute("ALTER TABLE videos ADD COLUMN target_person_id INTEGER REFERENCES persons(id) ON DELETE SET NULL")
-            if "target_person_name" not in video_cols:
-                c.execute("ALTER TABLE videos ADD COLUMN target_person_name TEXT")
-            if "title_hash" not in video_cols:
-                c.execute("ALTER TABLE videos ADD COLUMN title_hash TEXT")
-                try:
-                    from pipeline.indexer import compute_video_title_hash
-                    for v in c.execute("SELECT id, name FROM videos WHERE title_hash IS NULL").fetchall():
-                        if v["name"]:
-                            c.execute("UPDATE videos SET title_hash=? WHERE id=?", (compute_video_title_hash(v["name"]), v["id"]))
-                except Exception:
-                    pass
-            if "autopilot" not in video_cols:
-                c.execute("ALTER TABLE videos ADD COLUMN autopilot TEXT")
-            if "profile" not in video_cols:
-                c.execute("ALTER TABLE videos ADD COLUMN profile TEXT NOT NULL DEFAULT 'concept'")
-            region_cols = [r["name"] for r in c.execute("PRAGMA table_info(tag_regions)").fetchall()]
-            if "parent_id" not in region_cols:
-                c.execute("ALTER TABLE tag_regions ADD COLUMN parent_id INTEGER REFERENCES tag_regions(id) ON DELETE CASCADE")
+            self._migrate(c)
 
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS video_persons (
-                video_id TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
-                person_id INTEGER NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
-                role TEXT NOT NULL DEFAULT 'positive',
-                created_at REAL NOT NULL,
-                PRIMARY KEY (video_id, person_id)
-            )
-            """)
+    @staticmethod
+    def _migrate_chunks_and_frames(c: sqlite3.Connection) -> None:
+        chunk_cols = {r["name"] for r in c.execute("PRAGMA table_info(chunks)").fetchall()}
+        if "budget_pct" not in chunk_cols:
+            c.execute("ALTER TABLE chunks ADD COLUMN budget_pct REAL NOT NULL DEFAULT 0.0")
+        if "caption_model" not in chunk_cols:
+            c.execute("ALTER TABLE chunks ADD COLUMN caption_model TEXT NOT NULL DEFAULT 'google/gemma-4-31b-it'")
+        if "priority" not in chunk_cols:
+            c.execute("ALTER TABLE chunks ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'")
+        if "person_presence" not in chunk_cols:
+            c.execute("ALTER TABLE chunks ADD COLUMN person_presence REAL")
+        if "face_presence" not in chunk_cols:
+            c.execute("ALTER TABLE chunks ADD COLUMN face_presence REAL")
+        frame_cols = {r["name"] for r in c.execute("PRAGMA table_info(frames)").fetchall()}
+        if "native" not in frame_cols:
+            c.execute("ALTER TABLE frames ADD COLUMN native INTEGER NOT NULL DEFAULT 0")
+
+    @staticmethod
+    def _migrate_videos(c: sqlite3.Connection) -> None:
+        video_cols = {r["name"] for r in c.execute("PRAGMA table_info(videos)").fetchall()}
+        col_defs = [
+            ("target_person_id", "INTEGER REFERENCES persons(id) ON DELETE SET NULL"),
+            ("target_person_name", "TEXT"),
+            ("title_hash", "TEXT"),
+            ("autopilot", "TEXT"),
+            ("profile", "TEXT NOT NULL DEFAULT 'concept'"),
+            ("target_architecture", "TEXT DEFAULT 'MOSS_IMAGE'"),
+            ("training_mode", "TEXT DEFAULT 'CHARACTER'"),
+            ("trigger_phrase", "TEXT"),
+            ("class_noun", "TEXT"),
+            ("locked_traits", "TEXT"),
+        ]
+        for col_name, col_type in col_defs:
+            if col_name not in video_cols:
+                c.execute(f"ALTER TABLE videos ADD COLUMN {col_name} {col_type}")
+
+        if "title_hash" not in video_cols:
             try:
-                now_ts = time.time()
-                for row in c.execute("SELECT id, target_person_id FROM videos WHERE target_person_id IS NOT NULL").fetchall():
-                    c.execute(
-                        "INSERT OR IGNORE INTO video_persons (video_id, person_id, role, created_at) VALUES (?, ?, 'positive', ?)",
-                        (row["id"], row["target_person_id"], now_ts)
-                    )
+                from pipeline.indexer import compute_video_title_hash
+                for v in c.execute("SELECT id, name FROM videos WHERE title_hash IS NULL").fetchall():
+                    if v["name"]:
+                        c.execute("UPDATE videos SET title_hash=? WHERE id=?", (compute_video_title_hash(v["name"]), v["id"]))
             except Exception:
                 pass
+
+    @staticmethod
+    def _migrate_captions(c: sqlite3.Connection) -> None:
+        caption_cols = {r["name"] for r in c.execute("PRAGMA table_info(captions)").fetchall()}
+        col_defs = [
+            ("caption_long", "TEXT"),
+            ("caption_medium", "TEXT"),
+            ("caption_short", "TEXT"),
+            ("watermark", "TEXT"),
+            ("borders", "TEXT"),
+            ("suggested_crop", "TEXT"),
+            ("applied_crop", "TEXT"),
+            ("leaked_traits", "TEXT"),
+            ("review_status", "TEXT DEFAULT 'PENDING'"),
+            ("model_used", "TEXT"),
+        ]
+        for col_name, col_type in col_defs:
+            if col_name not in caption_cols:
+                c.execute(f"ALTER TABLE captions ADD COLUMN {col_name} {col_type}")
+
+    @staticmethod
+    def _migrate_tag_regions_and_persons(c: sqlite3.Connection) -> None:
+        region_cols = {r["name"] for r in c.execute("PRAGMA table_info(tag_regions)").fetchall()}
+        if "parent_id" not in region_cols:
+            c.execute("ALTER TABLE tag_regions ADD COLUMN parent_id INTEGER REFERENCES tag_regions(id) ON DELETE CASCADE")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS video_persons (
+            video_id TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+            person_id INTEGER NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+            role TEXT NOT NULL DEFAULT 'positive',
+            created_at REAL NOT NULL,
+            PRIMARY KEY (video_id, person_id)
+        )
+        """)
+        try:
+            now_ts = time.time()
+            for row in c.execute("SELECT id, target_person_id FROM videos WHERE target_person_id IS NOT NULL").fetchall():
+                c.execute(
+                    "INSERT OR IGNORE INTO video_persons (video_id, person_id, role, created_at) VALUES (?, ?, 'positive', ?)",
+                    (row["id"], row["target_person_id"], now_ts)
+                )
+        except Exception:
+            pass
+
+    def _migrate(self, c: sqlite3.Connection) -> None:
+        self._migrate_chunks_and_frames(c)
+        self._migrate_videos(c)
+        self._migrate_captions(c)
+        self._migrate_tag_regions_and_persons(c)
 
     @contextmanager
     def conn(self) -> Iterator[sqlite3.Connection]:
@@ -284,7 +344,8 @@ class DB:
         d = dict(r)
         for k in JSON_COLS & d.keys():
             if isinstance(d[k], str):
-                d[k] = json.loads(d[k])
+                with suppress(json.JSONDecodeError, ValueError):
+                    d[k] = json.loads(d[k])
         return d
 
     def one(self, sql: str, args: tuple = ()) -> dict | None:
@@ -304,6 +365,57 @@ class DB:
             c.execute("INSERT INTO settings(key,value) VALUES(?,?) "
                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, json.dumps(value)))
 
+    def get_video_moss_config(self, video_id: str) -> dict[str, Any]:
+        row = self.one(
+            """
+            SELECT target_architecture, training_mode, trigger_phrase, class_noun, locked_traits
+            FROM videos WHERE id=?
+            """,
+            (video_id,),
+        )
+        if not row:
+            return {}
+        return {
+            "target_architecture": row.get("target_architecture") or "MOSS_IMAGE",
+            "training_mode": row.get("training_mode") or "CHARACTER",
+            "trigger_phrase": row.get("trigger_phrase") or "",
+            "class_noun": row.get("class_noun") or "",
+            "locked_traits": row.get("locked_traits") or [],
+        }
+
+    def set_video_moss_config(self, video_id: str, config: Any) -> None:
+        if hasattr(config, "model_dump"):
+            cfg = config.model_dump(mode="json")
+        elif isinstance(config, dict):
+            cfg = dict(config)
+        else:
+            cfg = {}
+        target_arch = cfg.get("target_architecture", "MOSS_IMAGE")
+        target_arch = target_arch.value if hasattr(target_arch, "value") else str(target_arch)
+        training_mode = cfg.get("training_mode", "CHARACTER")
+        training_mode = training_mode.value if hasattr(training_mode, "value") else str(training_mode)
+
+        locked_traits = cfg.get("locked_traits", [])
+        if isinstance(locked_traits, (list, dict)):
+            locked_traits = json.dumps(locked_traits)
+        with self.write() as c:
+            c.execute(
+                """
+                UPDATE videos
+                SET target_architecture=?, training_mode=?, trigger_phrase=?, class_noun=?, locked_traits=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    target_arch,
+                    training_mode,
+                    cfg.get("trigger_phrase", ""),
+                    cfg.get("class_noun", ""),
+                    locked_traits,
+                    time.time(),
+                    video_id,
+                ),
+            )
+
     def create_or_update_person(
         self,
         name: str,
@@ -313,6 +425,7 @@ class DB:
     ) -> dict:
         import re
         import time
+
         import numpy as np
 
         clean_name = name.strip()
@@ -320,10 +433,7 @@ class DB:
         slug = re.sub(r"[-\s]+", "_", slug)[:64] or "person"
         now = time.time()
 
-        if isinstance(embedding, np.ndarray):
-            emb_blob = embedding.astype(np.float32).tobytes()
-        else:
-            emb_blob = bytes(embedding)
+        emb_blob = embedding.astype(np.float32).tobytes() if isinstance(embedding, np.ndarray) else bytes(embedding)
 
         existing = None
         if person_id is not None:

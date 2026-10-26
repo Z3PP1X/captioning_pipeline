@@ -9,6 +9,8 @@
   ],
   "include": [
     "src/web/**/*.d.ts",
+    "src/web/*.ts",
+    "src/web/services/**/*.ts",
     "src/web/app/**/*.ts",
     "src/web/shared/ui/**/*.ts"
   ],

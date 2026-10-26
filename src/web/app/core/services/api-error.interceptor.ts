@@ -13,13 +13,21 @@ export function toApiError(err: unknown): unknown {
     // HttpClient reports "Unknown Error" here; the request never reached FastAPI
     return new ApiError(0, null, 'Network error: the server could not be reached');
   }
+  const detail = errorDetail(err);
+  const message = detailMessage(detail);
+  return new ApiError(err.status, detail, message || `API request failed with status ${err.status}`);
+}
+
+/** FastAPI's `detail` from the error body, else the status text. */
+function errorDetail(err: HttpErrorResponse): unknown {
   const body = err.error as { detail?: unknown } | string | null | undefined;
   // Non-JSON error bodies arrive as a string, network failures as a ProgressEvent: neither has `detail`
   const bodyDetail = body && typeof body === 'object' && 'detail' in body ? body.detail : undefined;
-  const detail: unknown = bodyDetail ? bodyDetail : err.statusText;
-  const message =
-    typeof detail === 'string' ? detail : String((detail as { message?: string } | null)?.message ?? '');
-  return new ApiError(err.status, detail, message || `API request failed with status ${err.status}`);
+  return bodyDetail ? bodyDetail : err.statusText;
+}
+
+function detailMessage(detail: unknown): string {
+  return typeof detail === 'string' ? detail : String((detail as { message?: string } | null)?.message ?? '');
 }
 
 /** Central error mapping for every HttpClient request (registered in app.config). */

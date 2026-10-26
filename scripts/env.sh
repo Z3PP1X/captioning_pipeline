@@ -15,7 +15,7 @@ if ! command -v node >/dev/null 2>&1 && [ -s "${NVM_DIR:-$HOME/.nvm}/nvm.sh" ]; 
   # shellcheck disable=SC1091
   source "${NVM_DIR:-$HOME/.nvm}/nvm.sh" >/dev/null
 fi
-mkdir -p "$CP_CACHE_DIR" "$HOME/.venvs"
+mkdir -p "$CP_CACHE_DIR" "$HOME/.venvs" 2>/dev/null || true
 
 cd "$PROJECT_ROOT"
 

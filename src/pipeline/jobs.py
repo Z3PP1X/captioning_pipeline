@@ -25,6 +25,7 @@ from pipeline.export import (
     existing_caption_kind,
     link_or_copy,
     render_export_image,
+    resolve_buckets,
     snap_to_multiple_of_16,
     write_caption_files,
 )
@@ -523,7 +524,7 @@ class JobManager:
                 "gates": list(why),
             }
             if why:
-                for r in why:
+                for r in why:  # noqa: VEC001 aggregate filter rejection reasons
                     key = r if v2 else "hard_filter"
                     gate_stats[key] = gate_stats.get(key, 0) + 1
                 continue
@@ -1813,6 +1814,10 @@ class JobManager:
             concurrency = int(options.get("concurrency") or user_settings.get("openrouter_concurrency", 4))
             openrouter_max_dim = int(options.get("max_dim") or user_settings.get("openrouter_max_dim", 512))
             max_edge = int(user_settings.get("max_edge", 2048))
+            normalize_buckets = bool(user_settings.get("normalize_to_buckets", True))
+            active_buckets = resolve_buckets(
+                options.get("bucket_preset") or user_settings.get("export_bucket_preset", "4_buckets")
+            )
 
             def record_export(conn, frame_id: int, png: Path, merged_png: Path) -> None:
                 conn.execute(
@@ -1834,13 +1839,15 @@ class JobManager:
                 raw_img = cv2.imread(str(full_path))
                 if raw_img is None:
                     return None
-                # Same renderer as the exporter: crop, letterbox, watermark, max_edge, multiples of 16
+                # Same renderer as the exporter: crop, letterbox, watermark, 1MP center-crop bucket normalization
                 return render_export_image(
                     raw_img,
                     crop=item.get("crop"),
                     letterbox=video.get("letterbox"),
                     watermark_rect=video.get("watermark_rect"),
                     max_edge=max_edge,
+                    normalize_buckets=normalize_buckets,
+                    buckets=active_buckets,
                 )
 
             def reusable_caption(item: dict[str, Any], out_txt: Path) -> str:
@@ -1893,7 +1900,12 @@ class JobManager:
                         # kept without re-billing. Exporter stubs and captions cut off mid-sentence get replaced.
                         caption_text = reusable_caption(item, out_txt)
                         if caption_text:
-                            if not out_png.is_file():
+                            existing_png = cv2.imread(str(out_png)) if out_png.is_file() else None
+                            needs_render = existing_png is None or (
+                                normalize_buckets
+                                and (existing_png.shape[1], existing_png.shape[0]) not in active_buckets
+                            )
+                            if needs_render:
                                 img = render_frame(item)
                                 if img is None:
                                     return None
@@ -2001,6 +2013,7 @@ class JobManager:
                                 "timestamp_s": item["t"],
                                 "width": w,
                                 "height": h,
+                                "bucket": f"{w}x{h}",
                                 "caption": caption_text,
                                 "model": caption_model_used,
                                 "layer": layer_used,

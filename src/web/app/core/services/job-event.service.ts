@@ -18,6 +18,8 @@ export interface ToastNotification {
   persistent?: boolean;
 }
 
+type JobEventData = NonNullable<JobSSEMessage['data']>;
+
 @Injectable({
   providedIn: 'root',
 })
@@ -45,90 +47,7 @@ export class JobEventService {
 
     this.eventSource.onmessage = (event) => {
       try {
-        const msg: JobSSEMessage = JSON.parse(event.data);
-        if (msg.type === 'connected') {
-          this.connectionState.set('connected');
-          return;
-        }
-        const d = msg.data;
-        if (!d) return;
-
-        if (msg.type === 'tags_updated') {
-          this.tagsUpdated.set({ videoId: d.video_id != null ? String(d.video_id) : null, at: Date.now() });
-          return;
-        }
-
-        if (
-          msg.type === 'job_queued' ||
-          msg.type === 'job_started' ||
-          msg.type === 'job_progress'
-        ) {
-          this.activeJobs.update((jobs) => {
-            const next = new Map(jobs);
-            next.set(d.job_id, {
-              job_id: d.job_id,
-              video_id: d.video_id,
-              video_name: d.video_name || 'Video',
-              chunk_id: d.chunk_id,
-              progress: d.progress || 0,
-              step: d.step || 'Processing',
-              type: d.job_type || d.type || '',
-            });
-            return next;
-          });
-        } else if (msg.type === 'job_finished') {
-          const finishedJob = this.activeJobs().get(d.job_id);
-          const isCaption = (d as any).exported !== undefined || finishedJob?.type === 'openrouter_caption';
-
-          this.activeJobs.update((jobs) => {
-            const next = new Map(jobs);
-            next.delete(d.job_id);
-            return next;
-          });
-
-          const isTagging = (d as any).suggested !== undefined || finishedJob?.type === 'tag_suggest';
-          if (isTagging) {
-            this.showToast(
-              'Auto-Tagging Complete',
-              `${(d as any).suggested ?? 0} tag suggestions for ${d.video_name || 'Video'}.`,
-              d.video_id,
-              false,
-              { label: 'Review in Curate', tab: 'curate', videoId: d.video_id }
-            );
-          } else if (isCaption) {
-            this.showToast(
-              'Captioning Complete',
-              `${d.video_name || 'Video'} has finished batch captioning!`,
-              d.video_id,
-              false,
-              { label: 'View Dataset', tab: 'dataset', videoId: d.video_id }
-            );
-          } else {
-            this.showToast(
-              'Extraction Complete',
-              `${d.video_name || 'Video'} has finished extracting candidates! Ready for curation.`,
-              d.video_id,
-              false,
-              { label: 'Start Curating', tab: 'curate', videoId: d.video_id }
-            );
-          }
-
-          if (onJobFinished) {
-            onJobFinished(String(d.video_id), d.video_name || 'Video');
-          }
-        } else if (msg.type === 'job_cancelled' || msg.type === 'job_error') {
-          this.activeJobs.update((jobs) => {
-            const next = new Map(jobs);
-            next.delete(d.job_id);
-            return next;
-          });
-
-          if (msg.type === 'job_error') {
-            this.showToast('Job Error', d.error || 'Extraction failed', null, true, null, true);
-          } else {
-            this.showToast('Job Cancelled', `Extraction cancelled for job #${d.job_id}`);
-          }
-        }
+        this.handleMessage(JSON.parse(event.data), onJobFinished);
       } catch (err) {
         console.error('SSE message parsing error:', err);
       }
@@ -138,6 +57,107 @@ export class JobEventService {
       this.connectionState.set('disconnected');
       console.warn('SSE connection error:', err);
     };
+  }
+
+  private handleMessage(msg: JobSSEMessage, onJobFinished?: (videoId: string, videoName: string) => void): void {
+    if (msg.type === 'connected') {
+      this.connectionState.set('connected');
+      return;
+    }
+    const d = msg.data;
+    if (!d) return;
+
+    if (msg.type === 'tags_updated') {
+      this.tagsUpdated.set({ videoId: d.video_id != null ? String(d.video_id) : null, at: Date.now() });
+      return;
+    }
+
+    this.dispatchJobEvent(msg.type, d, onJobFinished);
+  }
+
+  private dispatchJobEvent(
+    type: JobSSEMessage['type'],
+    d: JobEventData,
+    onJobFinished?: (videoId: string, videoName: string) => void
+  ): void {
+    if (type === 'job_queued' || type === 'job_started' || type === 'job_progress') {
+      this.upsertActiveJob(d);
+    } else if (type === 'job_finished') {
+      this.handleJobFinished(d, onJobFinished);
+    } else if (type === 'job_cancelled' || type === 'job_error') {
+      this.removeActiveJob(d.job_id);
+
+      if (type === 'job_error') {
+        this.showToast('Job Error', d.error || 'Extraction failed', null, true, null, true);
+      } else {
+        this.showToast('Job Cancelled', `Extraction cancelled for job #${d.job_id}`);
+      }
+    }
+  }
+
+  private upsertActiveJob(d: JobEventData): void {
+    this.activeJobs.update((jobs) => {
+      const next = new Map(jobs);
+      next.set(d.job_id, {
+        job_id: d.job_id,
+        video_id: d.video_id,
+        video_name: d.video_name || 'Video',
+        chunk_id: d.chunk_id,
+        progress: d.progress || 0,
+        step: d.step || 'Processing',
+        type: d.job_type || d.type || '',
+      });
+      return next;
+    });
+  }
+
+  private removeActiveJob(jobId: number): void {
+    this.activeJobs.update((jobs) => {
+      const next = new Map(jobs);
+      next.delete(jobId);
+      return next;
+    });
+  }
+
+  private handleJobFinished(d: JobEventData, onJobFinished?: (videoId: string, videoName: string) => void): void {
+    const finishedJob = this.activeJobs().get(d.job_id);
+    const isCaption = (d as any).exported !== undefined || finishedJob?.type === 'openrouter_caption';
+
+    this.removeActiveJob(d.job_id);
+
+    const isTagging = (d as any).suggested !== undefined || finishedJob?.type === 'tag_suggest';
+    this.showJobFinishedToast(d, isTagging, isCaption);
+
+    if (onJobFinished) {
+      onJobFinished(String(d.video_id), d.video_name || 'Video');
+    }
+  }
+
+  private showJobFinishedToast(d: JobEventData, isTagging: boolean, isCaption: boolean): void {
+    const name = d.video_name || 'Video';
+    if (isTagging) {
+      this.showToast(
+        'Auto-Tagging Complete',
+        `${(d as any).suggested ?? 0} tag suggestions for ${name}.`,
+        d.video_id,
+        false,
+        { label: 'Review in Curate', tab: 'curate', videoId: d.video_id }
+      );
+    } else if (isCaption) {
+      this.showToast('Captioning Complete', `${name} has finished batch captioning!`, d.video_id, false, {
+        label: 'View Dataset',
+        tab: 'dataset',
+        videoId: d.video_id,
+      });
+    } else {
+      this.showToast(
+        'Extraction Complete',
+        `${name} has finished extracting candidates! Ready for curation.`,
+        d.video_id,
+        false,
+        { label: 'Start Curating', tab: 'curate', videoId: d.video_id }
+      );
+    }
   }
 
   async cancelJob(jobId: number): Promise<void> {

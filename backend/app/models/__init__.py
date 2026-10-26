@@ -1,0 +1,36 @@
+"""Domain models for Captioning Pipeline & LoRA Dataset Studio."""
+from backend.app.models.domain import (
+    ClusterAssignment,
+    ClusterRecord,
+    CurationState,
+    ExtractionConfig,
+    ExtractionMode,
+    FrameExtractType,
+    MediaFingerprint,
+    MediaItemRecord,
+    QualityScoreResult,
+    QualityWeights,
+    StratificationResult,
+    Tag,
+    TagCategory,
+    TagSource,
+    VideoMetadata,
+)
+
+__all__ = [
+    "ClusterAssignment",
+    "ClusterRecord",
+    "CurationState",
+    "ExtractionConfig",
+    "ExtractionMode",
+    "FrameExtractType",
+    "MediaFingerprint",
+    "MediaItemRecord",
+    "QualityScoreResult",
+    "QualityWeights",
+    "StratificationResult",
+    "Tag",
+    "TagCategory",
+    "TagSource",
+    "VideoMetadata",
+]

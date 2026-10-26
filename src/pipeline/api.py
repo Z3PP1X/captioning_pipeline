@@ -43,6 +43,7 @@ from pipeline.learned_weights import (
     log_curation_events,
     state_action,
 )
+from pipeline.moss_routes import build_moss_router
 from pipeline.openrouter import DEFAULT_CAPTION_MAX_TOKENS
 from pipeline.rag import (
     CHARACTERS,
@@ -53,6 +54,9 @@ from pipeline.rag import (
     RagPromptGenerator,
     RagRetriever,
     RagUpstreamError,
+    expand_moss_prompt,
+    index_moss_caption,
+    retrieve_moss_exemplars,
 )
 from pipeline.profiles import PROFILES, apply_character_profile, caption_mode_for, video_profile
 from pipeline.reconcile import get_video_scenes_caption_stats, reconcile_captions_and_state
@@ -105,6 +109,7 @@ app.add_middleware(
 
 # Learn-as-you-tag image tagging (registered before the SPA catch-all at the end of this module)
 app.include_router(build_tag_router(jobs.image_tags, jobs))
+app.include_router(build_moss_router(db, settings))
 
 
 @app.exception_handler(JobConflictError)
@@ -2201,6 +2206,131 @@ def get_rag_preview(caption_id: int):
         if not full_path.is_file():
             raise HTTPException(status_code=404, detail="Image file not found on disk")
         return FileResponse(full_path, media_type=RAG_PREVIEW_MEDIA.get(full_path.suffix.lower(), "image/png"))
+
+
+class MossExpandPromptRequest(BaseModel):
+    idea: str
+    dataset_id: str | None = None
+    video_id: str | None = None
+    mode: str = "CHARACTER"
+    trigger_phrase: str = ""
+    class_noun: str = "woman"
+    locked_traits: list[str] | None = None
+    use_llm: bool = False
+    openrouter_key: str | None = None
+
+
+class MossIndexCaptionItem(BaseModel):
+    frame_id: int
+    video_id: str = ""
+    trigger: str = ""
+    mode: str = "CHARACTER"
+    long: str = ""
+    medium: str = ""
+    short: str = ""
+    tags: list[str] = Field(default_factory=list)
+    embedding: list[float] | None = None
+
+
+class MossIndexRequest(BaseModel):
+    captions: list[MossIndexCaptionItem] | None = None
+    video_id: str | None = None
+    reindex_all: bool = False
+
+
+@app.post("/api/rag/expand-prompt")
+def expand_moss_prompt_endpoint(req: MossExpandPromptRequest):
+    video_id = req.dataset_id or req.video_id
+    api_key = req.openrouter_key or _openrouter_key(None)
+    return expand_moss_prompt(
+        db=db,
+        idea=req.idea,
+        video_id_or_dataset=video_id,
+        mode=req.mode or "CHARACTER",
+        trigger_phrase=req.trigger_phrase or "",
+        class_noun=req.class_noun or "woman",
+        locked_traits=req.locked_traits,
+        use_llm=req.use_llm,
+        openrouter_key=api_key,
+    )
+
+
+def _index_provided_captions(database: DB, captions: list[MossIndexCaptionItem]) -> int:
+    count = 0
+    for c in captions:
+        emb = np.array(c.embedding, dtype=np.float32) if c.embedding else None
+        index_moss_caption(
+            db=database,
+            frame_id=c.frame_id,
+            video_id=c.video_id,
+            trigger=c.trigger,
+            mode=c.mode,
+            long=c.long,
+            medium=c.medium,
+            short=c.short,
+            tags=c.tags,
+            embedding=emb,
+        )
+        count += 1
+    return count
+
+
+def _index_existing_db_captions(database: DB, video_id: str | None) -> int:
+    count = 0
+    where_clause = "WHERE video_id=?" if video_id else ""
+    args = (video_id,) if video_id else ()
+    rows = database.all(
+        f"SELECT frame_id, video_id, text, trigger, mode, caption_long, caption_medium, caption_short FROM captions {where_clause}",
+        args,
+    )
+    for r in rows:
+        long_c = str(r.get("caption_long") or r.get("text") or "")
+        med_c = str(r.get("caption_medium") or r.get("text") or "")
+        short_c = str(r.get("caption_short") or r.get("text") or "")
+        index_moss_caption(
+            db=database,
+            frame_id=int(r["frame_id"]),
+            video_id=str(r.get("video_id") or ""),
+            trigger=str(r.get("trigger") or ""),
+            mode=str(r.get("mode") or "CHARACTER"),
+            long=long_c,
+            medium=med_c,
+            short=short_c,
+            tags=[],
+        )
+        count += 1
+    return count
+
+
+@app.post("/api/rag/index-moss")
+def index_moss_endpoint(req: MossIndexRequest | None = None):
+    req = req or MossIndexRequest()
+    if req.captions:
+        count = _index_provided_captions(db, req.captions)
+    else:
+        count = _index_existing_db_captions(db, req.video_id)
+    return {"status": "ok", "indexed_count": count}
+
+
+@app.get("/api/rag/exemplars")
+def get_moss_exemplars_endpoint(
+    query: str = Query(default="", description="Search query or idea"),
+    idea: str | None = Query(default=None, description="Alias for query"),
+    video_id: str | None = None,
+    dataset_id: str | None = None,
+    mode: str | None = None,
+    top_k: int = Query(default=3, ge=1, le=50),
+):
+    q = query or idea or ""
+    vid = video_id or dataset_id
+    exemplars = retrieve_moss_exemplars(
+        db=db,
+        query_text=q,
+        top_k=top_k,
+        video_id=vid,
+        mode=mode,
+    )
+    return {"exemplars": exemplars, "count": len(exemplars), "query": q}
 
 
 # ----------------------------------------------------------------------------- Static Web

@@ -819,7 +819,7 @@ class ImageTagEngine:
             for m in models:
                 scores = m.score(flat).reshape(len(scored_ids), n_win)
                 best = scores.max(axis=1)
-                for idx in np.nonzero(best >= floor)[0]:
+                for idx in np.nonzero(best >= floor)[0]:  # noqa: VEC001 tag candidate indices
                     fid = scored_ids[int(idx)]
                     if (fid, m.tag_id) in decided:
                         continue

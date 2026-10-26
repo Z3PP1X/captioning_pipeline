@@ -82,7 +82,7 @@ def compute_tier1_metrics(img_bgr: np.ndarray) -> dict:
     tiles: list[float] = []
     for y in range(4):
         y0, y1 = y * gh // 4, (y + 1) * gh // 4
-        for x in range(4):
+        for x in range(4):  # noqa: VEC001 4x4 macro-tile sharpness slicing
             x0, x1 = x * gw // 4, (x + 1) * gw // 4
             tiles.append(float(lap[y0:y1, x0:x1].var()))
     tile_sharp = float(np.mean(sorted(tiles)[-3:]))

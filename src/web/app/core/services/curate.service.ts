@@ -91,39 +91,7 @@ export class CurateService {
   async loadCandidates(videoId: string | number): Promise<void> {
     try {
       this.isLoading.set(true);
-      let rawPicks: CandidateFrame[] = [];
-      let rawRunners: CandidateFrame[] = [];
-      let distData: any = null;
-
-      try {
-        const res = await this.api.get<{
-          picks?: CandidateFrame[];
-          runners?: CandidateFrame[];
-          candidates?: CandidateFrame[];
-          chunks?: ChunkItem[];
-          distribution?: any;
-          stats?: any;
-        }>(`/api/videos/${videoId}/curation-300`);
-
-        rawPicks = res.picks || [];
-        rawRunners = res.runners || [];
-        distData = res.distribution || res.stats;
-        if (res.chunks && res.chunks.length > 0) {
-          this.curationChunks.set(res.chunks);
-        }
-      } catch (err) {
-        console.warn('curation-300 fetch failed, trying /candidates fallback:', err);
-        const fb = await this.api.get<{
-          frames?: CandidateFrame[];
-          candidates?: CandidateFrame[];
-          distribution?: any;
-          stats?: any;
-        }>(`/api/videos/${videoId}/candidates`);
-        const frames = fb.candidates || fb.frames || [];
-        rawPicks = frames.filter((f) => f.role === 'pick' || f.is_pick);
-        rawRunners = frames.filter((f) => f.role !== 'pick' && !f.is_pick);
-        distData = fb.distribution || fb.stats;
-      }
+      const { rawPicks, rawRunners, distData } = await this.fetchCurationData(videoId);
 
       const normalizedPicks = rawPicks.map((c) => this.normalizeFrame(c, true, videoId));
       const normalizedRunners = rawRunners.map((c) => this.normalizeFrame(c, false, videoId));
@@ -142,6 +110,39 @@ export class CurateService {
       this.distribution.set(null);
     } finally {
       this.isLoading.set(false);
+    }
+  }
+
+  /** `curation-300` (updating `curationChunks`), falling back to `/candidates` split by role. */
+  private async fetchCurationData(videoId: string | number): Promise<CurationData> {
+    try {
+      const res = await this.api.get<{
+        picks?: CandidateFrame[];
+        runners?: CandidateFrame[];
+        candidates?: CandidateFrame[];
+        chunks?: ChunkItem[];
+        distribution?: any;
+        stats?: any;
+      }>(`/api/videos/${videoId}/curation-300`);
+
+      if (res.chunks && res.chunks.length > 0) {
+        this.curationChunks.set(res.chunks);
+      }
+      return { rawPicks: res.picks || [], rawRunners: res.runners || [], distData: res.distribution || res.stats };
+    } catch (err) {
+      console.warn('curation-300 fetch failed, trying /candidates fallback:', err);
+      const fb = await this.api.get<{
+        frames?: CandidateFrame[];
+        candidates?: CandidateFrame[];
+        distribution?: any;
+        stats?: any;
+      }>(`/api/videos/${videoId}/candidates`);
+      const frames = fb.candidates || fb.frames || [];
+      return {
+        rawPicks: frames.filter((f) => f.role === 'pick' || f.is_pick),
+        rawRunners: frames.filter((f) => f.role !== 'pick' && !f.is_pick),
+        distData: fb.distribution || fb.stats,
+      };
     }
   }
 
@@ -176,14 +177,9 @@ export class CurateService {
       is_pick: isPick,
       role: isPick ? 'pick' : 'runner_up',
       time_s: c.t !== undefined ? c.t : (c.time_s || 0),
-      thumb_url: c.preview_url || c.thumb_url || `/api/frames/${c.id}/preview`,
-      preview_url: c.preview_url || `/api/frames/${c.id}/preview`,
-      full_url: c.full_url || `/api/frames/${c.id}/full`,
+      ...frameUrls(c),
       state: c.state || (isPick ? 'keep' : 'reject'),
-      target_person_sim: c.target_person_sim ?? c.zs_scores?.['target_person_sim'] ?? 0,
-      target_person_matched: Boolean(c.target_person_matched ?? c.zs_scores?.['target_person_matched']),
-      face_count: c.face_count ?? c.zs_scores?.['face_count'] ?? 0,
-      faces: c.faces ?? c.zs_scores?.['faces'] ?? [],
+      ...framePersonFields(c),
     };
   }
 
@@ -341,85 +337,137 @@ export class CurateService {
     distData: any,
     allCandidates: CandidateFrame[]
   ): void {
-    const multPct = distData?.multiple_pct ?? distData?.multiple_people?.pct ?? 0;
-    const soloPct = distData?.one_person_pct ?? distData?.one_person?.pct ?? 0;
-    const toolsPct = distData?.tools_equipment_pct ?? distData?.tools_equipment?.pct ?? 0;
-    const facePct = distData?.face_visible_pct ?? distData?.face_visible?.pct ?? 0;
-    const targetPct = distData?.target_person_pct ?? distData?.target_person?.pct ?? 0;
+    const selectedCount = allCandidates.filter(isSelected).length;
 
-    const selectedCount = allCandidates.filter((c) => c.state === 'keep' || (c.is_pick && c.state !== 'reject')).length;
-
-    this.distribution.set({
-      multiple_people: {
-        pct: Math.round(multPct),
-        target_pct: 50,
-      },
-      one_person: {
-        pct: Math.round(soloPct),
-        target_pct: 25,
-      },
-      tools_equipment: {
-        pct: Math.round(toolsPct),
-        target_pct: 20,
-      },
-      face_visible: {
-        pct: Math.round(facePct),
-        target_pct: 50,
-      },
-      target_person: {
-        pct: Math.round(targetPct),
-        target_pct: 75,
-      },
-      target_person_pct: Math.round(targetPct),
-      selected_count: selectedCount,
-      target_count: 300,
-    });
+    this.distribution.set(
+      buildDistribution(
+        {
+          multiple_people: distPct(distData, 'multiple_pct', 'multiple_people'),
+          one_person: distPct(distData, 'one_person_pct', 'one_person'),
+          tools_equipment: distPct(distData, 'tools_equipment_pct', 'tools_equipment'),
+          face_visible: distPct(distData, 'face_visible_pct', 'face_visible'),
+          target_person: distPct(distData, 'target_person_pct', 'target_person'),
+        },
+        selectedCount
+      )
+    );
   }
 
   private recalculateDistribution(): void {
     const list = this.candidates();
-    const selected = list.filter((c) => c.state === 'keep' || (c.is_pick && c.state !== 'reject'));
+    const selected = list.filter(isSelected);
     const total = selected.length || 1;
+    const pctOf = (match: (c: CandidateFrame) => boolean): number =>
+      (selected.filter(match).length / total) * 100;
 
-    let multCount = 0;
-    let soloCount = 0;
-    let toolsCount = 0;
-    let faceCount = 0;
-    let targetCount = 0;
-
-    for (const c of selected) {
-      const zs = c.zs_scores || c.metrics || {};
-      if ((zs['multiple_persons'] ?? 0) >= 0.45 || c.categories?.multiple_people) multCount++;
-      if ((zs['one_person'] ?? 0) >= 0.45 || c.categories?.one_person) soloCount++;
-      if (Math.max(zs['tools'] ?? 0, zs['equipment'] ?? 0) >= 0.45 || c.categories?.tools_equipment) toolsCount++;
-      if ((zs['face_score'] ?? 0) >= 0.50 || zs['face_visible_50pct'] || c.categories?.face_visible) faceCount++;
-      if (c.target_person_matched || (c.target_person_sim ?? 0) >= 0.363) targetCount++;
-    }
-
-    this.distribution.set({
-      multiple_people: {
-        pct: Math.round((multCount / total) * 100),
-        target_pct: 50,
-      },
-      one_person: {
-        pct: Math.round((soloCount / total) * 100),
-        target_pct: 25,
-      },
-      tools_equipment: {
-        pct: Math.round((toolsCount / total) * 100),
-        target_pct: 20,
-      },
-      face_visible: {
-        pct: Math.round((faceCount / total) * 100),
-        target_pct: 50,
-      },
-      target_person: {
-        pct: Math.round((targetCount / total) * 100),
-        target_pct: 75,
-      },
-      target_person_pct: Math.round((targetCount / total) * 100),
-      selected_count: selected.length,
-      target_count: 300,
-    });
+    this.distribution.set(
+      buildDistribution(
+        {
+          multiple_people: pctOf(isMultiplePeople),
+          one_person: pctOf(isOnePerson),
+          tools_equipment: pctOf(hasToolsEquipment),
+          face_visible: pctOf(isFaceVisible),
+          target_person: pctOf(isTargetPerson),
+        },
+        selected.length
+      )
+    );
   }
+}
+
+interface CurationData {
+  rawPicks: CandidateFrame[];
+  rawRunners: CandidateFrame[];
+  distData: any;
+}
+
+type DistributionCategory = 'multiple_people' | 'one_person' | 'tools_equipment' | 'face_visible' | 'target_person';
+
+/** Target share (%) of every distribution category. */
+const DISTRIBUTION_TARGETS: Record<DistributionCategory, number> = {
+  multiple_people: 50,
+  one_person: 25,
+  tools_equipment: 20,
+  face_visible: 50,
+  target_person: 75,
+};
+
+function frameUrls(c: CandidateFrame): Pick<CandidateFrame, 'thumb_url' | 'preview_url' | 'full_url'> {
+  return {
+    thumb_url: c.preview_url || c.thumb_url || `/api/frames/${c.id}/preview`,
+    preview_url: c.preview_url || `/api/frames/${c.id}/preview`,
+    full_url: c.full_url || `/api/frames/${c.id}/full`,
+  };
+}
+
+/** Person/face fields, falling back to the zero-shot score bag. */
+function framePersonFields(
+  c: CandidateFrame
+): Pick<CandidateFrame, 'target_person_sim' | 'target_person_matched' | 'face_count' | 'faces'> {
+  return { ...frameTargetFields(c), ...frameFaceFields(c) };
+}
+
+function frameTargetFields(c: CandidateFrame): Pick<CandidateFrame, 'target_person_sim' | 'target_person_matched'> {
+  return {
+    target_person_sim: c.target_person_sim ?? c.zs_scores?.['target_person_sim'] ?? 0,
+    target_person_matched: Boolean(c.target_person_matched ?? c.zs_scores?.['target_person_matched']),
+  };
+}
+
+function frameFaceFields(c: CandidateFrame): Pick<CandidateFrame, 'face_count' | 'faces'> {
+  return {
+    face_count: c.face_count ?? c.zs_scores?.['face_count'] ?? 0,
+    faces: c.faces ?? c.zs_scores?.['faces'] ?? [],
+  };
+}
+
+/** Kept explicitly, or a pick that was not rejected. */
+function isSelected(c: CandidateFrame): boolean {
+  return c.state === 'keep' || (c.is_pick && c.state !== 'reject');
+}
+
+function zsOf(c: CandidateFrame): Record<string, any> {
+  return c.zs_scores || c.metrics || {};
+}
+
+function isMultiplePeople(c: CandidateFrame): boolean {
+  return (zsOf(c)['multiple_persons'] ?? 0) >= 0.45 || !!c.categories?.multiple_people;
+}
+
+function isOnePerson(c: CandidateFrame): boolean {
+  return (zsOf(c)['one_person'] ?? 0) >= 0.45 || !!c.categories?.one_person;
+}
+
+function hasToolsEquipment(c: CandidateFrame): boolean {
+  const zs = zsOf(c);
+  return Math.max(zs['tools'] ?? 0, zs['equipment'] ?? 0) >= 0.45 || !!c.categories?.tools_equipment;
+}
+
+function isFaceVisible(c: CandidateFrame): boolean {
+  const zs = zsOf(c);
+  return (zs['face_score'] ?? 0) >= 0.50 || !!zs['face_visible_50pct'] || !!c.categories?.face_visible;
+}
+
+function isTargetPerson(c: CandidateFrame): boolean {
+  return !!c.target_person_matched || (c.target_person_sim ?? 0) >= 0.363;
+}
+
+/** `distData.<flatKey>` (e.g. `multiple_pct`), else `distData.<nestedKey>.pct`, else 0. */
+function distPct(distData: any, flatKey: string, nestedKey: DistributionCategory): number {
+  return distData?.[flatKey] ?? distData?.[nestedKey]?.pct ?? 0;
+}
+
+/** Builds the curation distribution from raw (unrounded) category percentages. */
+function buildDistribution(pcts: Record<DistributionCategory, number>, selectedCount: number): CurationDistribution {
+  const entry = (key: DistributionCategory) => ({ pct: Math.round(pcts[key]), target_pct: DISTRIBUTION_TARGETS[key] });
+  return {
+    multiple_people: entry('multiple_people'),
+    one_person: entry('one_person'),
+    tools_equipment: entry('tools_equipment'),
+    face_visible: entry('face_visible'),
+    target_person: entry('target_person'),
+    target_person_pct: Math.round(pcts.target_person),
+    selected_count: selectedCount,
+    target_count: 300,
+  };
 }

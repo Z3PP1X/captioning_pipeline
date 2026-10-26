@@ -6,15 +6,18 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import pytest
 
 from pipeline.config import Settings
 from pipeline.db import DB
-from pipeline.export import Exporter, clamp_max_edge, snap_to_multiple_of_16
+from pipeline.export import (
+    BUCKETS_1MP_4,
+    Exporter,
+    clamp_max_edge,
+    render_export_image,
+    snap_to_multiple_of_16,
+)
 from pipeline.metrics import (
-    compute_phash,
     compute_tier1_metrics,
-    filter_and_rank_tier1,
     hard_filter_check,
     phash_hamming_distance,
 )
@@ -70,10 +73,11 @@ def test_clamp_max_edge():
 
 def test_mmr_selection():
     # Create 5 synthetic candidates
+    rng = np.random.default_rng(42)
     candidates = []
     for i in range(10):
         # Synthetic unit embedding
-        emb = np.random.randn(512).astype(np.float32)
+        emb = rng.standard_normal(512).astype(np.float32)
         emb /= np.linalg.norm(emb)
         candidates.append({
             "t": float(i * 2.0),
@@ -170,6 +174,37 @@ def test_export_pipeline():
         pngs_merged = list(merged_dir.glob("*.png"))
         assert len(pngs_merged) == 1
         assert (merged_dir / "manifest.jsonl").exists()
+        exported_bgr = cv2.imread(str(pngs_pv[0]))
+        assert exported_bgr is not None
+        assert (exported_bgr.shape[1], exported_bgr.shape[0]) == (1344, 768)
+
+
+def test_export_normalizes_5px_crop_variations_to_max_4_1mp_buckets():
+    """Verify crops differing by ~5px normalize to at most 4 1MP portrait/landscape buckets via center crop."""
+    raw_landscape = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    raw_portrait = np.zeros((1920, 1080, 3), dtype=np.uint8)
+
+    # 8 slightly different crops (differing by ~5px in pixel space) across 4 orientations
+    crops_and_sources = [
+        (raw_landscape, {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0}),
+        (raw_landscape, {"x": 0.002, "y": 0.004, "width": 0.995, "height": 0.992}),
+        (raw_landscape, {"x": 0.12, "y": 0.0, "width": 0.75, "height": 1.0}),
+        (raw_landscape, {"x": 0.123, "y": 0.003, "width": 0.745, "height": 0.994}),
+        (raw_portrait, {"x": 0.0, "y": 0.12, "width": 1.0, "height": 0.75}),
+        (raw_portrait, {"x": 0.003, "y": 0.123, "width": 0.994, "height": 0.745}),
+        (raw_portrait, {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0}),
+        (raw_portrait, {"x": 0.004, "y": 0.002, "width": 0.992, "height": 0.995}),
+    ]
+
+    output_buckets: set[tuple[int, int]] = set()
+    for src_img, crop_rect in crops_and_sources:
+        rendered = render_export_image(src_img, crop=crop_rect)
+        assert rendered is not None
+        h, w = rendered.shape[:2]
+        output_buckets.add((w, h))
+
+    assert len(output_buckets) == 4
+    assert output_buckets == set(BUCKETS_1MP_4)
 
 
 def test_concurrent_job_manager():

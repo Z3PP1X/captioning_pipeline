@@ -51,3 +51,9 @@ dist/
 *.legacy.html
 *.legacy.css
 
+
+# UX gate (Playwright / Lighthouse CI artefacts, frontend facade symlink)
+frontend/node_modules
+frontend/test-results/
+frontend/playwright-report/
+frontend/.lighthouseci/

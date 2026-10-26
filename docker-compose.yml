@@ -1,31 +1,49 @@
+# ==============================================================================
+# Krea 2 LoRA Dataset Curation & Captioning Studio — docker-compose.yml
+# Optimized for Windows 11 + WSL2 Bind Mounts & Linux Native Volume Performance
+# ==============================================================================
+
 services:
-  captioning-pipeline:
+  backend:
     build:
       context: .
-      dockerfile: Dockerfile
-    image: captioning-pipeline:latest
-    container_name: captioning-pipeline
+      dockerfile: Dockerfile.backend
+    image: krea2-captioning-backend:latest
+    container_name: krea2-captioning-backend
     restart: unless-stopped
     ports:
-      - "${PORT:-8000}:8000"
+      - "${BACKEND_PORT:-8000}:8000"
     environment:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
-      - CP_VIDEO_DIR=${CP_VIDEO_DIR:-/videos}
-      - CP_CACHE_DIR=${CP_CACHE_DIR:-/cache}
-      - CP_FINISHED_DIR=${CP_FINISHED_DIR:-/finished}
-      - CP_MODELS_DIR=/app/models
+      - PIPELINE_APPDATA_DIR=/var/lib/captioning_pipeline
+      - PIPELINE_INPUT_DIR=/data/input
+      - PIPELINE_EXPORT_DIR=/data/exports
+      - PRIMARY_MODEL=${PRIMARY_MODEL:-google/gemini-2.5-pro}
+      - FALLBACK_MODEL_1=${FALLBACK_MODEL_1:-qwen/qwen-2.5-vl-72b-instruct}
+      - FALLBACK_MODEL_2=${FALLBACK_MODEL_2:-meta-llama/llama-3.2-90b-vision-instruct}
     volumes:
-      # Video source directory: Windows host path C:\Users\Patri\Videos\_girls
-      - "${VIDEO_DIR:-/mnt/c/Users/Patri/Videos/_girls}:/videos:ro"
-      - "${VIDEO_DIR:-/mnt/c/Users/Patri/Videos/_girls}:/mnt/c/Users/Patri/Videos/_girls:ro"
+      # 1. WSL2 Host Media Bind-Mounts (Sequential Read/Write Only)
+      # Maps HOST_MEDIA_ROOT (e.g., /mnt/c/Users/.../lora_raw_data or /home/user/data)
+      - "${HOST_MEDIA_ROOT:-./data/input}:/data/input:ro"
+      - "${HOST_EXPORT_ROOT:-${HOST_MEDIA_ROOT:-./data}/exports}:/data/exports:rw"
 
-      # Persistent cache & database (state.db, filmstrips, previews)
-      - "${CACHE_DIR:-/home/z3pp1x/.cache/captioning_pipeline}:/cache"
-      - "${CACHE_DIR:-/home/z3pp1x/.cache/captioning_pipeline}:/root/.cache/captioning_pipeline"
+      # 2. Named Docker Volume on Native Linux ext4 Filesystem (CRITICAL for WSL2!)
+      # Stores SQLite WAL database (state.db), 384px WebP thumbnails, extracted temporary
+      # video frames, and RAG TF-IDF/SVD indices to bypass the Windows /mnt/c 9P bottleneck.
+      - pipeline_appdata:/var/lib/captioning_pipeline
 
-      # Finished dataset export directory
-      - "${FINISHED_DIR:-/mnt/c/Users/Patri/Documents/captioning_pipeline/data/finished}:/finished"
-      - "${FINISHED_DIR:-/mnt/c/Users/Patri/Documents/captioning_pipeline/data/finished}:/mnt/c/Users/Patri/Documents/captioning_pipeline/data/finished"
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    image: krea2-captioning-frontend:latest
+    container_name: krea2-captioning-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "${FRONTEND_PORT:-4200}:80"
 
-      # Gemini taxonomy & skills context (optional)
-      - "${GEMINI_SKILLS_DIR:-/home/z3pp1x/.gemini/config/skills}:/root/.gemini/config/skills:ro"
+volumes:
+  pipeline_appdata:
+    driver: local

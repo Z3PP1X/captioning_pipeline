@@ -34,6 +34,38 @@ function isSet(v: number | null | undefined): v is number {
   return v !== null && v !== undefined && !(typeof v === 'number' && Number.isNaN(v));
 }
 
+/** Type/integer/range message for one knob, or null when the value is empty or valid. */
+function fieldError(key: ReselectField, v: number | null | undefined): string | null {
+  if (v === null || v === undefined) return null;
+  const rule = RESELECT_RULES[key];
+  if (typeof v !== 'number' || !Number.isFinite(v)) return `${rule.label} must be a number.`;
+  if (rule.integer && !Number.isInteger(v)) return `${rule.label} must be a whole number.`;
+  if (v < rule.min || v > rule.max) return `${rule.label} must be between ${rule.min} and ${rule.max}.`;
+  return null;
+}
+
+/** Floor above cap (only when both knobs are individually valid). */
+function floorCapError(
+  model: ReselectFormModel,
+  errors: Partial<Record<ReselectField, string>>,
+): string | null {
+  const { per_chunk_floor: floor, per_chunk_cap: cap } = model;
+  if (errors.per_chunk_floor || errors.per_chunk_cap) return null;
+  return isSet(floor) && isSet(cap) && floor > cap ? 'Per-chunk cap must be at least the floor.' : null;
+}
+
+/** Floors of all chunks above the target (only when both knobs are individually valid). */
+function floorTargetError(
+  model: ReselectFormModel,
+  errors: Partial<Record<ReselectField, string>>,
+  chunkCount: number,
+): string | null {
+  const { per_chunk_floor: floor, target_count: target } = model;
+  if (errors.per_chunk_floor || errors.target_count) return null;
+  if (!isSet(floor) || !isSet(target) || chunkCount <= 0 || floor * chunkCount <= target) return null;
+  return `A floor of ${floor} in ${chunkCount} chunks needs at least ${floor * chunkCount} picks (target ${target}).`;
+}
+
 /**
  * One message per invalid field (empty object = valid). Mirrors the server's 422 ranges and the obvious 400
  * cases (floor above cap, floors of all chunks above the target) so most infeasible knobs never reach the API.
@@ -44,24 +76,13 @@ export function reselectFormErrors(
 ): Partial<Record<ReselectField, string>> {
   const errors: Partial<Record<ReselectField, string>> = {};
   for (const key of RESELECT_FIELDS) {
-    const v = model[key];
-    if (v === null || v === undefined) continue;
-    const rule = RESELECT_RULES[key];
-    if (typeof v !== 'number' || !Number.isFinite(v)) {
-      errors[key] = `${rule.label} must be a number.`;
-    } else if (rule.integer && !Number.isInteger(v)) {
-      errors[key] = `${rule.label} must be a whole number.`;
-    } else if (v < rule.min || v > rule.max) {
-      errors[key] = `${rule.label} must be between ${rule.min} and ${rule.max}.`;
-    }
+    const message = fieldError(key, model[key]);
+    if (message) errors[key] = message;
   }
-  const { per_chunk_floor: floor, per_chunk_cap: cap, target_count: target } = model;
-  if (!errors.per_chunk_floor && !errors.per_chunk_cap && isSet(floor) && isSet(cap) && floor > cap) {
-    errors.per_chunk_cap = 'Per-chunk cap must be at least the floor.';
-  }
-  if (!errors.per_chunk_floor && !errors.target_count && isSet(floor) && isSet(target) && chunkCount > 0 && floor * chunkCount > target) {
-    errors.per_chunk_floor = `A floor of ${floor} in ${chunkCount} chunks needs at least ${floor * chunkCount} picks (target ${target}).`;
-  }
+  const capError = floorCapError(model, errors);
+  if (capError) errors.per_chunk_cap = capError;
+  const floorError = floorTargetError(model, errors, chunkCount);
+  if (floorError) errors.per_chunk_floor = floorError;
   return errors;
 }
 
@@ -107,8 +128,8 @@ export function buildAxisCaps(caps: AxisCapsModel): Partial<Record<ReselectAxis,
   return out;
 }
 
-/** Toast copy for a finished reselect. */
-export function formatReselectSummary(report: ReselectReport): { title: string; message: string; isWarning: boolean } {
+/** Comma-separated count parts of the reselect toast. */
+function reselectSummaryParts(report: ReselectReport): string[] {
   const parts = [
     `${report.promoted?.length ?? 0} promoted`,
     `${report.demoted?.length ?? 0} demoted`,
@@ -118,10 +139,21 @@ export function formatReselectSummary(report: ReselectReport): { title: string; 
   if (report.cross_dataset?.enabled && report.cross_dataset.blocked) {
     parts.push(`${report.cross_dataset.blocked} already in the dataset from other videos`);
   }
+  const capsPart = axisOverflowPart(report);
+  if (capsPart) parts.push(capsPart);
+  return parts;
+}
+
+/** "caps exceeded for ..." when any axis cap overflowed, else null. */
+function axisOverflowPart(report: ReselectReport): string | null {
   const overflow = Object.entries(report.axis_caps ?? {}).filter(([, a]) => (a?.overflow ?? 0) > 0);
-  if (overflow.length) {
-    parts.push(`caps exceeded for ${overflow.map(([axis]) => AXIS_LABELS[axis as ReselectAxis] ?? axis).join(', ')}`);
-  }
+  if (!overflow.length) return null;
+  return `caps exceeded for ${overflow.map(([axis]) => AXIS_LABELS[axis as ReselectAxis] ?? axis).join(', ')}`;
+}
+
+/** Toast copy for a finished reselect. */
+export function formatReselectSummary(report: ReselectReport): { title: string; message: string; isWarning: boolean } {
+  const parts = reselectSummaryParts(report);
   let message = `${report.picks_count} of ${report.target_count} picks: ${parts.join(', ')}.`;
   if (report.shortfall > 0) {
     message += ` Shortfall: ${report.shortfall} - not enough eligible frames for the target.`;

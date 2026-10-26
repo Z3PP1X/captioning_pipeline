@@ -193,26 +193,33 @@ export function settingsFromForm(model: SettingsFormModel): PipelineSettings {
   };
 }
 
+/** The dialog's defaults for settings that are missing from the stored settings. */
+const SETTINGS_FORM_DEFAULTS: Readonly<SettingsFormModel> = {
+  default_k: 5,
+  default_rule: 'person',
+  sample_fps: 4.0,
+  survivor_frac: 0.5,
+  trigger_word: '',
+  max_edge: 2048,
+  snap_to_cuts: true,
+  snap_window_s: 1.5,
+  tag_suggest_min_score: 0.5,
+  dhash_dedup_max_distance: 4,
+  auto_suggest_tags: true,
+  quality_v2: true,
+  window_peak_sampling: true,
+  reuse_analysis_cache: true,
+  rag_auto_reindex: true,
+  cut_detector: 'content',
+  selection_embedder: 'clip',
+  iqa_model: 'off',
+};
+
 /** Form model from the stored settings, with the dialog's defaults for missing values. */
 export function settingsToForm(s: Partial<PipelineSettings>): SettingsFormModel {
-  return {
-    default_k: s.default_k ?? 5,
-    default_rule: s.default_rule ?? 'person',
-    sample_fps: s.sample_fps ?? 4.0,
-    survivor_frac: s.survivor_frac ?? 0.5,
-    trigger_word: s.trigger_word ?? '',
-    max_edge: s.max_edge ?? 2048,
-    snap_to_cuts: s.snap_to_cuts ?? true,
-    snap_window_s: s.snap_window_s ?? 1.5,
-    tag_suggest_min_score: s.tag_suggest_min_score ?? 0.5,
-    dhash_dedup_max_distance: s.dhash_dedup_max_distance ?? 4,
-    auto_suggest_tags: s.auto_suggest_tags ?? true,
-    quality_v2: s.quality_v2 ?? true,
-    window_peak_sampling: s.window_peak_sampling ?? true,
-    reuse_analysis_cache: s.reuse_analysis_cache ?? true,
-    rag_auto_reindex: s.rag_auto_reindex ?? true,
-    cut_detector: s.cut_detector ?? 'content',
-    selection_embedder: s.selection_embedder ?? 'clip',
-    iqa_model: s.iqa_model ?? 'off',
-  };
+  const form: Record<string, unknown> = {};
+  for (const key of Object.keys(SETTINGS_FORM_DEFAULTS) as (keyof SettingsFormModel)[]) {
+    form[key] = s[key] ?? SETTINGS_FORM_DEFAULTS[key];
+  }
+  return form as unknown as SettingsFormModel;
 }

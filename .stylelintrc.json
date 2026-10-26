@@ -1,0 +1,24 @@
+{
+  "$comment": "UX gate - design-system discipline. Literal hex colours only in src/web/styles/_tokens.css; margin/padding/gap only on the 4px/8px grid (var(--space-1..8), 0, auto or 0.25rem multiples); no !important.",
+  "ignoreFiles": ["**/dist/**", "**/node_modules/**", "**/.angular/**"],
+  "rules": {
+    "color-no-hex": true,
+    "declaration-no-important": true,
+    "declaration-property-value-allowed-list": {
+      "/^(margin|padding)(-(top|right|bottom|left|inline|block)(-(start|end))?)?$/": [
+        "/^(?:(?:0|auto|inherit|initial|unset|var\\(--space-[1-8]\\)|-?(?:\\d+(?:\\.(?:0|00|25|5|50|75))?|\\.(?:25|5|50|75))rem)(?:\\s+|$))+$/"
+      ],
+      "/^(gap|row-gap|column-gap|grid-gap)$/": [
+        "/^(?:(?:0|normal|inherit|initial|unset|var\\(--space-[1-8]\\)|(?:\\d+(?:\\.(?:0|00|25|5|50|75))?|\\.(?:25|5|50|75))rem)(?:\\s+|$))+$/"
+      ]
+    }
+  },
+  "overrides": [
+    {
+      "files": ["**/styles/_tokens.css"],
+      "rules": {
+        "color-no-hex": null
+      }
+    }
+  ]
+}

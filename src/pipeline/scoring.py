@@ -153,7 +153,7 @@ class ScoringEngine:
 
             # 3-7. Semantic dimensions via two-probe sigmoid contrast
             scores: dict[str, float] = {}
-            for dim, (p_vec, n_vec) in prompt_vecs.items():
+            for dim, (p_vec, n_vec) in prompt_vecs.items():  # noqa: VEC001 prompt probes
                 pos_sim = float(np.dot(emb, p_vec))
                 neg_sim = float(np.dot(emb, n_vec))
                 # Logit difference scaled by temperature 10.0

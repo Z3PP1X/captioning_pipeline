@@ -1,151 +1,45 @@
-# Captioning Pipeline
+# Krea 2 LoRA Dataset Curation & Captioning Studio
 
-A high-throughput video processing, frame extraction, quality scoring, curation, and VLM captioning pipeline designed for building high-quality LoRA and generative model training datasets.
-
----
-
-## Features
-
-- **Video Ingestion & Indexing**: Scans directories, extracts metadata, builds lightweight proxies, and indexes videos into SQLite.
-- **Scene Chunking & Budgeting**: Auto-segments long videos into balanced chunks with per-scene frame sampling budgets.
-- **Frame Extraction & Metric Scoring**: Fast PyAV video decoding with sharpness, motion, blur, and aesthetic metrics.
-- **Quality Control & ONNX Classification**: Built-in ONNX Runtime (CPU) with `Xenova/clip-vit-base-patch32` for automated zero-shot visual scoring and MMR diversification.
-- **Vision-Language Captioning**: Batch and streaming caption generation via OpenRouter API targeting Google Gemma 4 31B IT (with fallback cascade to DeepSeek and Grok).
-- **Modern Angular Studio UI**: Angular 22 + Tailwind v4 + Spartan UI interface with keyboard shortcuts, lightbox comparison, candidate swapper, pipeline board, and Prompt Director.
-- **Dataset Export**: Exports curated frames and paired caption text directly into AI-Toolkit format for LoRA training.
-- **Full Docker & Docker Compose Support**: Production multi-stage Docker build with embedded ONNX models and host volume mounts.
+A **local, self-hosted, fully dockerized End-to-End Dataset Curation, VLM Captioning & RAG Studio** engineered for preparing **Krea 2 LoRA** training datasets across two specialized domains: **Character Training** and **Style / Concept Training**.
 
 ---
 
-## Docker Quickstart (Recommended)
+## Key Architectural Highlights
 
-The easiest way to run the entire application (Angular frontend + FastAPI backend + FFmpeg + ONNX models) is via Docker Compose.
+1. **Zero Local Machine Learning Models in Core (`Phase 1` Non-ML Architecture)**:
+   - **Stage 1 — Video & Folder Ingestion**: Supports both pre-sorted image folders (`.png`, `.jpg`, `.jpeg`, `.webp` + sidecar `.txt`) and high-speed **FFmpeg** video extraction (`select='gt(scene,0.15)'`, I-Frame `select='eq(pict_type,I)'`, and window-peak interval sampling).
+   - **Stage 2 — Mathematical Quality Scoring ($Q \in [0, 1]$)**: Combines 4x4 tile top-3 Laplacian variance $\sigma^2(\nabla^2 I)$ (with Immerkaer sensor noise subtraction) and central-60% **Tenengrad Sobel gradient energy** ($G_x^2 + G_y^2$), chiaroscuro-aware exposure & clipping analysis ($<5$ shadow / $>250$ highlight), and 256-bin **Shannon Entropy** $H(I) = -\sum p_i \log_2(p_i)$ (~151 FPS).
+   - **Stage 3 — $\mathcal{O}(N \log N)$ Deduplication & Best-Representative Selection**: Computes 64-bit DCT **pHash**, 64-bit gradient **dHash**, and 24-bin L2-normalized **HSV color histograms** (~670 FPS), grouping near-duplicates via a **Burkhard-Keller Metric Tree (`BKTree`)** and **4-Band 16-Bit Multi-Index Prefix Buckets** (**23x faster** and **726x fewer distance evaluations** at $N=5000$ than naive $\mathcal{O}(N^2)$) and automatically selecting $i^* = \arg\max_{i \in C_k} Q(I_i)$.
+2. **Future-Proof ML-Plugin Architecture (`Strategy Pattern`)**:
+   - Clean abstract interfaces [`BaseTaggerPlugin`](file:///home/z3pp1x/code/captioning_pipeline/backend/app/modules/curation/interfaces.py) and [`DatasetStratifier`](file:///home/z3pp1x/code/captioning_pipeline/backend/app/modules/curation/interfaces.py).
+   - Ships with [`RuleBasedHeuristicPlugin`](file:///home/z3pp1x/code/captioning_pipeline/backend/app/modules/curation/rule_tagger.py) and [`RuleBasedStratifier`](file:///home/z3pp1x/code/captioning_pipeline/backend/app/modules/curation/stratifier.py) out of the box, ready for drop-in local Vision-ML taggers (WD14, CLIP, SigLIP) later.
+3. **OpenRouter 3-Tier Cascade & Deterministic `RejectionDetector`**:
+   - Configurable **Primary Model** $\rightarrow$ **Fallback Model 1** $\rightarrow$ **Fallback Model 2** with persistent API key storage, `max_tokens`, and `temperature` $\in [0.0, 2.0]$.
+   - Versionable Master Skills for **Krea 2 Character Training** (identity decoupling onto `trigger_word`) and **Krea 2 Concept / Style Training** (content-style separation).
+   - Every response is audited by [`RejectionDetector`](file:///home/z3pp1x/code/captioning_pipeline/backend/app/modules/captioning/rejection_guard.py) (empty/min-length $<15$, normalized first-200-char refusal regex, meta-talk/question detection) with automatic cascade escalation and `"Needs Manual Caption"` fallback status.
+4. **Standardized Dataset Exporter & Local Non-ML LoRA-RAG Pipeline**:
+   - Exports normalized `.png`/`.jpg` images (Lanczos-4 clamping, multiple-of-16 latent snapping), paired `.txt` captions, `metadata.jsonl`, `dataset_card.json`, and downloadable `.zip` archives.
+   - Indexes curated datasets into **SQLite FTS5 (BM25)** + **TF-IDF / TruncatedSVD (128-D LSA)** / optional OpenRouter Embeddings with Reciprocal Rank Fusion (RRF) and MMR to power the **LoRA Prompt Studio**.
+5. **Docker & WSL2 Bind-Mount Optimization**:
+   - Separates host media bind-mounts (`/data/input:ro`, `/data/exports:rw`) from the native Linux ext4 Docker volume (`pipeline_appdata:/var/lib/captioning_pipeline`) for SQLite WAL, thumbnails, and extracted frames to eliminate the Windows `/mnt/c` 9P bottleneck.
 
-### 1. Configure Environment
+---
 
-Copy `.env.example` to `.env`:
+## Quickstart (Docker Compose & WSL2)
+
 ```bash
 cp .env.example .env
-```
-Edit `.env` with your settings:
-```env
-# OpenRouter API Key for VLM batch captioning
-OPENROUTER_API_KEY=sk-or-v1-your-key-here
-
-# Video source folder on host
-# Under WSL 2: /mnt/c/Users/Patri/Videos/_girls
-# Under Windows Docker Desktop: C:\Users\Patri\Videos\_girls
-VIDEO_DIR=/mnt/c/Users/Patri/Videos/_girls
-
-# Persistent cache & database (state.db, previews, filmstrips)
-CACHE_DIR=/home/z3pp1x/.cache/captioning_pipeline
-
-# Finished dataset export destination
-FINISHED_DIR=/mnt/c/Users/Patri/Documents/captioning_pipeline/data/finished
-
-# Port for the web interface and API
-PORT=8000
+# Edit HOST_MEDIA_ROOT in .env to point to your WSL2 / Windows media folder
+docker compose up --build -d
 ```
 
-### 2. Build & Launch
-
-```bash
-docker compose build
-docker compose up -d
-```
-
-The container starts with:
-- Video folder mounted read-only (`:ro`).
-- Persistent cache mounted for database and preview images.
-- Pre-cached ONNX models (`Xenova/clip-vit-base-patch32`) embedded directly into `/app/models` inside the image (no runtime model downloads required).
-- Healthcheck monitoring `http://localhost:8000/api/videos`.
-
-Open your browser at `http://localhost:8000`.
-
-### 3. Container Management
-
-```bash
-# View live logs
-docker compose logs -f
-
-# Check container health status
-docker compose ps
-
-# Stop container
-docker compose down
-```
+- **Angular 22 HITL Studio UI**: `http://localhost:4200`
+- **FastAPI Backend & OpenAPI Docs**: `http://localhost:8000/docs`
 
 ---
 
-## Database Management & Reset
+## Documentation & Benchmarks
 
-To reset the SQLite state database:
-
-```bash
-# Creates a timestamped backup and initializes a fresh database schema:
-scripts/reset_db.sh
-
-# Or also purge cached candidates, previews, and filmstrips:
-scripts/reset_db.sh --purge-all
-```
-
----
-
-## Architecture & Directory Layout
-
-```
-captioning_pipeline/
-├── Dockerfile                  # Multi-stage build (Node 22 Angular + Python 3.12 + FFmpeg + ONNX)
-├── docker-compose.yml          # Container configuration with host volume mounts
-├── .env.example                # Template environment variables
-├── src/
-│   ├── pipeline/               # Python backend modules
-│   │   ├── api.py              # FastAPI server & REST/SSE endpoints
-│   │   ├── autochunk.py        # Video chunking & scene budgeting
-│   │   ├── autoprocess.py      # Automated processing pipeline
-│   │   ├── classifier.py       # ONNX CLIP classification & embeddings
-│   │   ├── config.py           # Settings & environment configuration
-│   │   ├── db.py               # SQLite storage & transactions
-│   │   ├── decode.py           # Video frame decoding via PyAV
-│   │   ├── export.py           # LoRA dataset export
-│   │   ├── indexer.py          # Video library scanner
-│   │   ├── jobs.py             # Job queue & background workers
-│   │   ├── metrics.py          # Sharpness, motion & visual metrics
-│   │   ├── openrouter.py       # OpenRouter VLM integration
-│   │   ├── rag/                # RAG prompt taxonomy and generator
-│   │   ├── scoring.py          # Frame scoring, MMR selection & distribution stats
-│   │   ├── select.py           # Frame sampling algorithms
-│   │   ├── streaming.py        # Video proxy & streaming
-│   │   └── tagger.py           # Tagging integration
-│   └── web/                    # Angular 22 frontend
-│       ├── app/                # Feature components & services
-│       ├── shared/             # Spartan UI (hlm/brain) components
-│       └── dist/               # Built static production bundle
-├── scripts/                    # CLI & automation scripts
-│   ├── download_models.py      # Pre-download ONNX CLIP models
-│   ├── reset_db.sh             # Database backup & reset script
-│   ├── env.sh                  # WSL environment definitions
-│   ├── run.sh                  # Start local FastAPI server
-│   ├── setup.sh                # Install dependencies with uv
-│   └── test.sh                 # Run pytest suite
-├── tests/                      # Pytest backend test suite
-└── pyproject.toml              # Project dependencies & package metadata
-```
-
----
-
-## Local Development (WSL 2)
-
-If developing outside Docker inside WSL 2:
-
-```bash
-# 1. Setup Python & Node dependencies
-bash scripts/setup.sh
-
-# 2. Run backend and frontend tests
-bash scripts/test.sh
-npm test
-
-# 3. Start local development servers
-bash scripts/start_all.sh
-```
+- [Architecture Blueprint (`ARCHITECTURE.md`)](file:///home/z3pp1x/code/captioning_pipeline/ARCHITECTURE.md)
+- [Classical Vision & $\mathcal{O}(N \log N)$ Clustering Benchmark Report (`docs/BENCHMARK_REPORT.md`)](file:///home/z3pp1x/code/captioning_pipeline/docs/BENCHMARK_REPORT.md)
+- [HITL UI/UX Design Specification (`docs/HITL_UX_DESIGN.md`)](file:///home/z3pp1x/code/captioning_pipeline/docs/HITL_UX_DESIGN.md)

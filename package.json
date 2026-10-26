@@ -7,7 +7,15 @@
     "start": "ng serve --proxy-config proxy.conf.json --host 0.0.0.0 --port 4200",
     "build": "ng build --configuration production",
     "watch": "ng build --watch --configuration development",
-    "test": "ng test"
+    "test": "ng test",
+    "lint": "eslint .",
+    "knip": "knip",
+    "lint:ts": "bash scripts/ux_gate.sh lint-ts",
+    "lint:styles": "bash scripts/ux_gate.sh lint-styles",
+    "e2e:ux": "bash scripts/ux_gate.sh e2e",
+    "lhci": "bash scripts/ux_gate.sh lhci",
+    "ux-gate": "bash scripts/ux_gate.sh all",
+    "ux-gate:setup": "bash scripts/ux_gate_setup.sh"
   },
   "dependencies": {
     "@angular/animations": "^22.1.8",
@@ -32,15 +40,26 @@
     "tw-animate-css": "^1.2.0"
   },
   "devDependencies": {
+    "@angular-eslint/eslint-plugin": "^22.6.0",
+    "@angular-eslint/eslint-plugin-template": "^22.6.0",
+    "@angular-eslint/template-parser": "^22.6.0",
     "@angular/build": "^22.1.8",
     "@angular/cli": "^22.1.8",
     "@angular/compiler-cli": "^22.1.8",
+    "@axe-core/playwright": "^4.14.0",
+    "@lhci/cli": "^0.15.1",
+    "@playwright/test": "^1.64.1",
     "@tailwindcss/postcss": "^4.0.0",
     "@types/jsdom": "^30.0.0",
+    "eslint": "^10.13.0",
+    "eslint-plugin-sonarjs": "^4.2.2",
     "jsdom": "^30.1.3",
+    "knip": "^6.43.0",
     "postcss": "^8.5.0",
+    "stylelint": "^17.16.0",
     "tailwindcss": "^4.0.0",
     "typescript": "~6.0.0",
+    "typescript-eslint": "^8.72.0",
     "vitest": "^5.0.5"
   }
 }

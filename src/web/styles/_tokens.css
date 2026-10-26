@@ -1,0 +1,64 @@
+/*
+ * Design tokens (mim26 light theme) - the ONLY file allowed to contain literal hex colours
+ * (enforced by stylelint `color-no-hex`, see .stylelintrc.json). Components consume these through the
+ * Tailwind `@theme` mapping in ../styles.css (`bg-card`, `text-muted-foreground`, ...) or directly as
+ * semantic custom properties (`var(--surface-card)`, `var(--status-danger)`, `var(--accent-primary)`).
+ *
+ * Contrast (WCAG 2.1 AA) is verified by the axe scan in frontend/e2e/ux-gate.spec.ts; when it fails,
+ * adjust the values here (>= 4.5:1 normal text, >= 3:1 large text / UI components).
+ */
+:root {
+  --background: #FFFFFF;
+  --foreground: #1A1A1A;
+  --canvas: #E9EBEE;
+  --card: #FFFFFF;
+  --card-foreground: #1A1A1A;
+  --popover: #FFFFFF;
+  --popover-foreground: #1A1A1A;
+  --primary: #D73816;
+  --primary-foreground: #FFFFFF;
+  --brand: #E33B17;
+  --secondary: #1A1A1A;
+  --secondary-foreground: #FFFFFF;
+  --muted: #F4F5F6;
+  --muted-foreground: #65696F;
+  --accent: #F4F5F6;
+  --accent-foreground: #1A1A1A;
+  --destructive: #D70015;
+  --destructive-foreground: #FFFFFF;
+  --border: #D7DADC;
+  --input: #868B90;
+  --ring: #D73816;
+  --radius: 0.75rem;
+
+  --success: #22C55E;
+  --warning: #FFBC1F;
+  /* AA-safe shades for state carried by text/icons/borders on white (success-strong 5.02:1, warning-strong 5.93:1) */
+  --success-strong: #15803D;
+  --warning-strong: #8A5A00;
+  --info: #1658C7;
+  --sidebar: #1A1A1A;
+  --sidebar-foreground: #FFFFFF;
+
+  /* Semantic aliases (the names used by the UX gate / design-system docs) */
+  --surface-card: var(--card);
+  --surface-canvas: var(--canvas);
+  --accent-primary: var(--primary);
+  --status-danger: var(--destructive);
+  --status-success: var(--success-strong);
+  --status-warning: var(--warning-strong);
+  --status-info: var(--info);
+
+  /* 4px / 8px spacing grid: margin, padding and gap may only use these (or 0.25rem multiples) */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-7: 1.75rem;
+  --space-8: 2rem;
+
+  --font-sans: Helvetica, Arial, "Noto Sans", sans-serif;
+  --font-display: Helvetica, Arial, "Noto Sans", sans-serif;
+}

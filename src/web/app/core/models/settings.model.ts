@@ -5,6 +5,8 @@ export interface PipelineSettings {
   survivor_frac: number;
   trigger_word: string;
   max_edge: number;
+  normalize_to_buckets?: boolean;
+  export_bucket_preset?: '4_buckets' | '3_buckets';
   snap_to_cuts?: boolean;
   snap_window_s?: number;
   suggest_min_len_s?: number;

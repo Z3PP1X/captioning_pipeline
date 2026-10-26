@@ -440,17 +440,25 @@ export class PromptRagService {
   /** Put a history entry's inputs back into the editor (tags, description, character, model, trigger). */
   restoreInputs(entry: RagHistoryEntry): void {
     const tags = entry.inputs?.selected_tags ?? {};
+    const copy = (category: string) => [...(tags[category] || [])];
     this.selectedTags.set({
-      equipment: [...(tags['equipment'] || [])],
-      surroundings: [...(tags['surroundings'] || [])],
-      position: [...(tags['position'] || [])],
-      camera_lighting: [...(tags['camera_lighting'] || [])],
+      equipment: copy('equipment'),
+      surroundings: copy('surroundings'),
+      position: copy('position'),
+      camera_lighting: copy('camera_lighting'),
     });
-    this.userDescription.set(entry.inputs?.user_description ?? '');
-    this.selectedCharacter.set(entry.inputs?.character ?? null);
-    if (entry.inputs?.model) this.selectedModel.set(entry.inputs.model);
-    if (entry.inputs?.trigger) this.selectedTrigger.set(entry.inputs.trigger);
-    if (entry.inputs?.local_url) this.localUrl.set(entry.inputs.local_url);
+    const inputs = entry.inputs;
+    this.userDescription.set(inputs?.user_description ?? '');
+    this.selectedCharacter.set(inputs?.character ?? null);
+    this.restoreRunOptions(inputs);
+  }
+
+  /** Model, trigger and local URL of a history entry (only the ones it stored). */
+  private restoreRunOptions(inputs: RagHistoryEntry['inputs'] | undefined): void {
+    if (!inputs) return;
+    if (inputs.model) this.selectedModel.set(inputs.model);
+    if (inputs.trigger) this.selectedTrigger.set(inputs.trigger);
+    if (inputs.local_url) this.localUrl.set(inputs.local_url);
   }
 
   // ------------------------------------------------------------------ inline edit + re-lint

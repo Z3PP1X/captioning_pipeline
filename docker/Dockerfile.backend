@@ -1,0 +1,62 @@
+# ==============================================================================
+# Krea 2 LoRA Dataset Curation & Captioning Pipeline — Dockerfile.backend
+# Zero Local ML Model Bloat | Classical Mathematical CV (FFmpeg, OpenCV, NumPy)
+# ==============================================================================
+FROM python:3.12-slim-bookworm
+
+# Install system dependencies: FFmpeg (hardware/scene frame extraction), OpenCV runtime libs, SQLite3
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libgl1 \
+    libglib2.0-0 \
+    curl \
+    ca-certificates \
+    sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH="/app" \
+    PIPELINE_APPDATA_DIR="/var/lib/captioning_pipeline" \
+    PIPELINE_INPUT_DIR="/data/input" \
+    PIPELINE_EXPORT_DIR="/data/exports"
+
+WORKDIR /app
+
+# Install lightweight, zero-ML-bloat Python dependencies
+RUN pip install --no-cache-dir \
+    "fastapi>=0.115.0" \
+    "uvicorn[standard]>=0.30.0" \
+    "pydantic>=2.8.0" \
+    "httpx>=0.27.0" \
+    "numpy>=1.26.0" \
+    "scipy>=1.13.0" \
+    "scikit-learn>=1.5.0" \
+    "opencv-python-headless>=4.10.0.84" \
+    "pillow>=10.4.0" \
+    "av>=12.0.0" \
+    "python-multipart>=0.0.9"
+
+# Copy application source
+COPY backend/ /app/backend/
+COPY docs/ /app/docs/
+COPY ARCHITECTURE.md README.md /app/
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# Create mount points & native Linux volume directory structure
+RUN mkdir -p \
+    /data/input \
+    /data/exports \
+    /var/lib/captioning_pipeline/db \
+    /var/lib/captioning_pipeline/frames \
+    /var/lib/captioning_pipeline/thumbnails \
+    /var/lib/captioning_pipeline/rag
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -f http://localhost:8000/api/v1/health || exit 1
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000"]

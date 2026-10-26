@@ -1,0 +1,51 @@
+# Pre-commit configuration for Automated Complexity, Big-O & Quality Gatekeeper
+repos:
+  - repo: local
+    hooks:
+      - id: ast-vector-lint
+        name: AST Vector Loop Linter (VEC001)
+        entry: python3 scripts/ast_vector_lint.py
+        language: system
+        types: [python]
+        files: ^(src/pipeline/|backend/)
+
+      - id: ruff-check
+        name: Ruff Complexity & Performance Gate
+        entry: ruff check
+        language: system
+        types: [python]
+
+      - id: complexipy
+        name: Complexipy Cognitive Complexity Gate (<= 15)
+        entry: complexipy --max-complexity-allowed 15
+        language: system
+        types: [python]
+        files: ^(src/pipeline/|tests/complexity/)
+
+      - id: xenon
+        name: Xenon Maintainability Rank Gate
+        entry: xenon --max-absolute B --max-modules A --max-average A
+        language: system
+        types: [python]
+        files: ^(src/pipeline/deduplication|tests/complexity/)
+
+      - id: mypy-strict
+        name: Mypy Strict Static Typing Gate
+        entry: mypy --strict
+        language: system
+        types: [python]
+        files: ^(src/pipeline/deduplication|tests/complexity|scripts/ast_vector_lint)
+
+      - id: eslint-angular
+        name: Angular ESLint Complexity & OnPush Gate
+        entry: npm run lint
+        language: system
+        files: ^src/web/app/
+        pass_filenames: false
+
+      - id: knip-dead-code
+        name: Knip Dead-Code & Unused Exports Gate
+        entry: npx knip
+        language: system
+        files: ^src/web/
+        pass_filenames: false

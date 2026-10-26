@@ -91,10 +91,10 @@ import { formatTime } from '../../core/utils/time.utils';
         <!-- Card 3: Image Spec -->
         <div class="flex flex-col gap-1 rounded-xl border border-border bg-card p-5 shadow-xs">
           <span class="font-display font-black text-2xl md:text-3xl text-foreground leading-none">
-            PNG 100%
+            1MP Buckets
           </span>
           <span class="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
-            Lossless sRGB (Snap % 16)
+            Max 4 Buckets · Center-Crop (1344×768 / 1152×896 / 896×1152 / 768×1344)
           </span>
         </div>
       </div>

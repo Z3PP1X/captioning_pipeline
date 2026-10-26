@@ -4,8 +4,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export NODE_OPTIONS="--require $SCRIPT_DIR/patch_os.js --max-old-space-size=2048"
 export NG_CLI_ANALYTICS=false
 export NG_DISABLE_VERSION_CHECK=1
-mkdir -p "$HOME"
-[ -f "$HOME/.angular-config.json" ] || echo '{"version": 1, "cli": {"analytics": false}}' > "$HOME/.angular-config.json"
+mkdir -p "$HOME" 2>/dev/null || true
+([ -f "$HOME/.angular-config.json" ] || echo '{"version": 1, "cli": {"analytics": false, "completion": {"prompted": true}}}' > "$HOME/.angular-config.json") 2>/dev/null || true
 
 # Keep the Angular build cache on ext4: on a /mnt/<drive> checkout (9p) it is slow and can corrupt.
 # `.angular` becomes a symlink into the cache dir (gitignored either way).

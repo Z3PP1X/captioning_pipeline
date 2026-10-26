@@ -1,0 +1,29 @@
+{
+  "$schema": "https://unpkg.com/knip@5/overview.json",
+  "entry": [
+    "src/web/main.ts",
+    "src/web/app/app.config.ts",
+    "src/web/app/app.component.ts",
+    "src/web/app/features/**/*.component.ts",
+    "src/web/shared/ui/**/index.ts",
+    "src/web/shared/ui/**/src/index.ts",
+    "scripts/patch_os.js"
+  ],
+  "project": [
+    "src/web/app/**/*.ts",
+    "src/web/shared/ui/**/*.ts"
+  ],
+  "ignoreDependencies": [
+    "@angular/router",
+    "embla-carousel",
+    "embla-carousel-angular",
+    "ngx-scrollbar"
+  ],
+  "rules": {
+    "files": "error",
+    "dependencies": "error",
+    "unlisted": "error",
+    "exports": "warn",
+    "types": "warn"
+  }
+}

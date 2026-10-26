@@ -282,7 +282,7 @@ class AnalysisCache:
             motion = gap_stats.get("motion") or {}
             subsamples += int(gap_stats.get("subsamples", len(raw)))
             new: list[dict[str, Any]] = []
-            for t, img in raw:
+            for t, img in raw:  # noqa: VEC001 gap raw sample iteration
                 t = round(float(t), 3)
                 if not (ga - 1e-6 <= t <= gb + 1e-6):
                     continue

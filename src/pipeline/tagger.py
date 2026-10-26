@@ -115,7 +115,7 @@ class LocalTagger:
             # Sort by score descending
             items.sort(key=lambda x: x[1], reverse=True)
             added = 0
-            for tag_label, score in items:
+            for tag_label, score in items:  # noqa: VEC001 category top-k tag selection
                 if score >= threshold and added < top_k_per_category:
                     chosen_tags.append(tag_label)
                     added += 1

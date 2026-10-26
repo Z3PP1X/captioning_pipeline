@@ -21,6 +21,37 @@ export interface StatusMeta {
   spin?: boolean;
 }
 
+const STATUS_META: Readonly<Record<string, StatusMeta>> = {
+  new: { variant: 'muted', icon: 'lucideCircleDashed', label: 'New' },
+  chunking: { variant: 'muted', icon: 'lucideScissors', label: 'Chunking' },
+  chunked: { variant: 'muted', icon: 'lucideScissors', label: 'Chunked' },
+  extracting: { variant: 'warning', icon: 'lucideLoader2', label: 'Extracting' },
+  extracting_750: { variant: 'warning', icon: 'lucideLoader2', label: 'Extracting' },
+  curating: { variant: 'info', icon: 'lucideListChecks', label: 'Curating' },
+  curating_300: { variant: 'info', icon: 'lucideListChecks', label: 'Curating' },
+  captioning: { variant: 'warning', icon: 'lucideCaptions', label: 'Captioning' },
+  exported: { variant: 'success', icon: 'lucideCheck', label: 'Exported' },
+  skipped: { variant: 'muted', icon: 'lucideSkipForward', label: 'Skipped' },
+  ignored: { variant: 'muted', icon: 'lucideBan', label: 'Ignored' },
+};
+
+function activeJobMeta(status: string, activeJob: ActiveJob): StatusMeta {
+  const pct = Math.round((activeJob.progress || 0) * 100);
+  if (activeJob.type === 'openrouter_caption' || status === 'captioning') {
+    return {
+      variant: 'warning',
+      icon: 'lucideCaptions',
+      label: pct > 0 ? `Captioning · ${pct}%` : 'Captioning',
+    };
+  }
+  return {
+    variant: 'warning',
+    icon: 'lucideLoader2',
+    label: pct > 0 ? `Extracting · ${pct}%` : 'Extracting',
+    spin: true,
+  };
+}
+
 export function videoStatusMeta(
   video: Pick<Video, 'status' | 'broken' | 'broken_reason'>,
   activeJob?: ActiveJob | null,
@@ -30,48 +61,10 @@ export function videoStatusMeta(
     return { variant: 'danger', icon: 'lucideAlertTriangle', label: reason };
   }
 
-  if (activeJob) {
-    if (activeJob.type === 'openrouter_caption' || video.status === 'captioning') {
-      const pct = Math.round((activeJob.progress || 0) * 100);
-      return {
-        variant: 'warning',
-        icon: 'lucideCaptions',
-        label: pct > 0 ? `Captioning · ${pct}%` : 'Captioning',
-      };
-    }
-    const pct = Math.round((activeJob.progress || 0) * 100);
-    return {
-      variant: 'warning',
-      icon: 'lucideLoader2',
-      label: pct > 0 ? `Extracting · ${pct}%` : 'Extracting',
-      spin: true,
-    };
-  }
+  if (activeJob) return activeJobMeta(video.status, activeJob);
 
-  switch (video.status) {
-    case 'new':
-      return { variant: 'muted', icon: 'lucideCircleDashed', label: 'New' };
-    case 'chunking':
-      return { variant: 'muted', icon: 'lucideScissors', label: 'Chunking' };
-    case 'chunked':
-      return { variant: 'muted', icon: 'lucideScissors', label: 'Chunked' };
-    case 'extracting':
-    case 'extracting_750':
-      return { variant: 'warning', icon: 'lucideLoader2', label: 'Extracting' };
-    case 'curating':
-    case 'curating_300':
-      return { variant: 'info', icon: 'lucideListChecks', label: 'Curating' };
-    case 'captioning':
-      return { variant: 'warning', icon: 'lucideCaptions', label: 'Captioning' };
-    case 'exported':
-      return { variant: 'success', icon: 'lucideCheck', label: 'Exported' };
-    case 'skipped':
-      return { variant: 'muted', icon: 'lucideSkipForward', label: 'Skipped' };
-    case 'ignored':
-      return { variant: 'muted', icon: 'lucideBan', label: 'Ignored' };
-    default:
-      return { variant: 'muted', icon: 'lucideCircleDashed', label: video.status || 'New' };
-  }
+  const known = Object.hasOwn(STATUS_META, video.status) ? STATUS_META[video.status] : undefined;
+  return known ? { ...known } : { variant: 'muted', icon: 'lucideCircleDashed', label: video.status || 'New' };
 }
 
 export const ALL_VIDEO_STATUSES = [
